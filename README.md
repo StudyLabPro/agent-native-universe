@@ -135,7 +135,8 @@ The same encrypted transport carries discovery, relationship and committee traff
 
 ## Quick start
 
-Requires Node.js 22 or newer.
+Requires Node.js 22 or newer. CI verifies the minimum Node.js 22 line and the
+Node.js 24 Active LTS line.
 
 ```bash
 npm ci
