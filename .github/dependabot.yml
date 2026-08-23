@@ -5,6 +5,12 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
+    # Node typings model the minimum supported runtime. Raise this boundary
+    # only together with the package engine, Docker image, and CI matrix.
+    ignore:
+      - dependency-name: "@types/node"
+        update-types:
+          - "version-update:semver-major"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

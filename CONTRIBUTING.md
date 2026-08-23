@@ -5,7 +5,8 @@ well-scoped runtime improvements.
 
 ## Development contract
 
-Requires Node.js 22 or newer.
+Requires Node.js 22 or newer. Keep code compatible with the Node.js 22 type
+surface; CI also verifies the Node.js 24 Active LTS line.
 
 ```bash
 npm ci --ignore-scripts

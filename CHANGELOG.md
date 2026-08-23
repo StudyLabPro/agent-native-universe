@@ -3,6 +3,19 @@
 All notable changes to Agent Native Universe are documented here. The project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Toolchain
+
+- Adopted the stable native TypeScript 7 compiler after the complete Node.js 22
+  runtime and production-container checks passed.
+- Updated the official checkout and Node setup actions to v7.
+- Kept Node.js 22 as the verified minimum and added a complete runtime lane on
+  the Node.js 24 Active LTS line.
+- Constrained `@types/node` major updates to the declared minimum-runtime
+  boundary; future major type upgrades must move the runtime, image, and CI
+  contracts together.
+
 ## [1.0.0] - 2026-08-19
 
 The first stable release establishes ANU as an executable agent-native runtime
@@ -63,4 +76,5 @@ capacity target, not a v1.0.0 throughput guarantee. Scientific correctness,
 recovery, evidence integrity, and process isolation are covered; the measured
 single-universe envelope is in docs/LAB_CAPACITY.md.
 
+[Unreleased]: https://github.com/AndrewHakmi/agent-native-universe/compare/v1.0.0...HEAD
 [1.0.0]: https://github.com/AndrewHakmi/agent-native-universe/releases/tag/v1.0.0
