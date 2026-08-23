@@ -35,6 +35,22 @@ jobs:
       - name: Verify the publishable package
         run: npm pack --dry-run
 
+  runtime-active-lts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install exact development dependencies
+        run: npm ci --ignore-scripts
+      - name: Verify the complete runtime on Active LTS
+        run: npm test
+      - name: Execute the living-graph smoke scenario
+        run: npm run demo:living
+
   container:
     runs-on: ubuntu-latest
     timeout-minutes: 20
