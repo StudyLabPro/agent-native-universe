@@ -17,6 +17,54 @@ export interface CognitiveBillingPolicy {
   tokenSafetyFactor?: number;
   inputCreditsPerThousand?: number;
   outputCreditsPerThousand?: number;
+  /**
+   * How to treat usage that exceeds the reservation.
+   *
+   * `"topUp"` (default) draws the difference from the agent's balance. It keeps
+   * the thought alive, but it also means a reservation bounds nothing at all
+   * for a solvent agent — providers that ignore the requested output cap can
+   * spend arbitrarily beyond it.
+   *
+   * `"reject"` treats the reservation as a real ceiling. The reserved amount is
+   * still settled to the provider — the work was genuinely performed and must
+   * be paid for — and {@link CognitiveOverrunError} is raised so the caller
+   * learns the bound was breached instead of silently absorbing the cost.
+   */
+  overrunPolicy?: "topUp" | "reject";
+}
+
+export type MeteredResource = "model_tokens" | "credits";
+
+/** A reservation that real usage exceeded. Reported whether or not it was honoured. */
+export interface ReservationOverrun {
+  resource: MeteredResource;
+  reserved: number;
+  required: number;
+  /** Drawn from the agent's balance to cover the excess; 0 under `"reject"`. */
+  toppedUp: number;
+}
+
+/** Usage a provider really delivered that the ledger could not bill in full. */
+export interface UnbilledUsage {
+  resource: MeteredResource;
+  delivered: number;
+  billed: number;
+}
+
+export class CognitiveOverrunError extends Error {
+  readonly unbilled: UnbilledUsage[];
+
+  constructor(
+    readonly thoughtId: string,
+    readonly overrun: ReservationOverrun,
+    unbilled: UnbilledUsage[] = [],
+  ) {
+    super(
+      `Thought ${thoughtId} required ${overrun.required} ${overrun.resource} but reserved only ${overrun.reserved}`,
+    );
+    this.name = "CognitiveOverrunError";
+    this.unbilled = unbilled;
+  }
 }
 
 export interface ThoughtResult {
@@ -27,6 +75,8 @@ export interface ThoughtResult {
   chargedModelTokens: number;
   chargedCredits: number;
   actions: CognitiveAction[];
+  /** Reservations that real usage exceeded. Empty when everything fit. */
+  overruns: ReservationOverrun[];
   startedAt: number;
   completedAt: number;
 }
@@ -71,6 +121,12 @@ export class MeteredCognitiveLoop {
       "LLM thought token reserve",
     );
     let creditReservation: { reservationId: string; account: string } | undefined;
+    const overrunPolicy = this.billing.overrunPolicy ?? "topUp";
+    const overruns: ReservationOverrun[] = [];
+    /** Set once the provider has answered; from then on the spend is real. */
+    let completion: LlmResponse | undefined;
+    let tokensSettled = false;
+    let creditsSettled = false;
     try {
       if (creditReserve > 0) {
         creditReservation = await this.economy.reserve(
@@ -87,16 +143,24 @@ export class MeteredCognitiveLoop {
         { require: ["chat", "json"], ...(options.providerPolicy ?? {}) },
         options.signal,
       );
-      const chargedModelTokens = Math.max(1, response.usage.totalTokens || estimateTokens(response.content));
-      await ensureReservationCapacity(
+      // From here on the provider has really executed the completion: the cost
+      // exists in the outside world whatever happens next in this function.
+      completion = response;
+
+      const deliveredModelTokens = Math.max(1, response.usage.totalTokens || estimateTokens(response.content));
+      const tokenOverrun = await reconcileReservation(
         this.economy,
         agent.id,
         tokenReservation.account,
         "model_tokens",
-        chargedModelTokens,
+        deliveredModelTokens,
         tokenReserve,
         thoughtId,
+        overrunPolicy,
       );
+      if (tokenOverrun) overruns.push(tokenOverrun);
+      const rejectedTokens = tokenOverrun !== undefined && tokenOverrun.toppedUp === 0;
+      const chargedModelTokens = rejectedTokens ? tokenReserve : deliveredModelTokens;
       await this.economy.settleReservation(
         tokenReservation.reservationId,
         this.billing.providerAccount,
@@ -105,23 +169,34 @@ export class MeteredCognitiveLoop {
         agent.id,
         "LLM token usage settlement",
       );
+      tokensSettled = true;
+      if (rejectedTokens) {
+        throw new CognitiveOverrunError(thoughtId, tokenOverrun, [
+          { resource: "model_tokens", delivered: deliveredModelTokens, billed: chargedModelTokens },
+        ]);
+      }
 
-      const chargedCredits = estimateCreditCharge(
+      const deliveredCredits = estimateCreditCharge(
         response.usage.inputTokens,
         response.usage.outputTokens,
         this.billing.inputCreditsPerThousand ?? 0,
         this.billing.outputCreditsPerThousand ?? 0,
       );
+      let chargedCredits = deliveredCredits;
       if (creditReservation) {
-        await ensureReservationCapacity(
+        const creditOverrun = await reconcileReservation(
           this.economy,
           agent.id,
           creditReservation.account,
           "credits",
-          chargedCredits,
+          deliveredCredits,
           creditReserve,
           thoughtId,
+          overrunPolicy,
         );
+        if (creditOverrun) overruns.push(creditOverrun);
+        const rejectedCredits = creditOverrun !== undefined && creditOverrun.toppedUp === 0;
+        chargedCredits = rejectedCredits ? creditReserve : deliveredCredits;
         if (chargedCredits > 0) {
           await this.economy.settleReservation(
             creditReservation.reservationId,
@@ -133,6 +208,12 @@ export class MeteredCognitiveLoop {
           );
         } else {
           await this.economy.refundReservation(creditReservation.reservationId, agent.id, "credits");
+        }
+        creditsSettled = true;
+        if (rejectedCredits) {
+          throw new CognitiveOverrunError(thoughtId, creditOverrun, [
+            { resource: "credits", delivered: deliveredCredits, billed: chargedCredits },
+          ]);
         }
       } else if (chargedCredits > 0) {
         await this.economy.transfer(
@@ -172,12 +253,39 @@ export class MeteredCognitiveLoop {
         chargedModelTokens,
         chargedCredits,
         actions,
+        overruns,
         startedAt,
         completedAt,
       };
     } catch (error) {
-      await this.economy.refundReservation(tokenReservation.reservationId, agent.id, "model_tokens");
-      if (creditReservation) await this.economy.refundReservation(creditReservation.reservationId, agent.id, "credits");
+      // A completion that already came back was really executed and really
+      // cost tokens. Refunding it would erase spend that has happened in the
+      // outside world, leaving a ledger that quietly under-reports the truth.
+      // Only a thought that never reached the provider may be refunded whole.
+      const unbilled: UnbilledUsage[] = [];
+      if (!tokensSettled) {
+        if (completion) {
+          const delivered = Math.max(1, completion.usage.totalTokens || estimateTokens(completion.content));
+          const shortfall = await settleDelivered(
+            this.economy,
+            tokenReservation.reservationId,
+            this.billing.providerAccount,
+            "model_tokens",
+            delivered,
+            agent.id,
+            tokenReserve,
+          );
+          if (shortfall) unbilled.push(shortfall);
+        } else {
+          await this.economy.refundReservation(tokenReservation.reservationId, agent.id, "model_tokens");
+        }
+      }
+      if (creditReservation && !creditsSettled) {
+        await this.economy.refundReservation(creditReservation.reservationId, agent.id, "credits");
+      }
+      if (unbilled.length > 0 && error instanceof Error && !(error instanceof CognitiveOverrunError)) {
+        Object.defineProperty(error, "unbilled", { value: unbilled, enumerable: true, configurable: true });
+      }
       throw error;
     }
   }
@@ -323,17 +431,57 @@ function applyDecision(agent: AgentCognitivePort, decision: CognitiveDecision): 
   if (decision.ephemeralState) agent.setEphemeral?.(decision.ephemeralState);
 }
 
-async function ensureReservationCapacity(
+/**
+ * Reconcile a reservation with the usage a provider actually delivered.
+ *
+ * Returns the overrun whenever one happened, even when it is absorbed: an
+ * overrun nobody can observe is indistinguishable from a bound that works.
+ */
+async function reconcileReservation(
   economy: PersistentResourceEconomy,
   owner: string,
   reservationAccount: string,
-  resource: "model_tokens" | "credits",
+  resource: MeteredResource,
   required: number,
   reserved: number,
   reference: string,
-): Promise<void> {
-  if (required <= reserved) return;
-  await economy.transfer(owner, reservationAccount, resource, required - reserved, "LLM reservation top-up", reference);
+  policy: "topUp" | "reject",
+): Promise<ReservationOverrun | undefined> {
+  if (required <= reserved) return undefined;
+  if (policy === "reject") return { resource, reserved, required, toppedUp: 0 };
+  const shortfall = required - reserved;
+  await economy.transfer(owner, reservationAccount, resource, shortfall, "LLM reservation top-up", reference);
+  return { resource, reserved, required, toppedUp: shortfall };
+}
+
+/**
+ * Settle usage a provider already delivered, capped by what the reservation
+ * holds. Returns the part that could not be billed so the caller can report a
+ * ledger that knowingly under-records real spend rather than hiding it.
+ */
+async function settleDelivered(
+  economy: PersistentResourceEconomy,
+  reservationId: string,
+  beneficiary: string,
+  resource: MeteredResource,
+  delivered: number,
+  owner: string,
+  reserved: number,
+): Promise<UnbilledUsage | undefined> {
+  const billable = Math.min(delivered, reserved);
+  if (billable <= 0) {
+    await economy.refundReservation(reservationId, owner, resource);
+    return { resource, delivered, billed: 0 };
+  }
+  await economy.settleReservation(
+    reservationId,
+    beneficiary,
+    resource,
+    billable,
+    owner,
+    "LLM usage settlement after failed thought",
+  );
+  return billable < delivered ? { resource, delivered, billed: billable } : undefined;
 }
 
 function estimateTokens(text: string): number {

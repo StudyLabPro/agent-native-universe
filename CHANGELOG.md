@@ -5,6 +5,25 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Metered cognition
+
+- A reservation can now be enforced as a real spending ceiling through
+  `CognitiveBillingPolicy.overrunPolicy: "reject"`. The provider is still paid
+  for work it genuinely performed, but only up to the reservation, and the
+  breach is raised as `CognitiveOverrunError` carrying the unbilled remainder.
+  The previous behaviour — drawing the difference from the agent's balance —
+  remains the default under `"topUp"`.
+- Overruns are reported in `ThoughtResult.overruns` even when they are absorbed,
+  so an exceeded bound can no longer pass unobserved.
+- A thought that fails *after* the provider has answered now settles the
+  delivered usage instead of refunding it, and declares any part it could not
+  bill. A thought that never reached the provider is still refunded in full.
+  Previously both cases were refunded, letting the ledger record zero for tokens
+  that had really been consumed.
+- Added `experiments/mws-kimi`, a live falsification harness that established
+  the above against a reasoning model on MWS Cloud, where the provider ignores
+  the requested `max_tokens` entirely.
+
 ### Toolchain
 
 - Adopted the stable native TypeScript 7 compiler after the complete Node.js 22
