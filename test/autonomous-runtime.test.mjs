@@ -327,3 +327,119 @@ test("stable clusters automatically fold into metaagents and weak boundaries aut
   assert.ok(events.some((event) => event.type === "folded"));
   assert.ok(events.some((event) => event.type === "unfolded"));
 });
+
+/* ------------------------------------------------------------------ *
+ * Metering boundary regressions.
+ *
+ * A live run against a reasoning model on MWS Cloud showed three ways the
+ * declared bound failed to bind: providers may ignore the requested output
+ * cap, a solvent agent could exceed its reservation silently, and a thought
+ * that failed after the provider had already answered was refunded in full.
+ * See experiments/mws-kimi/verify.mjs.
+ * ------------------------------------------------------------------ */
+
+function fixedUsageLlm(totalTokens, content) {
+  return {
+    async complete() {
+      return {
+        provider: "fake-provider",
+        model: "fake-model",
+        content: content ?? JSON.stringify({ exposedState: { ok: true }, summary: "done" }),
+        usage: { inputTokens: 10, outputTokens: totalTokens - 10, totalTokens },
+        latencyMs: 3,
+      };
+    },
+  };
+}
+
+test("an overrun is reported even when the reservation is topped up", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-overrun-topup-"));
+  const economy = await PersistentResourceEconomy.open(directory);
+  await economy.mint("agent:solvent", "model_tokens", 10_000);
+  const agent = new FakeAgent("agent:solvent", { objective: "think" });
+  const loop = new MeteredCognitiveLoop(economy, fixedUsageLlm(900), {
+    providerAccount: "provider:x",
+    reserveOutputTokens: 10,
+    tokenSafetyFactor: 1,
+  });
+
+  const result = await loop.think(agent);
+
+  assert.equal(result.chargedModelTokens, 900);
+  assert.equal(result.overruns.length, 1);
+  assert.equal(result.overruns[0].resource, "model_tokens");
+  assert.ok(result.overruns[0].toppedUp > 0, "the top-up must be visible, not silent");
+  assert.ok(result.overruns[0].required > result.overruns[0].reserved);
+  assert.equal(economy.balance("provider:x", "model_tokens"), 900);
+  assert.equal(economy.assertConserved("model_tokens"), true);
+});
+
+test("overrunPolicy reject turns the reservation into a real ceiling and still pays for delivered work", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-overrun-reject-"));
+  const economy = await PersistentResourceEconomy.open(directory);
+  await economy.mint("agent:capped", "model_tokens", 10_000);
+  const before = economy.balance("agent:capped", "model_tokens");
+  const agent = new FakeAgent("agent:capped", { objective: "think" });
+  const loop = new MeteredCognitiveLoop(economy, fixedUsageLlm(900), {
+    providerAccount: "provider:x",
+    reserveOutputTokens: 10,
+    tokenSafetyFactor: 1,
+    overrunPolicy: "reject",
+  });
+
+  const error = await loop.think(agent).then(
+    () => null,
+    (raised) => raised,
+  );
+
+  assert.ok(error, "a breached ceiling must surface");
+  assert.equal(error.name, "CognitiveOverrunError");
+  assert.equal(error.overrun.required, 900);
+  assert.ok(error.overrun.toppedUp === 0);
+  // The provider really did the work, so it is paid — but only up to the ceiling.
+  const paid = economy.balance("provider:x", "model_tokens");
+  assert.ok(paid > 0 && paid < 900, `expected a capped payment, got ${paid}`);
+  assert.equal(before - economy.balance("agent:capped", "model_tokens"), paid);
+  assert.equal(error.unbilled[0].delivered, 900);
+  assert.equal(error.unbilled[0].billed, paid);
+  assert.equal(economy.assertConserved("model_tokens"), true);
+});
+
+test("a thought that fails after the provider answered pays for the delivered tokens instead of refunding them", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-postfail-"));
+  const economy = await PersistentResourceEconomy.open(directory);
+  await economy.mint("agent:parsefail", "model_tokens", 10_000);
+  const before = economy.balance("agent:parsefail", "model_tokens");
+  const agent = new FakeAgent("agent:parsefail", { objective: "think" });
+  // Valid usage, unparseable content: the completion happened, the thought did not.
+  const loop = new MeteredCognitiveLoop(economy, fixedUsageLlm(400, "not json at all"), {
+    providerAccount: "provider:x",
+    reserveOutputTokens: 5_000,
+    tokenSafetyFactor: 1,
+  });
+
+  await assert.rejects(() => loop.think(agent));
+
+  assert.equal(economy.balance("provider:x", "model_tokens"), 400);
+  assert.equal(before - economy.balance("agent:parsefail", "model_tokens"), 400);
+  assert.equal(economy.assertConserved("model_tokens"), true);
+});
+
+test("a thought that never reached the provider is still refunded in full", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-prefail-"));
+  const economy = await PersistentResourceEconomy.open(directory);
+  await economy.mint("agent:offline", "model_tokens", 10_000);
+  const before = economy.balance("agent:offline", "model_tokens");
+  const agent = new FakeAgent("agent:offline", { objective: "think" });
+  const loop = new MeteredCognitiveLoop(
+    economy,
+    { async complete() { throw new Error("transport refused"); } },
+    { providerAccount: "provider:x", reserveOutputTokens: 100 },
+  );
+
+  await assert.rejects(() => loop.think(agent), /transport refused/);
+
+  assert.equal(economy.balance("agent:offline", "model_tokens"), before);
+  assert.equal(economy.balance("provider:x", "model_tokens"), 0);
+  assert.equal(economy.assertConserved("model_tokens"), true);
+});
