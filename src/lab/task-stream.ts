@@ -1,5 +1,6 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
-import { compareCodeUnits } from "./canonical.js";
+import { compareCodeUnits, hashValue } from "./canonical.js";
+import { DeterministicRng } from "./rng.js";
 import type {
   DeterministicRngCheckpoint,
   LabTaskState,
@@ -7,6 +8,24 @@ import type {
   TaskStreamCheckpoint,
   TaskStreamConfig,
 } from "./types.js";
+
+/**
+ * The RNG a task stream must be driven by, derived identically by the world
+ * and by the protocol verifier.
+ *
+ * Without a `realizationSeed` the stream forks off the run's root RNG, so the
+ * realization is bound to the run identity — the historical behaviour every
+ * existing run hash depends on. With one, the stream is seeded from the
+ * realization seed alone, so runs that differ in policy, costs or universe id
+ * face byte-identical tasks and oracles; control-arm comparisons rely on it.
+ */
+export function taskStreamRng(config: TaskStreamConfig, rootRng: DeterministicRng): DeterministicRng {
+  if (config.realizationSeed === undefined) return rootRng.fork("tasks");
+  return new DeterministicRng(hashValue({
+    domain: "agent-native-universe/lab/task-realization/v1",
+    realizationSeed: config.realizationSeed,
+  }));
+}
 
 export interface TaskRandomSource {
   nextInt(maxExclusive: number): number;

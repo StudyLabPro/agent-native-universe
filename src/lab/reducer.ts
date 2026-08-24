@@ -645,6 +645,12 @@ export function prepareWorldEventTransition(
       }
       break;
     }
+    case "cognition.recorded":
+      // Deliberately state-neutral. What a model proposed is evidence; only the
+      // actions the world then accepted may move the world.
+      mutation = () => {};
+      break;
+
     case "agent.learning.updated": {
       throw new Error("agent.learning.updated is unsupported; learning is derived from task.evaluated");
     }

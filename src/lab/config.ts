@@ -121,6 +121,12 @@ export function validateGenesisConfig(config: GenesisConfig): void {
   nonNegativeInteger(config.taskStream.tasksPerTick, "taskStream.tasksPerTick");
   positiveInteger(config.taskStream.deadlineTicks, "taskStream.deadlineTicks");
   positiveInteger(config.taskStream.maxBacklog, "taskStream.maxBacklog");
+  if (config.taskStream.realizationSeed !== undefined) {
+    const realizationSeed = config.taskStream.realizationSeed;
+    if (typeof realizationSeed !== "string" || realizationSeed.trim().length === 0 || realizationSeed.length > 128) {
+      throw new Error("taskStream.realizationSeed must be a non-empty string of at most 128 characters");
+    }
+  }
   validateResources(config.initialResources, "initialResources");
   validateResources(config.treasuryResources, "treasuryResources");
   validateResources(config.acceptedTaskReward, "acceptedTaskReward");

@@ -4,18 +4,21 @@ import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import { equalJson } from "./evaluator.js";
 import { deterministicId } from "./ids.js";
-import { createRunManifest } from "./manifest.js";
+import { createRunManifest, LAB_POLICY_ID } from "./manifest.js";
 import { computeMetrics } from "./metrics.js";
+import { createLogicalPolicyById } from "./baselines.js";
+import { CohortPolicy, type CognitionRecord } from "./cognition.js";
 import { NeutralPolicy } from "./neutral-policy.js";
 import {
   decidePolicyTick,
+  type LogicalPolicy,
   type DeferredPolicyViolation,
   type PolicyDecision,
 } from "./policy-schedule.js";
 import { PressureEngine } from "./pressure-engine.js";
 import { RESOURCE_KINDS, ResourcePhysics } from "./resource-physics.js";
 import { DeterministicRng } from "./rng.js";
-import { DeterministicTaskStream, type GeneratedTask } from "./task-stream.js";
+import { DeterministicTaskStream, taskStreamRng, type GeneratedTask } from "./task-stream.js";
 import {
   PPM,
   type CheckpointRuntimeState,
@@ -64,6 +67,7 @@ const EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>
   "message.delivered": ["resolution"],
   "capability.published": ["resolution"],
   "capability.used": ["resolution"],
+  "cognition.recorded": ["observation"],
   "violation.recorded": ["resolution"],
   "task.evaluated": ["evaluation"],
   "metrics.recorded": ["metrics"],
@@ -129,7 +133,15 @@ export class LabProtocolVerifier {
   readonly #physics = new ResourcePhysics();
   readonly #pressure: PressureEngine;
   readonly #pressureRng: DeterministicRng;
-  readonly #policy = new NeutralPolicy();
+  readonly #neutral = new NeutralPolicy();
+  /**
+   * In cognitive mode the verifier must not regenerate a decision a model made.
+   * It replays the recorded answers through the same cohort policy the run
+   * used, so verification stays exact without ever calling a provider.
+   */
+  readonly #policy: LogicalPolicy;
+  readonly #cognitive: boolean;
+  #cognitionRecords: CognitionRecord[] = [];
   readonly #policyRng: DeterministicRng;
   readonly #resolutionRng: DeterministicRng;
   readonly #tasks: DeterministicTaskStream;
@@ -165,12 +177,18 @@ export class LabProtocolVerifier {
       universeId: manifest.universeId,
       seed: config.seed,
     }));
-    this.#tasks = new DeterministicTaskStream(config.taskStream, rootRng.fork("tasks"));
+    this.#tasks = new DeterministicTaskStream(config.taskStream, taskStreamRng(config.taskStream, rootRng));
     this.#pressure = new PressureEngine(config.pressures);
     this.#pressureRng = rootRng.fork("pressure");
     this.#policyRng = rootRng.fork("policy");
     this.#resolutionRng = rootRng.fork("resolution");
     this.#initialAgentTotals = multiplyResources(config.initialResources, config.agents);
+    this.#cognitive = manifest.mode === "cognitive";
+    this.#policy = this.#cognitive
+      ? new CohortPolicy(cohortOf(manifest.policyId), this.#neutral)
+      : manifest.policyId === LAB_POLICY_ID
+        ? this.#neutral
+        : createLogicalPolicyById(manifest.policyId);
   }
 
   verifyNext(event: LabEvent, state: WorldState): void {
@@ -190,6 +208,17 @@ export class LabProtocolVerifier {
     this.#finalizeSkippedPhases(rank, event, state);
     if (rank < this.#lastPhaseRank) this.#fail(event, "phase moves backwards within a tick");
     this.#lastPhaseRank = rank;
+
+    if (event.type === "cognition.recorded") {
+      // Recorded cognition is an input to the decision phase, not an outcome of
+      // it: accept it here and let it steer the schedule regenerated below.
+      if (!this.#cognitive) this.#fail(event, "cognition.recorded requires a cognitive manifest");
+      if (this.#policyDecisions !== undefined) {
+        this.#fail(event, "cognition must be recorded before the decision phase of its tick");
+      }
+      this.#cognitionRecords.push(decodeCognitionRecord(event, (reason) => this.#fail(event, reason)));
+      return;
+    }
 
     if (
       this.#openPayment !== undefined
@@ -312,7 +341,7 @@ export class LabProtocolVerifier {
     }
     return {
       taskStream: this.#tasks.checkpoint(),
-      policy: this.#policy.checkpoint(),
+      policy: this.#policy instanceof NeutralPolicy ? this.#policy.checkpoint() : null,
     };
   }
 
@@ -367,6 +396,7 @@ export class LabProtocolVerifier {
     this.#openPayment = undefined;
     this.#policyDecisions = undefined;
     this.#policyViolations = undefined;
+    this.#cognitionRecords = [];
     const pressure = this.#pressure.forTick(tick, state, this.#pressureRng.fork(tick));
     this.#pressureExpected = [
       ...pressure.events.map((draft) => ({ type: "pressure.applied" as const, data: draft.data })),
@@ -453,6 +483,7 @@ export class LabProtocolVerifier {
 
   #ensurePolicySchedule(state: WorldState): void {
     if (this.#policyDecisions !== undefined && this.#policyViolations !== undefined) return;
+    if (this.#policy instanceof CohortPolicy) this.#policy.load(this.#cognitionRecords);
     const batch = decidePolicyTick(
       state,
       this.#currentTick,
@@ -692,11 +723,29 @@ export class LabProtocolVerifier {
         assertExact(event.data, { message }, event, this.#fail.bind(this), "send outcome");
         return;
       }
+      case "verify": {
+        const submission = state.submissions[decision.action.submissionId];
+        if (submission === undefined) this.#fail(event, "verify outcome references an unknown submission");
+        if (event.type !== "submission.verified" || event.targetId !== submission.agentId) {
+          this.#fail(event, "verify outcome differs from its deterministic decision");
+        }
+        const verification = {
+          id: deterministicId("verification", this.manifest.runId, submission.id, actorId),
+          submissionId: submission.id,
+          verifierId: actorId,
+          computedResult: structuredClone(decision.action.computedResult),
+          verdict: decision.action.verdict,
+          matchesSubmission: hashValue(decision.action.computedResult) === hashValue(submission.result),
+          createdTick: event.tick,
+        };
+        assertExact(event.data, { verification }, event, this.#fail.bind(this), "verify outcome");
+        return;
+      }
       case "observe":
       case "reason":
         this.#fail(event, `${decision.action.type} must not emit an action outcome`);
       default:
-        this.#fail(event, `unsupported action ${decision.action.type} in the manifest-bound neutral policy`);
+        this.#fail(event, `unsupported action ${decision.action.type} in the manifest-bound policy`);
     }
   }
 
@@ -720,6 +769,21 @@ export class LabProtocolVerifier {
         return task === undefined || task.status !== "claimed" || task.claimedBy !== decision.actorId
           ? `Task ${action.taskId} is not claimed by ${decision.actorId}`
           : undefined;
+      }
+      case "verify": {
+        // Mirrors the world's checks in their exact order, so a violation's
+        // reason is regenerated rather than trusted.
+        const submission = state.submissions[action.submissionId];
+        if (submission === undefined) return `Unknown submission ${action.submissionId}`;
+        if (submission.agentId === decision.actorId) return "Agents cannot verify their own submissions";
+        const duplicate = Object.values(state.verifications).some((verification) => (
+          verification.submissionId === submission.id && verification.verifierId === decision.actorId
+        ));
+        if (duplicate) return `Submission ${submission.id} is already verified by ${decision.actorId}`;
+        const matchesSubmission = hashValue(action.computedResult) === hashValue(submission.result);
+        return action.verdict === matchesSubmission
+          ? undefined
+          : "Verification verdict does not match the independently computed result";
       }
       default:
         return undefined;
@@ -940,7 +1004,11 @@ export function assertReplayConfiguration(manifest: RunManifest, config: Genesis
   if (manifest.experimentId !== config.experimentId) throw new ProtocolVerificationError("Manifest experiment does not match config");
   if (manifest.seed !== config.seed) throw new ProtocolVerificationError("Manifest seed does not match config");
   if (manifest.configHash !== hashValue(config)) throw new ProtocolVerificationError("Manifest configHash does not match config");
-  const expected = createRunManifest(config, manifest.universeId);
+  const expected = createRunManifest(config, manifest.universeId, {
+    policyId: manifest.policyId,
+    mode: manifest.mode,
+    ...(manifest.cognitionId === undefined ? {} : { cognitionId: manifest.cognitionId }),
+  });
   if (hashValue(manifest) !== hashValue(expected)) {
     throw new ProtocolVerificationError("Manifest identity or runId is not deterministic for this config");
   }
@@ -1015,6 +1083,33 @@ function safePpmMultiply(value: number, multiplierPpm: number): number {
   const result = (BigInt(value) * BigInt(multiplierPpm)) / BigInt(PPM);
   if (result > BigInt(Number.MAX_SAFE_INTEGER)) throw new ProtocolVerificationError("Task load exceeds safe integer range");
   return Number(result);
+}
+
+/** The cohort a manifest policy id belongs to, e.g. `cohort-c-...` to `"C"`. */
+function cohortOf(policyId: string): "A" | "B" | "C" {
+  const letter = /^cohort-([abc])-/.exec(policyId)?.[1];
+  if (letter === undefined) throw new ProtocolVerificationError(`Policy ${policyId} is not a cohort policy`);
+  return letter.toUpperCase() as "A" | "B" | "C";
+}
+
+/** Rebuild a record from its event without trusting the payload's shape. */
+function decodeCognitionRecord(event: LabEvent, fail: (reason: string) => never): CognitionRecord {
+  const data = event.data as Record<string, unknown>;
+  const actions = data.actions;
+  if (!Array.isArray(actions)) fail("cognition.recorded requires an actions array");
+  if (typeof data.cohort !== "string") fail("cognition.recorded requires a cohort");
+  if (typeof event.actorId !== "string") fail("cognition.recorded requires an actorId");
+  return {
+    tick: event.tick,
+    agentId: event.actorId,
+    cohort: data.cohort as "A" | "B" | "C",
+    provider: String(data.provider ?? ""),
+    model: String(data.model ?? ""),
+    content: String(data.content ?? ""),
+    usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    latencyMs: 0,
+    actions: structuredClone(actions) as CognitionRecord["actions"],
+  };
 }
 
 function multiplyResources(resources: ResourceVector, count: number): ResourceVector {

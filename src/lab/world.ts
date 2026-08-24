@@ -3,17 +3,20 @@ import { assertRoleNeutralGenesis, createGenesisAgents } from "./agent-factory.j
 import { createCapabilityState, executeCapabilityPlan } from "./capability-registry.js";
 import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
+import { createObservationFrame, observeWorldFromFrame } from "./environment.js";
 import { IndependentEvaluator } from "./evaluator.js";
 import type { LabEventRecorder } from "./event-recorder.js";
 import { createLabEvent } from "./events.js";
 import { deterministicId } from "./ids.js";
 import {
+  LAB_COGNITIVE_ENGINE_VERSION,
   LAB_ENGINE_VERSION,
   LAB_POLICY_ID,
   LAB_TASK_GENERATOR_ID,
   createRunManifest,
 } from "./manifest.js";
 import { computeMetrics } from "./metrics.js";
+import { CohortPolicy, type CognitionPort, type CognitionRecord } from "./cognition.js";
 import { NeutralPolicy } from "./neutral-policy.js";
 import {
   decidePolicyTick,
@@ -24,7 +27,7 @@ import { PressureEngine } from "./pressure-engine.js";
 import { initialWorldState, prepareWorldEventTransition } from "./reducer.js";
 import { RESOURCE_KINDS, ResourcePhysics } from "./resource-physics.js";
 import { DeterministicRng } from "./rng.js";
-import { DeterministicTaskStream } from "./task-stream.js";
+import { DeterministicTaskStream, taskStreamRng } from "./task-stream.js";
 import {
   LAB_SCHEMA_VERSION,
   PPM,
@@ -46,6 +49,12 @@ export type { LogicalPolicy } from "./policy-schedule.js";
 
 export interface LogicalUniverseOptions {
   policy?: LogicalPolicy;
+  /**
+   * Consulted asynchronously before each decision phase. Every answer is
+   * committed as evidence, so a cognitive run stays replayable without ever
+   * asking a model twice.
+   */
+  cognition?: CognitionPort;
   onMetrics?: (snapshot: MetricsSnapshot) => void | Promise<void>;
   onCheckpoint?: (checkpoint: Checkpoint) => void | Promise<void>;
   /** A replay-verified durable boundary from this exact recorder and manifest. */
@@ -63,6 +72,7 @@ export class LogicalUniverse {
   readonly recorder: LabEventRecorder;
 
   readonly #policy: LogicalPolicy;
+  readonly #cognition: CognitionPort | undefined;
   readonly #onMetrics: LogicalUniverseOptions["onMetrics"];
   readonly #onCheckpoint: LogicalUniverseOptions["onCheckpoint"];
   readonly #physics = new ResourcePhysics();
@@ -90,12 +100,20 @@ export class LogicalUniverse {
   ) {
     validateGenesisConfig(config);
     if (manifest.schemaVersion !== LAB_SCHEMA_VERSION) throw new Error("Manifest schema does not match the lab");
+    const cognitiveMode = manifest.mode === "cognitive";
+    const expectedEngine = cognitiveMode ? LAB_COGNITIVE_ENGINE_VERSION : LAB_ENGINE_VERSION;
     if (
-      manifest.engineVersion !== LAB_ENGINE_VERSION
-      || manifest.mode !== "logical"
+      manifest.engineVersion !== expectedEngine
+      || (manifest.mode !== "logical" && !cognitiveMode)
       || manifest.taskGeneratorId !== LAB_TASK_GENERATOR_ID
     ) {
       throw new Error("Manifest implementation identity does not match this logical engine");
+    }
+    if (cognitiveMode !== (options.cognition !== undefined)) {
+      throw new Error("A cognitive manifest requires a cognition port, and a logical manifest forbids one");
+    }
+    if (options.cognition !== undefined && options.cognition.id !== manifest.cognitionId) {
+      throw new Error("Cognition port identity must exactly match manifest.cognitionId");
     }
     if (manifest.experimentId !== config.experimentId) throw new Error("Manifest experiment does not match config");
     if (manifest.seed !== config.seed) throw new Error("Manifest seed does not match config");
@@ -104,7 +122,11 @@ export class LogicalUniverse {
       throw new Error("Recorder belongs to another run or universe");
     }
 
-    const expectedManifest = createRunManifest(config, manifest.universeId, { policyId: manifest.policyId });
+    const expectedManifest = createRunManifest(config, manifest.universeId, {
+      policyId: manifest.policyId,
+      mode: manifest.mode,
+      ...(manifest.cognitionId === undefined ? {} : { cognitionId: manifest.cognitionId }),
+    });
     if (hashValue(manifest) !== hashValue(expectedManifest)) {
       throw new Error("Manifest identity or runId is not deterministic for this config and policy");
     }
@@ -121,6 +143,7 @@ export class LogicalUniverse {
     this.config = structuredClone(config);
     this.recorder = recorder;
     this.#policy = options.policy ?? new NeutralPolicy();
+    this.#cognition = options.cognition;
     this.#onMetrics = options.onMetrics;
     this.#onCheckpoint = options.onCheckpoint;
     const rootRng = new DeterministicRng(hashValue({
@@ -129,7 +152,7 @@ export class LogicalUniverse {
       universeId: manifest.universeId,
       seed: config.seed,
     }));
-    this.#taskStream = new DeterministicTaskStream(config.taskStream, rootRng.fork("tasks"));
+    this.#taskStream = new DeterministicTaskStream(config.taskStream, taskStreamRng(config.taskStream, rootRng));
     this.#pressure = new PressureEngine(config.pressures);
     this.#policyRng = rootRng.fork("policy");
     this.#pressureRng = rootRng.fork("pressure");
@@ -274,6 +297,7 @@ export class LogicalUniverse {
       await this.#applyPressures(tick);
       await this.#expireTasks(tick);
       await this.#generateTasks(tick);
+      await this.#consultCognition(tick);
       const decisions = await this.#decide(tick);
       const pendingEvaluation: string[] = [];
       const ordered = this.#resolutionRng.fork(tick).shuffle(decisions);
@@ -360,6 +384,81 @@ export class LogicalUniverse {
         data: toJsonObject({ task: generated.task }),
       });
     }
+  }
+
+  /**
+   * The asynchronous half of cognition.
+   *
+   * Answers are committed before any of them is acted on, so the evidence
+   * records what the model said independently of what the world then did with
+   * it — including answers that were rejected as unusable.
+   */
+  async #consultCognition(tick: number): Promise<void> {
+    const cognition = this.#cognition;
+    if (cognition === undefined) return;
+    const policy = this.#policy;
+    if (!(policy instanceof CohortPolicy)) return;
+
+    const agentIds = Object.keys(this.#world.agents)
+      .filter((agentId) => this.#world.agents[agentId]?.active)
+      .sort();
+    // The same pure projection the decision phase will use. It consumes no
+    // randomness, so consulting a model cannot shift the deterministic streams.
+    const frame = createObservationFrame(this.#world, tick);
+    const requests = agentIds.flatMap((agentId) => {
+      const agent = this.#world.agents[agentId];
+      if (agent === undefined) return [];
+      return [{
+        tick,
+        agentId,
+        observation: observeWorldFromFrame(frame, agentId),
+        agent: structuredClone(agent),
+      }];
+    });
+    if (requests.length === 0) {
+      policy.load([]);
+      return;
+    }
+
+    let records: CognitionRecord[] = [];
+    try {
+      records = await cognition.propose(requests);
+    } catch (error) {
+      // Losing the provider must not lose the tick: the population simply falls
+      // back to the neutral policy, and the failure is on record below.
+      records = [{
+        tick,
+        agentId: requests[0]!.agentId,
+        cohort: cognition.cohort,
+        provider: "unavailable",
+        model: "unavailable",
+        content: "",
+        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        latencyMs: 0,
+        actions: [],
+        rejected: `cognition failure: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300),
+      }];
+    }
+
+    for (const record of records) {
+      await this.#commit({
+        tick,
+        phase: "observation",
+        type: "cognition.recorded",
+        actorId: record.agentId,
+        data: toJsonObject({
+          cohort: record.cohort,
+          provider: record.provider,
+          model: record.model,
+          content: record.content,
+          usage: record.usage,
+          latencyMs: record.latencyMs,
+          actions: record.actions,
+          ...(record.rejected === undefined ? {} : { rejected: record.rejected }),
+        }),
+      });
+    }
+    policy.load(records);
   }
 
   async #decide(tick: number): Promise<PolicyDecision[]> {

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { EvidenceConflictError, EvidenceStore } from "./artifacts.js";
 import { canonicalJson, hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
+import { analysePopulation } from "./pareto.js";
 import { verifyCompletedRunEvidence } from "./evidence-verifier.js";
 import {
   ensureNoSymlinkDirectoryHierarchy,
@@ -170,6 +171,7 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
     experimentId: baseConfig.experimentId,
     baseSeed,
     universes: complete,
+    pareto: analysePopulation(complete),
   };
   await writePopulationSummary(options.runsRoot, populationIdValue, population);
   return structuredClone(population);

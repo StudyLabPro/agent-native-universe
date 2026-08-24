@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
+import type { ParetoAnalysis } from "./pareto.js";
 
 export const LAB_SCHEMA_VERSION = 1 as const;
 export const PPM = 1_000_000;
@@ -56,6 +57,13 @@ export interface TaskStreamConfig {
   tasksPerTick: number;
   deadlineTicks: number;
   maxBacklog: number;
+  /**
+   * When present, the task stream is seeded from this value alone instead of
+   * from the run identity, so runs that differ only in policy or costs face
+   * the identical realization of tasks and oracles. Control-arm comparisons
+   * pin it; absent, the stream stays bound to the run as before.
+   */
+  realizationSeed?: string;
 }
 
 export type PressureSpec =
@@ -84,9 +92,20 @@ export interface RunManifest {
   schemaVersion: typeof LAB_SCHEMA_VERSION;
   experimentId: string;
   engineVersion: string;
-  mode: "logical";
+  /**
+   * `logical` runs regenerate their own decision stream from the seed.
+   * `cognitive` runs cannot: a model answered, so replay reads the recorded
+   * answers back instead of re-deriving them.
+   */
+  mode: "logical" | "cognitive";
   policyId: string;
   taskGeneratorId: string;
+  /**
+   * Identity of the cognition port consulted (model, endpoint, consultation
+   * budget). Present exactly when mode is `cognitive`, and hashed into the
+   * runId so runs of different models can never share evidence.
+   */
+  cognitionId?: string;
   runId: string;
   universeId: string;
   seed: string;
@@ -372,6 +391,7 @@ export type LabEventType =
   | "capability.published"
   | "capability.used"
   | "agent.learning.updated"
+  | "cognition.recorded"
   | "pressure.applied"
   | "violation.recorded"
   | "metrics.recorded"
@@ -504,6 +524,11 @@ export interface PopulationSummary {
   experimentId: string;
   baseSeed: string;
   universes: RunSummary[];
+  /**
+   * Multi-objective comparison of the universes. Absent on summaries written
+   * before the analysis existed, so older evidence stays readable.
+   */
+  pareto?: ParetoAnalysis;
 }
 
 export const ZERO_RESOURCES: Readonly<ResourceVector> = Object.freeze({

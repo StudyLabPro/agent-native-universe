@@ -5,13 +5,26 @@ import { lstat, open, type FileHandle } from "node:fs/promises";
 import type { Server } from "node:http";
 import { parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { EvidenceStore } from "./artifacts.js";
+import { createLogicalPolicyById, zeroCostConfig } from "./baselines.js";
+import { hashValue } from "./canonical.js";
+import { deterministicId } from "./ids.js";
+import {
+  BASELINE_CENTRAL_DISPATCH_ID,
+  BASELINE_FIXED_ROLES_ID,
+  BASELINE_NO_LINKS_ID,
+} from "./manifest.js";
+import { analysePopulation } from "./pareto.js";
 import { canonicalJson } from "./canonical.js";
 import { loadGenesisConfig, validateGenesisConfig } from "./config.js";
 import {
   attestRunEvidence,
   verifyRunEvidenceAttestation,
 } from "./evidence-attestation.js";
+import { LlmRouter, OpenAICompatibleProvider } from "../v1/economy-llm.js";
+import { LlmCognition, type CognitionPort } from "./cognition.js";
 import { GenesisRunPausedError, runGenesis } from "./genesis.js";
 import { startObserverServer } from "./observer.js";
 import {
@@ -21,7 +34,8 @@ import {
   runPopulation,
 } from "./population.js";
 import { ReplayEngine } from "./replay.js";
-import type { GenesisConfig } from "./types.js";
+import type { LogicalPolicy } from "./policy-schedule.js";
+import type { GenesisConfig, RunSummary } from "./types.js";
 
 const DEFAULT_DATA_DIR = "runs";
 const DEFAULT_EXPERIMENT_ID = "genesis-1";
@@ -55,6 +69,8 @@ const RUN_OPTIONS = new Set([
 ]);
 const GENESIS_OPTIONS = new Set([
   "agents",
+  "arm",
+  "cohort",
   "checkpoint-every",
   "config",
   "data-dir",
@@ -63,6 +79,17 @@ const GENESIS_OPTIONS = new Set([
   "seed",
   "ticks",
   "universe-id",
+]);
+const BASELINES_OPTIONS = new Set([
+  "agents",
+  "arms",
+  "checkpoint-every",
+  "config",
+  "data-dir",
+  "experiment",
+  "metric-every",
+  "seed",
+  "ticks",
 ]);
 const REPLAY_OPTIONS = new Set([
   "data-dir",
@@ -109,6 +136,7 @@ const HELP = {
   commands: {
     run: "alias for population",
     "genesis-1": "run one logical Genesis-1 universe",
+    baselines: "run the §33 control arms on one seed and compare them",
     population: "run a bounded population of independent universes",
     replay: "replay one universe from its append-only evidence",
     attest: "create or recover a deterministic final evidence attestation",
@@ -125,6 +153,7 @@ const HELP = {
   examples: [
     "anu lab genesis-1 --data-dir ./runs --universe-id U0001",
     "anu lab population --data-dir ./runs --universes 32 --parallel 8",
+    "anu lab baselines --data-dir ./runs --ticks 200 --arms A,C,D,E,F",
     "anu lab replay --data-dir ./runs --universe-id U0001 [--run-id RUN_ID]",
     "anu lab attest --data-dir ./runs --universe-id U0001 --run-id RUN_ID",
     "anu lab verify-attestation --data-dir ./runs --universe-id U0001 --run-id RUN_ID --expected sha256:HASH",
@@ -165,6 +194,9 @@ export async function runLabCli(
         return 0;
       case "genesis-1":
         await executeGenesis(argv.slice(1), io);
+        return 0;
+      case "baselines":
+        await executeBaselines(argv.slice(1), io);
         return 0;
       case "replay":
         await executeReplay(argv.slice(1), io);
@@ -260,23 +292,46 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
     writeJson(io.stdout, {
       command: "genesis-1",
       status: "ok",
-      usage: "anu lab genesis-1 [--data-dir PATH] [--universe-id U0001] [config overrides]",
+      usage: "anu lab genesis-1 [--data-dir PATH] [--universe-id U0001] [--cohort A|B|C] [config overrides]",
     });
     return;
   }
 
-  const config = await configuredGenesis(options.values);
+  const arm = parseBaselineArm(options.values.get("arm"));
+  const config = applyBaselineArm(await configuredGenesis(options.values), arm);
   const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
   const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
   const shutdown = installRunAbortController();
   try {
-    const summary = await runGenesis({ config, runsRoot, universeId, signal: shutdown.signal });
+    const cognition = createCohortCognition(options.values.get("cohort"));
+    if (cognition !== undefined && arm !== "A") {
+      throw new CliUsageError("--cohort applies to arm A only; a control arm that thinks with a model is not a control");
+    }
+    const policy = baselineArmPolicy(arm);
+    const summary = await runGenesis({
+      config,
+      runsRoot,
+      universeId,
+      signal: shutdown.signal,
+      ...(cognition === undefined ? {} : { cognition }),
+      ...(policy === undefined ? {} : { policy }),
+    });
     writeJson(io.stdout, {
       command: "genesis-1",
       status: "completed",
       summary,
     });
   } catch (error) {
+    if (error instanceof Error && /does not support deterministic resume/.test(error.message)) {
+      // Cohort and control-arm policies fail closed on resume by design (and
+      // resume itself is unsound until the evaluator's oracle map is rebuilt
+      // on restore). Fail with the recovery path instead of a bare engine error.
+      throw new CliUsageError(
+        "This run was interrupted earlier and cannot resume (only unresumed neutral runs "
+        + `support it). Delete ${runsRoot}/${config.experimentId}/${universeId}/ and rerun `
+        + "to redo the run from genesis under the same deterministic identity.",
+      );
+    }
     if (!(error instanceof GenesisRunPausedError)) throw error;
     writeJson(io.stdout, {
       command: "genesis-1",
@@ -288,6 +343,212 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
   } finally {
     shutdown.cleanup();
   }
+}
+
+type BaselineArm = "A" | "C" | "D" | "E" | "F";
+
+/**
+ * Universe ids are bound to the arm identity, not to the position in the
+ * --arms list: `--arms F` and `--arms A,C,F` must produce the same runId for
+ * arm F, or reruns of a subset would silently redo full runs as unrelated
+ * evidence.
+ */
+const BASELINE_ARM_UNIVERSES: Record<BaselineArm, string> = {
+  A: "U0001",
+  C: "U0002",
+  D: "U0003",
+  E: "U0004",
+  F: "U0005",
+};
+
+const BASELINE_ARM_DESCRIPTIONS: Record<BaselineArm, string> = {
+  A: "self-organizing network (neutral policy)",
+  C: "no resource economy (every action cost is zero)",
+  D: "no link adaptation (topology actions suppressed)",
+  E: "central orchestrator (fixed dispatch, no discovery)",
+  F: "preassigned human roles (fixed roles and fixed routing)",
+};
+
+function parseBaselineArm(raw: string | undefined): BaselineArm {
+  const arm = (raw ?? "A").trim().toUpperCase();
+  if (arm === "B") {
+    throw new CliUsageError(
+      "Arm B (no metaagents) is not applicable: the logical engine has no metaagents to remove",
+    );
+  }
+  if (arm !== "A" && arm !== "C" && arm !== "D" && arm !== "E" && arm !== "F") {
+    throw new CliUsageError(`Unknown baseline arm ${raw}; expected A, C, D, E or F`);
+  }
+  return arm;
+}
+
+/** Arm C is a physics change, not a policy: it lives in the config hash. */
+function applyBaselineArm(config: GenesisConfig, arm: BaselineArm): GenesisConfig {
+  return arm === "C" ? zeroCostConfig(config) : config;
+}
+
+function baselineArmPolicy(arm: BaselineArm): LogicalPolicy | undefined {
+  switch (arm) {
+    case "A":
+    case "C":
+      return undefined;
+    case "D":
+      return createLogicalPolicyById(BASELINE_NO_LINKS_ID);
+    case "E":
+      return createLogicalPolicyById(BASELINE_CENTRAL_DISPATCH_ID);
+    case "F":
+      return createLogicalPolicyById(BASELINE_FIXED_ROLES_ID);
+  }
+}
+
+async function executeBaselines(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, BASELINES_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "baselines",
+      status: "ok",
+      usage: "anu lab baselines [--data-dir PATH] [--arms A,C,D,E,F] [config overrides]",
+      arms: BASELINE_ARM_DESCRIPTIONS,
+    });
+    return;
+  }
+
+  const config = await configuredGenesis(options.values);
+  // Pin one task realization for the whole comparison: every arm faces
+  // byte-identical tasks and oracles, so metric gaps are attributable to the
+  // architecture rather than to each arm drawing its own task luck.
+  config.taskStream.realizationSeed ??= config.seed;
+  const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
+  const arms = parseBaselineArmList(options.values.get("arms"));
+  const shutdown = installRunAbortController();
+  try {
+    const runs: Array<{ arm: BaselineArm; description: string; configHash: string; summary: RunSummary }> = [];
+    for (const arm of arms) {
+      const armConfig = applyBaselineArm(structuredClone(config), arm);
+      const policy = baselineArmPolicy(arm);
+      const summary = await runGenesis({
+        config: armConfig,
+        runsRoot,
+        universeId: BASELINE_ARM_UNIVERSES[arm],
+        signal: shutdown.signal,
+        ...(policy === undefined ? {} : { policy }),
+      });
+      runs.push({
+        arm,
+        description: BASELINE_ARM_DESCRIPTIONS[arm],
+        configHash: hashValue(armConfig),
+        summary,
+      });
+    }
+
+    const comparison = {
+      schemaVersion: 1,
+      caveats: [
+        "All arms face one pinned task realization (taskStream.realizationSeed), so metric gaps are attributable to the architecture, not to per-arm task luck.",
+        "One run per arm: differences smaller than seed-to-seed variance are not interpretable. Compare across seeds before concluding.",
+        "Arm F verification coverage is bounded by the observation physics: a tick producing more submissions than the public window (64) evicts the overflow before its only verifiable tick.",
+      ],
+      experimentId: config.experimentId,
+      seed: config.seed,
+      ticks: config.ticks,
+      agents: config.agents,
+      arms: runs.map((run) => ({
+        arm: run.arm,
+        description: run.description,
+        universeId: run.summary.universeId,
+        runId: run.summary.runId,
+        configHash: run.configHash,
+        metrics: run.summary.latestMetrics,
+      })),
+      pareto: analysePopulation(runs.map((run) => run.summary)),
+    };
+    const comparisonId = deterministicId(
+      "baselines",
+      config.seed,
+      hashValue(config),
+      arms.join(","),
+    ).replace(":", "-");
+    const directory = join(runsRoot, config.experimentId, "baselines", comparisonId);
+    await mkdir(directory, { recursive: true });
+    const path = join(directory, "comparison.json");
+    await writeFile(path, canonicalJson(comparison), "utf8");
+    writeJson(io.stdout, { command: "baselines", status: "completed", path, comparison });
+  } catch (error) {
+    if (error instanceof Error && /does not support deterministic resume/.test(error.message)) {
+      // A previously interrupted control arm left a durable checkpoint that
+      // baseline policies refuse to resume by design. Fail with the recovery
+      // path instead of a bare engine error.
+      throw new CliUsageError(
+        "A control arm was interrupted earlier and cannot resume "
+        + "(baseline policies fail closed on resume). Delete that arm's run directory "
+        + `under ${runsRoot}/${config.experimentId}/ and rerun to redo the arm from genesis.`,
+      );
+    }
+    if (!(error instanceof GenesisRunPausedError)) throw error;
+    writeJson(io.stdout, {
+      command: "baselines",
+      status: "paused",
+      runId: error.runId,
+      universeId: error.universeId,
+      tick: error.tick,
+    });
+  } finally {
+    shutdown.cleanup();
+  }
+}
+
+function parseBaselineArmList(raw: string | undefined): BaselineArm[] {
+  const arms = (raw ?? "A,C,D,E,F")
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .map((part) => parseBaselineArm(part));
+  if (arms.length === 0) throw new CliUsageError("--arms must name at least one arm");
+  if (new Set(arms).size !== arms.length) throw new CliUsageError("--arms must not repeat an arm");
+  return arms;
+}
+
+/**
+ * Cohort A is the control arm and needs no port: it is the logical engine.
+ * B and C need a provider, and refusing to invent one keeps a mislabelled run
+ * from being recorded as cognitive evidence.
+ */
+function createCohortCognition(raw: string | undefined): CognitionPort | undefined {
+  if (raw === undefined || raw === "A" || raw === "a") return undefined;
+  const cohort = raw.toUpperCase();
+  if (cohort !== "B" && cohort !== "C") throw new Error(`Unknown cohort ${raw}; expected A, B or C`);
+  const apiKey = process.env.ANU_LLM_API_KEY;
+  const baseUrl = process.env.ANU_LLM_BASE_URL;
+  const model = process.env.ANU_LLM_MODEL;
+  if (!baseUrl || !model) {
+    throw new Error(`Cohort ${cohort} requires ANU_LLM_BASE_URL and ANU_LLM_MODEL`);
+  }
+  const router = new LlmRouter();
+  router.register(new OpenAICompatibleProvider({
+    baseUrl,
+    defaultModel: model,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    timeoutMs: 180_000,
+  }));
+  // The host disambiguates equally-named deployments on different providers;
+  // the full URL stays out of the manifest, and the API key never goes near it.
+  const host = new URL(baseUrl).host;
+  return new LlmCognition({
+    cohort,
+    completion: router,
+    model: `${model}@${host}`,
+    agentsPerTick: positiveEnv("ANU_LLM_AGENTS_PER_TICK", 4),
+    concurrency: positiveEnv("ANU_LLM_CONCURRENCY", 4),
+    maxTokens: positiveEnv("ANU_LLM_MAX_TOKENS", 2_048),
+  });
+}
+
+function positiveEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+  return value;
 }
 
 async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<void> {

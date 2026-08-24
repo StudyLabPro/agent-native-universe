@@ -3,7 +3,11 @@ import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import { createRunEvidenceAttestation } from "./evidence-attestation.js";
 import { writeFinalAttestationInternal } from "./evidence-attestation-storage.js";
+import { createLogicalPolicyById } from "./baselines.js";
+import { CohortPolicy, type CognitionPort } from "./cognition.js";
+import type { LogicalPolicy } from "./policy-schedule.js";
 import { createRunManifest } from "./manifest.js";
+import { NeutralPolicy } from "./neutral-policy.js";
 import { ReplayEngine, type ReplayResult } from "./replay.js";
 import {
   LAB_SCHEMA_VERSION,
@@ -21,6 +25,18 @@ export interface GenesisRunOptions {
   runsRoot: string;
   universeId: string;
   signal?: AbortSignal;
+  /**
+   * Supplying a port makes this a cognitive run: the manifest takes a separate
+   * engine identity so its evidence can never be confused with a run a seed
+   * alone reproduces.
+   */
+  cognition?: CognitionPort;
+  /**
+   * A deterministic control-arm policy from the manifest registry (see
+   * baselines.ts). Mutually exclusive with `cognition`: a control that thinks
+   * with a model would not be a control.
+   */
+  policy?: LogicalPolicy;
 }
 
 export class GenesisRunPausedError extends Error {
@@ -47,7 +63,34 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
   if (!options.runsRoot) throw new TypeError("Genesis runs root must not be empty");
   const config = structuredClone(options.config);
   validateGenesisConfig(config);
-  const manifest = createRunManifest(config, options.universeId);
+  const cognition = options.cognition;
+  if (cognition !== undefined && options.policy !== undefined) {
+    throw new Error("A run takes either a cognition port or a baseline policy, never both");
+  }
+  // Never run with the caller's instance. A stateful policy that already
+  // decided a previous run would draw from advanced RNG streams, and the
+  // verifier — which always regenerates from a fresh instance — would refuse
+  // the evidence after the compute was already spent. Deriving a fresh policy
+  // from the identity guarantees the run uses exactly what replay will use.
+  const policy = cognition !== undefined
+    ? new CohortPolicy(cognition.cohort, new NeutralPolicy())
+    : options.policy === undefined
+      ? undefined
+      : createLogicalPolicyById(options.policy.id);
+  const manifest = createRunManifest(
+    config,
+    options.universeId,
+    policy === undefined
+      ? {}
+      : {
+        policyId: policy.id,
+        mode: cognition === undefined ? "logical" : "cognitive",
+        // The consulted model is part of the treatment: without it in the
+        // identity, rerunning the same cohort against a different model
+        // would recover the earlier run's evidence instead of running.
+        ...(cognition === undefined ? {} : { cognitionId: cognition.id }),
+      },
+  );
   const evidence = new EvidenceStore(
     options.runsRoot,
     manifest.experimentId,
@@ -62,6 +105,8 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
     if (recovery.kind === "completed") return recovery.summary;
 
     const universe = new LogicalUniverse(manifest, config, evidence.events, {
+      ...(policy === undefined ? {} : { policy }),
+      ...(cognition === undefined ? {} : { cognition }),
       onMetrics: (metrics) => evidence.appendMetrics(metrics),
       onCheckpoint: (checkpoint) => evidence.writeCheckpoint(checkpoint),
       ...(recovery.kind === "checkpoint" ? { resumeFrom: recovery.checkpoint } : {}),
