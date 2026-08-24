@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
+import type { ParetoAnalysis } from "./pareto.js";
 
 export const LAB_SCHEMA_VERSION = 1 as const;
 export const PPM = 1_000_000;
@@ -510,6 +511,11 @@ export interface PopulationSummary {
   experimentId: string;
   baseSeed: string;
   universes: RunSummary[];
+  /**
+   * Multi-objective comparison of the universes. Absent on summaries written
+   * before the analysis existed, so older evidence stays readable.
+   */
+  pareto?: ParetoAnalysis;
 }
 
 export const ZERO_RESOURCES: Readonly<ResourceVector> = Object.freeze({

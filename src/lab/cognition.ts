@@ -321,17 +321,18 @@ export const COGNITION_SYSTEM_PROMPT = [
   '{"type":"transfer","targetId":string,"resource":string,"amount":integer}',
   '{"type":"reserve","resource":string,"amount":integer}',
   '{"type":"trade","resource":string,"amount":integer,"credits":integer}',
-  '{"type":"spawn"} {"type":"clone"} {"type":"merge","targetId":string}',
+  'Resources are named exactly: credits, llmTokens, computeMs, storageBytes, bandwidthBytes.',
+  'A task must be claimed with claimTask before it can be executed or submitted.',
   "Every action costs resources. Acting without means ends you.",
   "Do not invent action types. Do not claim a task was solved correctly; only an external evaluator decides that.",
 ].join("\n");
 
 const RESOURCE_KINDS = new Set<string>([
   "credits",
-  "llm_tokens",
-  "compute_ms",
-  "storage_bytes",
-  "bandwidth_bytes",
+  "llmTokens",
+  "computeMs",
+  "storageBytes",
+  "bandwidthBytes",
 ]);
 
 /** Actions a model is allowed to request. `publishCapability` is excluded: its
