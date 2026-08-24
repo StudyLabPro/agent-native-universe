@@ -18,7 +18,7 @@ import {
 import { PressureEngine } from "./pressure-engine.js";
 import { RESOURCE_KINDS, ResourcePhysics } from "./resource-physics.js";
 import { DeterministicRng } from "./rng.js";
-import { DeterministicTaskStream, type GeneratedTask } from "./task-stream.js";
+import { DeterministicTaskStream, taskStreamRng, type GeneratedTask } from "./task-stream.js";
 import {
   PPM,
   type CheckpointRuntimeState,
@@ -177,7 +177,7 @@ export class LabProtocolVerifier {
       universeId: manifest.universeId,
       seed: config.seed,
     }));
-    this.#tasks = new DeterministicTaskStream(config.taskStream, rootRng.fork("tasks"));
+    this.#tasks = new DeterministicTaskStream(config.taskStream, taskStreamRng(config.taskStream, rootRng));
     this.#pressure = new PressureEngine(config.pressures);
     this.#pressureRng = rootRng.fork("pressure");
     this.#policyRng = rootRng.fork("policy");
@@ -1007,6 +1007,7 @@ export function assertReplayConfiguration(manifest: RunManifest, config: Genesis
   const expected = createRunManifest(config, manifest.universeId, {
     policyId: manifest.policyId,
     mode: manifest.mode,
+    ...(manifest.cognitionId === undefined ? {} : { cognitionId: manifest.cognitionId }),
   });
   if (hashValue(manifest) !== hashValue(expected)) {
     throw new ProtocolVerificationError("Manifest identity or runId is not deterministic for this config");

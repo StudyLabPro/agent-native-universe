@@ -82,7 +82,14 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
     options.universeId,
     policy === undefined
       ? {}
-      : { policyId: policy.id, mode: cognition === undefined ? "logical" : "cognitive" },
+      : {
+        policyId: policy.id,
+        mode: cognition === undefined ? "logical" : "cognitive",
+        // The consulted model is part of the treatment: without it in the
+        // identity, rerunning the same cohort against a different model
+        // would recover the earlier run's evidence instead of running.
+        ...(cognition === undefined ? {} : { cognitionId: cognition.id }),
+      },
   );
   const evidence = new EvidenceStore(
     options.runsRoot,

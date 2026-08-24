@@ -15,6 +15,7 @@ import { NeutralPolicy } from "../dist/lab/neutral-policy.js";
 import {
   DEFAULT_OBJECTIVES,
   analysePopulation,
+  crowdingDistances,
   dominates,
   paretoFrontier,
   selectSurvivors,
@@ -22,7 +23,11 @@ import {
 } from "../dist/lab/pareto.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
 import { runGenesis } from "../dist/lab/genesis.js";
-import { LAB_COGNITIVE_ENGINE_VERSION, LAB_ENGINE_VERSION } from "../dist/lab/manifest.js";
+import {
+  LAB_COGNITIVE_ENGINE_VERSION,
+  LAB_ENGINE_VERSION,
+  createRunManifest,
+} from "../dist/lab/manifest.js";
 
 /* ------------------------------------------------------------------ */
 /* Validation of model output                                          */
@@ -155,6 +160,7 @@ test("recorded cognition replays without contacting a provider", async () => {
 test("a provider failure is recorded as evidence instead of ending the tick", async () => {
   const cognition = new LlmCognition({
     cohort: "C",
+    model: "scripted-1@test",
     agentsPerTick: 1,
     completion: { async complete() { throw new Error("provider exploded"); } },
   });
@@ -267,7 +273,7 @@ test("a cognitive run takes its own engine identity and replays exactly", async 
     config,
     runsRoot: directory,
     universeId: "U0001",
-    cognition: new LlmCognition({ cohort: "C", completion, agentsPerTick: 2 }),
+    cognition: new LlmCognition({ cohort: "C", model: "scripted-1@test", completion, agentsPerTick: 2 }),
   });
 
   // runGenesis replays the whole stream and protocol-verifies it before
@@ -281,6 +287,18 @@ test("a cognitive run takes its own engine identity and replays exactly", async 
   assert.equal(manifest.engineVersion, LAB_COGNITIVE_ENGINE_VERSION);
   assert.notEqual(manifest.engineVersion, LAB_ENGINE_VERSION);
   assert.match(manifest.policyId, /^cohort-c-/);
+  assert.match(manifest.cognitionId, /^cognition-llm-c-v1:scripted-1@test:apt2:mt2048$/);
+
+  // The consulted model is part of the run identity: the same cohort against
+  // a different model must get its own runId instead of silently recovering
+  // this run's completed evidence.
+  const other = await runGenesis({
+    config,
+    runsRoot: directory,
+    universeId: "U0001",
+    cognition: new LlmCognition({ cohort: "C", model: "scripted-2@test", completion, agentsPerTick: 2 }),
+  });
+  assert.notEqual(other.runId, summary.runId);
 });
 
 test("a logical run refuses a cognition port and a cognitive run requires one", async (t) => {
@@ -293,4 +311,53 @@ test("a logical run refuses a cognition port and a cognitive run requires one", 
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   assert.equal(manifest.mode, "logical");
   assert.equal(manifest.engineVersion, LAB_ENGINE_VERSION);
+});
+
+test("a cognitive manifest binds the consulted model, a logical one refuses it", () => {
+  const config = { ...DEFAULT_GENESIS_CONFIG, ticks: 1, agents: 2, metricEvery: 1, checkpointEvery: 1 };
+  assert.throws(
+    () => createRunManifest(config, "U0001", { policyId: "cohort-c-neutral-backpressure-v1", mode: "cognitive" }),
+    /Cognition id/,
+    "a cognitive run without a cognition identity must be refused",
+  );
+  assert.throws(
+    () => createRunManifest(config, "U0001", { cognitionId: "cognition-llm-c-v1:m@h:apt2:mt64" }),
+    /logical run manifest must not carry/,
+    "a logical run claiming a cognition identity must be refused",
+  );
+  const manifest = createRunManifest(config, "U0001", {
+    policyId: "cohort-c-neutral-backpressure-v1",
+    mode: "cognitive",
+    cognitionId: "cognition-llm-c-v1:m@h:apt2:mt64",
+  });
+  const otherModel = createRunManifest(config, "U0001", {
+    policyId: "cohort-c-neutral-backpressure-v1",
+    mode: "cognitive",
+    cognitionId: "cognition-llm-c-v1:other@h:apt2:mt64",
+  });
+  assert.notEqual(manifest.runId, otherModel.runId, "different models must never share a run identity");
+});
+
+test("a flat objective axis grants nobody infinite crowding", () => {
+  // Three points: axis 0 is constant, axis 1 varies. Only axis 1 may crown
+  // boundary points; axis 0 must stay silent instead of electing the lowest
+  // and highest universe ids by name.
+  const layer = [
+    { universeId: "U0001", runId: "r1", values: [5, 10] },
+    { universeId: "U0002", runId: "r2", values: [5, 20] },
+    { universeId: "U0003", runId: "r3", values: [5, 30] },
+  ];
+  const distances = crowdingDistances(layer);
+  assert.equal(distances.get("U0001"), Number.MAX_SAFE_INTEGER);
+  assert.equal(distances.get("U0003"), Number.MAX_SAFE_INTEGER);
+  assert.notEqual(distances.get("U0002"), Number.MAX_SAFE_INTEGER);
+
+  // With every axis flat there is no diversity information at all: everyone
+  // keeps zero, and survival falls through to rank and stable ordering.
+  const flat = [
+    { universeId: "U0001", runId: "r1", values: [5, 10] },
+    { universeId: "U0002", runId: "r2", values: [5, 10] },
+    { universeId: "U0003", runId: "r3", values: [5, 10] },
+  ];
+  for (const distance of crowdingDistances(flat).values()) assert.equal(distance, 0);
 });

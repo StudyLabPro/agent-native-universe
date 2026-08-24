@@ -5,6 +5,29 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Universe Lab
+
+- Genesis runs can now put a model in the loop: cognition cohorts record every
+  answer as replay input (`cognition.recorded`), fall back to the neutral
+  policy on provider failure, and take a separate engine identity
+  (`genesis-cognitive-v1.1.0`) so cognitive evidence can never be mistaken for
+  seed-reproducible evidence. The manifest binds the consulted model through
+  `cognitionId` — model, endpoint host and consultation budget are hashed into
+  the runId, so rerunning a cohort against a different model can never recover
+  another model's completed evidence.
+- Added the experiment plan's §33 control arms (`baselines` command): central
+  dispatch, fixed roles, no link adaptation, free physics — each a
+  manifest-bound deterministic policy producing evidence of the same grade as
+  the treatment. The comparison pins one task realization for every arm via
+  `taskStream.realizationSeed`; without the field the task stream stays bound
+  to the run identity, byte-for-byte as before.
+- Population comparison is now multi-objective (Pareto dominance, NSGA-II
+  style ranks and crowding in integer ppm) instead of a single score. A flat
+  objective axis no longer grants arbitrary boundary points infinite crowding.
+- Recorded the first two §33 readouts in `experiments/genesis-1/BASELINES.md`,
+  including the 600-tick crisis run in which the fixed-roles arm collapses
+  under a ×4 load spike while every other arm absorbs it.
+
 ### Metered cognition
 
 - A reservation can now be enforced as a real spending ceiling through

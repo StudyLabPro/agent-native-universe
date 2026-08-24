@@ -9,8 +9,13 @@ export const LAB_ENGINE_VERSION = "genesis-logical-v1.1.0";
  * model in the loop must never be mistaken for evidence a seed alone can
  * reproduce, and a verifier that regenerates the neutral decision stream must
  * refuse it rather than silently disagree.
+ *
+ * v1.1.0: the manifest carries `cognitionId` and hashes it into the runId, so
+ * consulting a different model, endpoint or consultation budget can never
+ * collide with — and silently recover — a run made with another one. v1.0.0
+ * evidence lacked that binding and is refused rather than reinterpreted.
  */
-export const LAB_COGNITIVE_ENGINE_VERSION = "genesis-cognitive-v1.0.0";
+export const LAB_COGNITIVE_ENGINE_VERSION = "genesis-cognitive-v1.1.0";
 export const LAB_POLICY_ID = "neutral-backpressure-v1";
 /**
  * Control-arm policies (experiment plan §33). Registered here because the
@@ -32,6 +37,23 @@ export const LAB_TASK_GENERATOR_ID = "deterministic-task-stream-v1";
 export interface RunManifestOptions {
   policyId?: string;
   mode?: "logical" | "cognitive";
+  /**
+   * Identity of the cognition port a cognitive run consults (model, endpoint,
+   * consultation budget). Required in cognitive mode and hashed into the
+   * runId; forbidden in logical mode, where no such treatment exists.
+   */
+  cognitionId?: string;
+}
+
+function assertValidCognitionId(cognitionId: string): void {
+  if (
+    typeof cognitionId !== "string"
+    || cognitionId.length === 0
+    || cognitionId.length > 128
+    || /[\u0000-\u001F\u007F]/.test(cognitionId)
+  ) {
+    throw new Error("Cognition id must be a non-empty control-character-free string of at most 128 characters");
+  }
 }
 
 /** Fail closed when evidence targets semantics other than this exact projector. */
@@ -77,6 +99,13 @@ export function assertLabManifestImplementation(manifest: RunManifest): void {
       `Unsupported lab taskGeneratorId ${manifest.taskGeneratorId}; expected ${LAB_TASK_GENERATOR_ID}`,
     );
   }
+  // The consulted model is part of what the evidence claims. A cognitive
+  // manifest without it could silently stand in for a run of any model.
+  if (cognitive) {
+    assertValidCognitionId(manifest.cognitionId as string);
+  } else if (manifest.cognitionId !== undefined) {
+    throw new Error("A logical manifest must not carry a cognitionId");
+  }
 }
 
 export function createRunManifest(
@@ -93,14 +122,21 @@ export function createRunManifest(
     throw new Error("Policy id must be a non-empty string of at most 128 characters");
   }
   const mode = options.mode ?? "logical";
+  if (mode === "cognitive") {
+    assertValidCognitionId(options.cognitionId as string);
+  } else if (options.cognitionId !== undefined) {
+    throw new Error("A logical run manifest must not carry a cognitionId");
+  }
   const configHash = hashValue(config);
   // The implementation is hashed into the run id, so a cognitive run can never
-  // collide with the logical run that shares its seed and config.
+  // collide with the logical run that shares its seed and config — nor with a
+  // cognitive run that consulted a different model or consultation budget.
   const implementation = {
     engineVersion: mode === "cognitive" ? LAB_COGNITIVE_ENGINE_VERSION : LAB_ENGINE_VERSION,
     mode,
     policyId,
     taskGeneratorId: LAB_TASK_GENERATOR_ID,
+    ...(options.cognitionId === undefined ? {} : { cognitionId: options.cognitionId }),
   };
   return {
     schemaVersion: config.schemaVersion,

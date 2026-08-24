@@ -57,6 +57,13 @@ export interface TaskStreamConfig {
   tasksPerTick: number;
   deadlineTicks: number;
   maxBacklog: number;
+  /**
+   * When present, the task stream is seeded from this value alone instead of
+   * from the run identity, so runs that differ only in policy or costs face
+   * the identical realization of tasks and oracles. Control-arm comparisons
+   * pin it; absent, the stream stays bound to the run as before.
+   */
+  realizationSeed?: string;
 }
 
 export type PressureSpec =
@@ -93,6 +100,12 @@ export interface RunManifest {
   mode: "logical" | "cognitive";
   policyId: string;
   taskGeneratorId: string;
+  /**
+   * Identity of the cognition port consulted (model, endpoint, consultation
+   * budget). Present exactly when mode is `cognitive`, and hashed into the
+   * runId so runs of different models can never share evidence.
+   */
+  cognitionId?: string;
   runId: string;
   universeId: string;
   seed: string;

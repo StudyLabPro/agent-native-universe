@@ -311,3 +311,36 @@ test("an arm's identity does not depend on the --arms list it was requested in",
   assert.equal(soloArm.universeId, "U0004");
   assert.equal(soloArm.runId, pairedArm.runId, "the same arm must be the same run wherever it is requested");
 });
+
+test("every arm faces the identical task realization, not just the same distribution", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-bl-tasks-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const { io, json } = capture();
+  const code = await runLabCli([
+    "baselines", "--data-dir", directory, "--agents", "6", "--ticks", "12",
+    "--metric-every", "6", "--checkpoint-every", "12", "--arms", "A,C,E",
+  ], io);
+  assert.equal(code, 0);
+  const output = json();
+
+  // The comparison pins the realization: identical tasks, identical oracles,
+  // in every arm — including arm C, whose config differs in costs.
+  const streams = await Promise.all(output.comparison.arms.map(async (entry) => {
+    const events = await readEvents(directory, entry.universeId, entry.runId);
+    return events
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((event) => event.type === "task.created")
+      .map((event) => hashValue(event.data.task));
+  }));
+  assert.ok(streams[0].length > 0, "arms must have generated tasks");
+  for (const stream of streams.slice(1)) {
+    assert.deepEqual(stream, streams[0], "arms must share one task realization");
+  }
+  assert.match(
+    output.comparison.caveats[0],
+    /pinned task realization/,
+    "the artifact must state the realization is shared",
+  );
+});

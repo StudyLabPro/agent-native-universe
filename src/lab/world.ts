@@ -27,7 +27,7 @@ import { PressureEngine } from "./pressure-engine.js";
 import { initialWorldState, prepareWorldEventTransition } from "./reducer.js";
 import { RESOURCE_KINDS, ResourcePhysics } from "./resource-physics.js";
 import { DeterministicRng } from "./rng.js";
-import { DeterministicTaskStream } from "./task-stream.js";
+import { DeterministicTaskStream, taskStreamRng } from "./task-stream.js";
 import {
   LAB_SCHEMA_VERSION,
   PPM,
@@ -112,6 +112,9 @@ export class LogicalUniverse {
     if (cognitiveMode !== (options.cognition !== undefined)) {
       throw new Error("A cognitive manifest requires a cognition port, and a logical manifest forbids one");
     }
+    if (options.cognition !== undefined && options.cognition.id !== manifest.cognitionId) {
+      throw new Error("Cognition port identity must exactly match manifest.cognitionId");
+    }
     if (manifest.experimentId !== config.experimentId) throw new Error("Manifest experiment does not match config");
     if (manifest.seed !== config.seed) throw new Error("Manifest seed does not match config");
     if (manifest.configHash !== hashValue(config)) throw new Error("Manifest configHash does not match config");
@@ -122,6 +125,7 @@ export class LogicalUniverse {
     const expectedManifest = createRunManifest(config, manifest.universeId, {
       policyId: manifest.policyId,
       mode: manifest.mode,
+      ...(manifest.cognitionId === undefined ? {} : { cognitionId: manifest.cognitionId }),
     });
     if (hashValue(manifest) !== hashValue(expectedManifest)) {
       throw new Error("Manifest identity or runId is not deterministic for this config and policy");
@@ -148,7 +152,7 @@ export class LogicalUniverse {
       universeId: manifest.universeId,
       seed: config.seed,
     }));
-    this.#taskStream = new DeterministicTaskStream(config.taskStream, rootRng.fork("tasks"));
+    this.#taskStream = new DeterministicTaskStream(config.taskStream, taskStreamRng(config.taskStream, rootRng));
     this.#pressure = new PressureEngine(config.pressures);
     this.#policyRng = rootRng.fork("policy");
     this.#pressureRng = rootRng.fork("pressure");

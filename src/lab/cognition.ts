@@ -133,6 +133,14 @@ export class NeutralCognition implements CognitionPort {
 export interface LlmCognitionOptions {
   cohort: Exclude<CohortId, "A">;
   completion: CompletionLike;
+  /**
+   * The deployment this port intends to consult — model name plus whatever
+   * distinguishes the endpoint (e.g. `kimi-k2-6@gpt.mwsapis.ru`). It becomes
+   * part of the port id and therefore of the run identity, so two runs that
+   * consulted different models can never share evidence. Never put secrets
+   * here: the id is written into every manifest.
+   */
+  model: string;
   /** Agents consulted per tick, lowest id first. Keeps a large run affordable. */
   agentsPerTick?: number;
   maxTokens?: number;
@@ -152,12 +160,23 @@ export class LlmCognition implements CognitionPort {
 
   constructor(options: LlmCognitionOptions) {
     this.cohort = options.cohort;
-    this.id = `cognition-llm-${options.cohort.toLowerCase()}-v1`;
     this.#completion = options.completion;
     this.#agentsPerTick = requirePositive(options.agentsPerTick ?? 4, "agentsPerTick");
     this.#maxTokens = requirePositive(options.maxTokens ?? 2_048, "maxTokens");
     this.#concurrency = requirePositive(options.concurrency ?? 4, "concurrency");
     this.#timeoutMs = requirePositive(options.timeoutMs ?? 120_000, "timeoutMs");
+    const model = typeof options.model === "string" ? options.model.trim() : "";
+    if (model.length === 0 || /\s/.test(model)) {
+      throw new Error("LlmCognition requires a non-empty whitespace-free model descriptor");
+    }
+    // Everything that changes what the model contributes belongs in the id:
+    // the deployment itself and the consultation budget. Operational knobs
+    // (concurrency, timeout) stay out — they change pacing, not treatment.
+    this.id = `cognition-llm-${options.cohort.toLowerCase()}-v1:${model}`
+      + `:apt${this.#agentsPerTick}:mt${this.#maxTokens}`;
+    if (this.id.length > 128) {
+      throw new Error("Cognition id exceeds 128 characters; shorten the model descriptor");
+    }
   }
 
   async propose(requests: readonly CognitionRequest[], signal?: AbortSignal): Promise<CognitionRecord[]> {

@@ -228,12 +228,19 @@ inside the policies; genesis agents remain role-neutral state.
 Universe ids are bound to arm identity (A→U0001 … F→U0005), so rerunning a
 subset of arms reuses the same run identities instead of redoing evidence.
 
-Three caveats ship inside every `comparison.json` and bear repeating: each
-arm's run id seeds its own task stream, so arms share the task distribution
-but not the task realization; with one run per arm, differences smaller than
-seed-to-seed variance are not interpretable; and arm F verification coverage
-is bounded by the public observation window — a tick producing more than 64
-submissions evicts the overflow before its only verifiable tick.
+The comparison pins one task realization for every arm: the command sets
+`taskStream.realizationSeed` (to the base seed, unless the config supplies its
+own), which seeds the task stream independently of each arm's run identity.
+Every arm therefore faces byte-identical tasks and oracles, and metric gaps
+are attributable to the architecture rather than to per-arm task luck. A
+config without the field keeps the historical run-bound derivation, which is
+what every existing run hash depends on.
+
+Two caveats still ship inside every `comparison.json` and bear repeating:
+with one run per arm, differences smaller than seed-to-seed variance are not
+interpretable; and arm F verification coverage is bounded by the public
+observation window — a tick producing more than 64 submissions evicts the
+overflow before its only verifiable tick.
 
 Baseline runs do not support checkpoint resume — their runtime policy state
 is recorded as `null`, and the world refuses to resume it rather than guess.

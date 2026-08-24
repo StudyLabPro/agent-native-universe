@@ -322,6 +322,16 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
       summary,
     });
   } catch (error) {
+    if (error instanceof Error && /does not support deterministic resume/.test(error.message)) {
+      // Cohort and control-arm policies fail closed on resume by design (and
+      // resume itself is unsound until the evaluator's oracle map is rebuilt
+      // on restore). Fail with the recovery path instead of a bare engine error.
+      throw new CliUsageError(
+        "This run was interrupted earlier and cannot resume (only unresumed neutral runs "
+        + `support it). Delete ${runsRoot}/${config.experimentId}/${universeId}/ and rerun `
+        + "to redo the run from genesis under the same deterministic identity.",
+      );
+    }
     if (!(error instanceof GenesisRunPausedError)) throw error;
     writeJson(io.stdout, {
       command: "genesis-1",
@@ -404,15 +414,16 @@ async function executeBaselines(argv: readonly string[], io: LabCliIo): Promise<
   }
 
   const config = await configuredGenesis(options.values);
+  // Pin one task realization for the whole comparison: every arm faces
+  // byte-identical tasks and oracles, so metric gaps are attributable to the
+  // architecture rather than to each arm drawing its own task luck.
+  config.taskStream.realizationSeed ??= config.seed;
   const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
   const arms = parseBaselineArmList(options.values.get("arms"));
   const shutdown = installRunAbortController();
   try {
     const runs: Array<{ arm: BaselineArm; description: string; configHash: string; summary: RunSummary }> = [];
     for (const arm of arms) {
-      // Every arm shares the seed and the task distribution; each arm's runId
-      // carries its policy and config identity and therefore seeds its own
-      // task realization — see the caveats embedded in the artifact below.
       const armConfig = applyBaselineArm(structuredClone(config), arm);
       const policy = baselineArmPolicy(arm);
       const summary = await runGenesis({
@@ -433,11 +444,7 @@ async function executeBaselines(argv: readonly string[], io: LabCliIo): Promise<
     const comparison = {
       schemaVersion: 1,
       caveats: [
-        // The root RNG of a run is derived from its runId, and the runId
-        // carries the policy identity. Changing that derivation would break
-        // byte-compatibility of all existing evidence, so it stays — and the
-        // consequence must travel with the numbers it affects.
-        "Arms share the task distribution but not the task realization: each arm's run id seeds its own task stream.",
+        "All arms face one pinned task realization (taskStream.realizationSeed), so metric gaps are attributable to the architecture, not to per-arm task luck.",
         "One run per arm: differences smaller than seed-to-seed variance are not interpretable. Compare across seeds before concluding.",
         "Arm F verification coverage is bounded by the observation physics: a tick producing more submissions than the public window (64) evicts the overflow before its only verifiable tick.",
       ],
@@ -523,9 +530,13 @@ function createCohortCognition(raw: string | undefined): CognitionPort | undefin
     ...(apiKey === undefined ? {} : { apiKey }),
     timeoutMs: 180_000,
   }));
+  // The host disambiguates equally-named deployments on different providers;
+  // the full URL stays out of the manifest, and the API key never goes near it.
+  const host = new URL(baseUrl).host;
   return new LlmCognition({
     cohort,
     completion: router,
+    model: `${model}@${host}`,
     agentsPerTick: positiveEnv("ANU_LLM_AGENTS_PER_TICK", 4),
     concurrency: positiveEnv("ANU_LLM_CONCURRENCY", 4),
     maxTokens: positiveEnv("ANU_LLM_MAX_TOKENS", 2_048),

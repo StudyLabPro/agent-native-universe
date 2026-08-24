@@ -153,11 +153,14 @@ export function crowdingDistances(layer: readonly ParetoPoint[]): Map<string, nu
     });
     const lowest = sorted[0]!;
     const highest = sorted[sorted.length - 1]!;
+    const span = highest.values[axis]! - lowest.values[axis]!;
+    // A flat axis separates nobody. Skip it before crowning its boundary
+    // points, or the lowest and highest universe ids — an ordering that is
+    // pure identifier tie-breaking here — would inherit infinite crowding and
+    // survival would depend on how universes happen to be named.
+    if (span === 0) continue;
     distances.set(lowest.universeId, Number.MAX_SAFE_INTEGER);
     distances.set(highest.universeId, Number.MAX_SAFE_INTEGER);
-    const span = highest.values[axis]! - lowest.values[axis]!;
-    // A flat axis separates nobody; dividing by it would only inject noise.
-    if (span === 0) continue;
     for (let index = 1; index < sorted.length - 1; index += 1) {
       const point = sorted[index]!;
       const current = distances.get(point.universeId)!;
