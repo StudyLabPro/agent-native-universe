@@ -250,10 +250,11 @@ same deterministic identity. Resuming interrupted *neutral* runs currently has
 a known engine defect (the evaluator's oracle map is not rebuilt on restore),
 so prefer restarting interrupted arms of any kind from genesis.
 
-Recorded readouts on the default seed — including the 600-tick crisis run in
-which the fixed-roles arm collapses under the ×4 load spike — live in
+Recorded readouts — including the 600-tick crisis run in which the
+fixed-roles arm collapses under the ×4 load spike, and the five-seed series
+that validates the collapse arithmetic quantitatively — live in
 [`experiments/genesis-1/BASELINES.md`](../experiments/genesis-1/BASELINES.md),
-together with the windowed analysis script that produced the tables.
+together with the analysis scripts that produced the tables.
 
 ## Commands
 
