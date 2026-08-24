@@ -84,7 +84,12 @@ export interface RunManifest {
   schemaVersion: typeof LAB_SCHEMA_VERSION;
   experimentId: string;
   engineVersion: string;
-  mode: "logical";
+  /**
+   * `logical` runs regenerate their own decision stream from the seed.
+   * `cognitive` runs cannot: a model answered, so replay reads the recorded
+   * answers back instead of re-deriving them.
+   */
+  mode: "logical" | "cognitive";
   policyId: string;
   taskGeneratorId: string;
   runId: string;
@@ -372,6 +377,7 @@ export type LabEventType =
   | "capability.published"
   | "capability.used"
   | "agent.learning.updated"
+  | "cognition.recorded"
   | "pressure.applied"
   | "violation.recorded"
   | "metrics.recorded"

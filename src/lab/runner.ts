@@ -12,6 +12,8 @@ import {
   attestRunEvidence,
   verifyRunEvidenceAttestation,
 } from "./evidence-attestation.js";
+import { LlmRouter, OpenAICompatibleProvider } from "../v1/economy-llm.js";
+import { LlmCognition, type CognitionPort } from "./cognition.js";
 import { GenesisRunPausedError, runGenesis } from "./genesis.js";
 import { startObserverServer } from "./observer.js";
 import {
@@ -55,6 +57,7 @@ const RUN_OPTIONS = new Set([
 ]);
 const GENESIS_OPTIONS = new Set([
   "agents",
+  "cohort",
   "checkpoint-every",
   "config",
   "data-dir",
@@ -260,7 +263,7 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
     writeJson(io.stdout, {
       command: "genesis-1",
       status: "ok",
-      usage: "anu lab genesis-1 [--data-dir PATH] [--universe-id U0001] [config overrides]",
+      usage: "anu lab genesis-1 [--data-dir PATH] [--universe-id U0001] [--cohort A|B|C] [config overrides]",
     });
     return;
   }
@@ -270,7 +273,14 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
   const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
   const shutdown = installRunAbortController();
   try {
-    const summary = await runGenesis({ config, runsRoot, universeId, signal: shutdown.signal });
+    const cognition = createCohortCognition(options.values.get("cohort"));
+    const summary = await runGenesis({
+      config,
+      runsRoot,
+      universeId,
+      signal: shutdown.signal,
+      ...(cognition === undefined ? {} : { cognition }),
+    });
     writeJson(io.stdout, {
       command: "genesis-1",
       status: "completed",
@@ -288,6 +298,45 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
   } finally {
     shutdown.cleanup();
   }
+}
+
+/**
+ * Cohort A is the control arm and needs no port: it is the logical engine.
+ * B and C need a provider, and refusing to invent one keeps a mislabelled run
+ * from being recorded as cognitive evidence.
+ */
+function createCohortCognition(raw: string | undefined): CognitionPort | undefined {
+  if (raw === undefined || raw === "A" || raw === "a") return undefined;
+  const cohort = raw.toUpperCase();
+  if (cohort !== "B" && cohort !== "C") throw new Error(`Unknown cohort ${raw}; expected A, B or C`);
+  const apiKey = process.env.ANU_LLM_API_KEY;
+  const baseUrl = process.env.ANU_LLM_BASE_URL;
+  const model = process.env.ANU_LLM_MODEL;
+  if (!baseUrl || !model) {
+    throw new Error(`Cohort ${cohort} requires ANU_LLM_BASE_URL and ANU_LLM_MODEL`);
+  }
+  const router = new LlmRouter();
+  router.register(new OpenAICompatibleProvider({
+    baseUrl,
+    defaultModel: model,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    timeoutMs: 180_000,
+  }));
+  return new LlmCognition({
+    cohort,
+    completion: router,
+    agentsPerTick: positiveEnv("ANU_LLM_AGENTS_PER_TICK", 4),
+    concurrency: positiveEnv("ANU_LLM_CONCURRENCY", 4),
+    maxTokens: positiveEnv("ANU_LLM_MAX_TOKENS", 2_048),
+  });
+}
+
+function positiveEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+  return value;
 }
 
 async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<void> {

@@ -6,9 +6,11 @@ import { equalJson } from "./evaluator.js";
 import { deterministicId } from "./ids.js";
 import { createRunManifest } from "./manifest.js";
 import { computeMetrics } from "./metrics.js";
+import { CohortPolicy, type CognitionRecord } from "./cognition.js";
 import { NeutralPolicy } from "./neutral-policy.js";
 import {
   decidePolicyTick,
+  type LogicalPolicy,
   type DeferredPolicyViolation,
   type PolicyDecision,
 } from "./policy-schedule.js";
@@ -64,6 +66,7 @@ const EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>
   "message.delivered": ["resolution"],
   "capability.published": ["resolution"],
   "capability.used": ["resolution"],
+  "cognition.recorded": ["observation"],
   "violation.recorded": ["resolution"],
   "task.evaluated": ["evaluation"],
   "metrics.recorded": ["metrics"],
@@ -129,7 +132,15 @@ export class LabProtocolVerifier {
   readonly #physics = new ResourcePhysics();
   readonly #pressure: PressureEngine;
   readonly #pressureRng: DeterministicRng;
-  readonly #policy = new NeutralPolicy();
+  readonly #neutral = new NeutralPolicy();
+  /**
+   * In cognitive mode the verifier must not regenerate a decision a model made.
+   * It replays the recorded answers through the same cohort policy the run
+   * used, so verification stays exact without ever calling a provider.
+   */
+  readonly #policy: LogicalPolicy;
+  readonly #cognitive: boolean;
+  #cognitionRecords: CognitionRecord[] = [];
   readonly #policyRng: DeterministicRng;
   readonly #resolutionRng: DeterministicRng;
   readonly #tasks: DeterministicTaskStream;
@@ -171,6 +182,8 @@ export class LabProtocolVerifier {
     this.#policyRng = rootRng.fork("policy");
     this.#resolutionRng = rootRng.fork("resolution");
     this.#initialAgentTotals = multiplyResources(config.initialResources, config.agents);
+    this.#cognitive = manifest.mode === "cognitive";
+    this.#policy = this.#cognitive ? new CohortPolicy(cohortOf(manifest.policyId), this.#neutral) : this.#neutral;
   }
 
   verifyNext(event: LabEvent, state: WorldState): void {
@@ -190,6 +203,17 @@ export class LabProtocolVerifier {
     this.#finalizeSkippedPhases(rank, event, state);
     if (rank < this.#lastPhaseRank) this.#fail(event, "phase moves backwards within a tick");
     this.#lastPhaseRank = rank;
+
+    if (event.type === "cognition.recorded") {
+      // Recorded cognition is an input to the decision phase, not an outcome of
+      // it: accept it here and let it steer the schedule regenerated below.
+      if (!this.#cognitive) this.#fail(event, "cognition.recorded requires a cognitive manifest");
+      if (this.#policyDecisions !== undefined) {
+        this.#fail(event, "cognition must be recorded before the decision phase of its tick");
+      }
+      this.#cognitionRecords.push(decodeCognitionRecord(event, (reason) => this.#fail(event, reason)));
+      return;
+    }
 
     if (
       this.#openPayment !== undefined
@@ -312,7 +336,7 @@ export class LabProtocolVerifier {
     }
     return {
       taskStream: this.#tasks.checkpoint(),
-      policy: this.#policy.checkpoint(),
+      policy: this.#neutral.checkpoint(),
     };
   }
 
@@ -367,6 +391,7 @@ export class LabProtocolVerifier {
     this.#openPayment = undefined;
     this.#policyDecisions = undefined;
     this.#policyViolations = undefined;
+    this.#cognitionRecords = [];
     const pressure = this.#pressure.forTick(tick, state, this.#pressureRng.fork(tick));
     this.#pressureExpected = [
       ...pressure.events.map((draft) => ({ type: "pressure.applied" as const, data: draft.data })),
@@ -453,6 +478,7 @@ export class LabProtocolVerifier {
 
   #ensurePolicySchedule(state: WorldState): void {
     if (this.#policyDecisions !== undefined && this.#policyViolations !== undefined) return;
+    if (this.#policy instanceof CohortPolicy) this.#policy.load(this.#cognitionRecords);
     const batch = decidePolicyTick(
       state,
       this.#currentTick,
@@ -940,7 +966,10 @@ export function assertReplayConfiguration(manifest: RunManifest, config: Genesis
   if (manifest.experimentId !== config.experimentId) throw new ProtocolVerificationError("Manifest experiment does not match config");
   if (manifest.seed !== config.seed) throw new ProtocolVerificationError("Manifest seed does not match config");
   if (manifest.configHash !== hashValue(config)) throw new ProtocolVerificationError("Manifest configHash does not match config");
-  const expected = createRunManifest(config, manifest.universeId);
+  const expected = createRunManifest(config, manifest.universeId, {
+    policyId: manifest.policyId,
+    mode: manifest.mode,
+  });
   if (hashValue(manifest) !== hashValue(expected)) {
     throw new ProtocolVerificationError("Manifest identity or runId is not deterministic for this config");
   }
@@ -1015,6 +1044,33 @@ function safePpmMultiply(value: number, multiplierPpm: number): number {
   const result = (BigInt(value) * BigInt(multiplierPpm)) / BigInt(PPM);
   if (result > BigInt(Number.MAX_SAFE_INTEGER)) throw new ProtocolVerificationError("Task load exceeds safe integer range");
   return Number(result);
+}
+
+/** The cohort a manifest policy id belongs to, e.g. `cohort-c-...` to `"C"`. */
+function cohortOf(policyId: string): "A" | "B" | "C" {
+  const letter = /^cohort-([abc])-/.exec(policyId)?.[1];
+  if (letter === undefined) throw new ProtocolVerificationError(`Policy ${policyId} is not a cohort policy`);
+  return letter.toUpperCase() as "A" | "B" | "C";
+}
+
+/** Rebuild a record from its event without trusting the payload's shape. */
+function decodeCognitionRecord(event: LabEvent, fail: (reason: string) => never): CognitionRecord {
+  const data = event.data as Record<string, unknown>;
+  const actions = data.actions;
+  if (!Array.isArray(actions)) fail("cognition.recorded requires an actions array");
+  if (typeof data.cohort !== "string") fail("cognition.recorded requires a cohort");
+  if (typeof event.actorId !== "string") fail("cognition.recorded requires an actorId");
+  return {
+    tick: event.tick,
+    agentId: event.actorId,
+    cohort: data.cohort as "A" | "B" | "C",
+    provider: String(data.provider ?? ""),
+    model: String(data.model ?? ""),
+    content: String(data.content ?? ""),
+    usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    latencyMs: 0,
+    actions: structuredClone(actions) as CognitionRecord["actions"],
+  };
 }
 
 function multiplyResources(resources: ResourceVector, count: number): ResourceVector {

@@ -4,11 +4,21 @@ import { deterministicId } from "./ids.js";
 import { LAB_SCHEMA_VERSION, type GenesisConfig, type RunManifest } from "./types.js";
 
 export const LAB_ENGINE_VERSION = "genesis-logical-v1.1.0";
+/**
+ * Cognitive runs get their own identity on purpose. Evidence produced with a
+ * model in the loop must never be mistaken for evidence a seed alone can
+ * reproduce, and a verifier that regenerates the neutral decision stream must
+ * refuse it rather than silently disagree.
+ */
+export const LAB_COGNITIVE_ENGINE_VERSION = "genesis-cognitive-v1.0.0";
 export const LAB_POLICY_ID = "neutral-backpressure-v1";
+/** `cohort-a-…` through `cohort-c-…`, as built by `CohortPolicy`. */
+const COHORT_POLICY_PATTERN = /^cohort-[abc]-neutral-backpressure-v1$/;
 export const LAB_TASK_GENERATOR_ID = "deterministic-task-stream-v1";
 
 export interface RunManifestOptions {
   policyId?: string;
+  mode?: "logical" | "cognitive";
 }
 
 /** Fail closed when evidence targets semantics other than this exact projector. */
@@ -31,12 +41,23 @@ export function assertLabManifestImplementation(manifest: RunManifest): void {
   if (manifest.schemaVersion !== LAB_SCHEMA_VERSION) {
     throw new Error(`Unsupported lab manifest schemaVersion ${String(manifest.schemaVersion)}`);
   }
-  if (manifest.engineVersion !== LAB_ENGINE_VERSION) {
-    throw new Error(`Unsupported lab engineVersion ${manifest.engineVersion}; expected ${LAB_ENGINE_VERSION}`);
+  const cognitive = manifest.mode === "cognitive";
+  const expectedEngine = cognitive ? LAB_COGNITIVE_ENGINE_VERSION : LAB_ENGINE_VERSION;
+  if (manifest.engineVersion !== expectedEngine) {
+    throw new Error(`Unsupported lab engineVersion ${manifest.engineVersion}; expected ${expectedEngine}`);
   }
-  if (manifest.mode !== "logical") throw new Error(`Unsupported lab execution mode ${String(manifest.mode)}`);
-  if (manifest.policyId !== LAB_POLICY_ID) {
-    throw new Error(`Unsupported lab policyId ${manifest.policyId}; expected ${LAB_POLICY_ID}`);
+  if (manifest.mode !== "logical" && !cognitive) {
+    throw new Error(`Unsupported lab execution mode ${String(manifest.mode)}`);
+  }
+  // A cognitive run is steered by recorded answers, so its policy is a cohort
+  // wrapper. A logical run must remain exactly the neutral policy.
+  const policyValid = cognitive
+    ? COHORT_POLICY_PATTERN.test(manifest.policyId)
+    : manifest.policyId === LAB_POLICY_ID;
+  if (!policyValid) {
+    throw new Error(
+      `Unsupported lab policyId ${manifest.policyId}; expected ${cognitive ? "a cohort policy" : LAB_POLICY_ID}`,
+    );
   }
   if (manifest.taskGeneratorId !== LAB_TASK_GENERATOR_ID) {
     throw new Error(
@@ -58,10 +79,13 @@ export function createRunManifest(
   if (typeof policyId !== "string" || policyId.length === 0 || policyId.length > 128) {
     throw new Error("Policy id must be a non-empty string of at most 128 characters");
   }
+  const mode = options.mode ?? "logical";
   const configHash = hashValue(config);
+  // The implementation is hashed into the run id, so a cognitive run can never
+  // collide with the logical run that shares its seed and config.
   const implementation = {
-    engineVersion: LAB_ENGINE_VERSION,
-    mode: "logical" as const,
+    engineVersion: mode === "cognitive" ? LAB_COGNITIVE_ENGINE_VERSION : LAB_ENGINE_VERSION,
+    mode,
     policyId,
     taskGeneratorId: LAB_TASK_GENERATOR_ID,
   };
