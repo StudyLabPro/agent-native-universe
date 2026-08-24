@@ -26,6 +26,7 @@ export * from "./artifacts.js";
 export * from "./evidence-verifier.js";
 export * from "./evidence-attestation.js";
 export * from "./neutral-policy.js";
+export * from "./baselines.js";
 export * from "./cognition.js";
 export * from "./pareto.js";
 export * from "./world.js";

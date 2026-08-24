@@ -12,6 +12,19 @@ export const LAB_ENGINE_VERSION = "genesis-logical-v1.1.0";
  */
 export const LAB_COGNITIVE_ENGINE_VERSION = "genesis-cognitive-v1.0.0";
 export const LAB_POLICY_ID = "neutral-backpressure-v1";
+/**
+ * Control-arm policies (experiment plan §33). Registered here because the
+ * manifest is the authority on which implementation identities evidence may
+ * claim; the implementations live in baselines.ts.
+ */
+export const BASELINE_CENTRAL_DISPATCH_ID = "baseline-central-dispatch-v1";
+export const BASELINE_FIXED_ROLES_ID = "baseline-fixed-roles-v1";
+export const BASELINE_NO_LINKS_ID = "baseline-no-links-v1";
+export const LAB_BASELINE_POLICY_IDS: readonly string[] = Object.freeze([
+  BASELINE_CENTRAL_DISPATCH_ID,
+  BASELINE_FIXED_ROLES_ID,
+  BASELINE_NO_LINKS_ID,
+]);
 /** `cohort-a-…` through `cohort-c-…`, as built by `CohortPolicy`. */
 const COHORT_POLICY_PATTERN = /^cohort-[abc]-neutral-backpressure-v1$/;
 export const LAB_TASK_GENERATOR_ID = "deterministic-task-stream-v1";
@@ -53,7 +66,7 @@ export function assertLabManifestImplementation(manifest: RunManifest): void {
   // wrapper. A logical run must remain exactly the neutral policy.
   const policyValid = cognitive
     ? COHORT_POLICY_PATTERN.test(manifest.policyId)
-    : manifest.policyId === LAB_POLICY_ID;
+    : manifest.policyId === LAB_POLICY_ID || LAB_BASELINE_POLICY_IDS.includes(manifest.policyId);
   if (!policyValid) {
     throw new Error(
       `Unsupported lab policyId ${manifest.policyId}; expected ${cognitive ? "a cohort policy" : LAB_POLICY_ID}`,

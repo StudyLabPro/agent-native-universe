@@ -4,8 +4,9 @@ import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import { equalJson } from "./evaluator.js";
 import { deterministicId } from "./ids.js";
-import { createRunManifest } from "./manifest.js";
+import { createRunManifest, LAB_POLICY_ID } from "./manifest.js";
 import { computeMetrics } from "./metrics.js";
+import { createLogicalPolicyById } from "./baselines.js";
 import { CohortPolicy, type CognitionRecord } from "./cognition.js";
 import { NeutralPolicy } from "./neutral-policy.js";
 import {
@@ -183,7 +184,11 @@ export class LabProtocolVerifier {
     this.#resolutionRng = rootRng.fork("resolution");
     this.#initialAgentTotals = multiplyResources(config.initialResources, config.agents);
     this.#cognitive = manifest.mode === "cognitive";
-    this.#policy = this.#cognitive ? new CohortPolicy(cohortOf(manifest.policyId), this.#neutral) : this.#neutral;
+    this.#policy = this.#cognitive
+      ? new CohortPolicy(cohortOf(manifest.policyId), this.#neutral)
+      : manifest.policyId === LAB_POLICY_ID
+        ? this.#neutral
+        : createLogicalPolicyById(manifest.policyId);
   }
 
   verifyNext(event: LabEvent, state: WorldState): void {
@@ -336,7 +341,7 @@ export class LabProtocolVerifier {
     }
     return {
       taskStream: this.#tasks.checkpoint(),
-      policy: this.#neutral.checkpoint(),
+      policy: this.#policy instanceof NeutralPolicy ? this.#policy.checkpoint() : null,
     };
   }
 
@@ -718,11 +723,29 @@ export class LabProtocolVerifier {
         assertExact(event.data, { message }, event, this.#fail.bind(this), "send outcome");
         return;
       }
+      case "verify": {
+        const submission = state.submissions[decision.action.submissionId];
+        if (submission === undefined) this.#fail(event, "verify outcome references an unknown submission");
+        if (event.type !== "submission.verified" || event.targetId !== submission.agentId) {
+          this.#fail(event, "verify outcome differs from its deterministic decision");
+        }
+        const verification = {
+          id: deterministicId("verification", this.manifest.runId, submission.id, actorId),
+          submissionId: submission.id,
+          verifierId: actorId,
+          computedResult: structuredClone(decision.action.computedResult),
+          verdict: decision.action.verdict,
+          matchesSubmission: hashValue(decision.action.computedResult) === hashValue(submission.result),
+          createdTick: event.tick,
+        };
+        assertExact(event.data, { verification }, event, this.#fail.bind(this), "verify outcome");
+        return;
+      }
       case "observe":
       case "reason":
         this.#fail(event, `${decision.action.type} must not emit an action outcome`);
       default:
-        this.#fail(event, `unsupported action ${decision.action.type} in the manifest-bound neutral policy`);
+        this.#fail(event, `unsupported action ${decision.action.type} in the manifest-bound policy`);
     }
   }
 
@@ -746,6 +769,21 @@ export class LabProtocolVerifier {
         return task === undefined || task.status !== "claimed" || task.claimedBy !== decision.actorId
           ? `Task ${action.taskId} is not claimed by ${decision.actorId}`
           : undefined;
+      }
+      case "verify": {
+        // Mirrors the world's checks in their exact order, so a violation's
+        // reason is regenerated rather than trusted.
+        const submission = state.submissions[action.submissionId];
+        if (submission === undefined) return `Unknown submission ${action.submissionId}`;
+        if (submission.agentId === decision.actorId) return "Agents cannot verify their own submissions";
+        const duplicate = Object.values(state.verifications).some((verification) => (
+          verification.submissionId === submission.id && verification.verifierId === decision.actorId
+        ));
+        if (duplicate) return `Submission ${submission.id} is already verified by ${decision.actorId}`;
+        const matchesSubmission = hashValue(action.computedResult) === hashValue(submission.result);
+        return action.verdict === matchesSubmission
+          ? undefined
+          : "Verification verdict does not match the independently computed result";
       }
       default:
         return undefined;
