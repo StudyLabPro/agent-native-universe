@@ -1,7 +1,7 @@
 # Agent Native Universe
 
-[![CI](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml/badge.svg)](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/AndrewHakmi/agent-native-universe)](https://github.com/AndrewHakmi/agent-native-universe/releases)
+[![CI](https://github.com/StudyLabPro/agent-native-universe/actions/workflows/ci.yml/badge.svg)](https://github.com/StudyLabPro/agent-native-universe/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/StudyLabPro/agent-native-universe)](https://github.com/StudyLabPro/agent-native-universe/releases)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-5FA04E)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-87f5bd.svg)](LICENSE)
 

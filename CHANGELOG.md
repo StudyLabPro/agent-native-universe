@@ -118,5 +118,5 @@ capacity target, not a v1.0.0 throughput guarantee. Scientific correctness,
 recovery, evidence integrity, and process isolation are covered; the measured
 single-universe envelope is in docs/LAB_CAPACITY.md.
 
-[Unreleased]: https://github.com/AndrewHakmi/agent-native-universe/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/AndrewHakmi/agent-native-universe/releases/tag/v1.0.0
+[Unreleased]: https://github.com/StudyLabPro/agent-native-universe/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/StudyLabPro/agent-native-universe/releases/tag/v1.0.0

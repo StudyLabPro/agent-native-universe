@@ -31,7 +31,7 @@ WORKDIR /app
 
 LABEL org.opencontainers.image.title="Agent Native Universe Lab" \
       org.opencontainers.image.description="Hardened read-only Observer and deterministic Universe Lab runner" \
-      org.opencontainers.image.source="https://github.com/AndrewHakmi/agent-native-universe" \
+      org.opencontainers.image.source="https://github.com/StudyLabPro/agent-native-universe" \
       org.opencontainers.image.version="${ANU_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="MIT"

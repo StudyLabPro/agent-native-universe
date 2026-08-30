@@ -15,7 +15,7 @@ MWS_API_KEY=<service-account API key> node experiments/mws-kimi/verify.mjs
 | Variable | Default |
 |---|---|
 | `MWS_API_KEY` | required — the run refuses to start without it |
-| `MWS_BASE_URL` | `https://gpt.mwsapis.ru/projects/project-vxgxs2/openai/v1` |
+| `MWS_BASE_URL` | `https://gpt.mwsapis.ru/projects/<mws-project-id>/openai/v1` |
 | `MWS_MODEL` | `kimi-k2-6` |
 
 The process exits non-zero if any hypothesis is refuted. A run costs a few

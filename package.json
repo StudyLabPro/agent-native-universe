@@ -52,11 +52,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AndrewHakmi/agent-native-universe.git"
+    "url": "git+https://github.com/StudyLabPro/agent-native-universe.git"
   },
-  "homepage": "https://github.com/AndrewHakmi/agent-native-universe#readme",
+  "homepage": "https://github.com/StudyLabPro/agent-native-universe#readme",
   "bugs": {
-    "url": "https://github.com/AndrewHakmi/agent-native-universe/issues"
+    "url": "https://github.com/StudyLabPro/agent-native-universe/issues"
   },
   "keywords": [
     "agents",
