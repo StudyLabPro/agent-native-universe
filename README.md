@@ -3,7 +3,7 @@
 [![CI](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml/badge.svg)](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/AndrewHakmi/agent-native-universe)](https://github.com/AndrewHakmi/agent-native-universe/releases)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-5FA04E)](https://nodejs.org/)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0%20%2B%20Commercial-87f5bd.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-87f5bd.svg)](LICENSE)
 
 **An agent-native runtime where autonomous NanoAgents discover one another, negotiate stateful relationships, think through interchangeable LLM providers, pay for their own resource use, reach distributed agreement, and recursively organize into MetaAgents.**
 
@@ -319,7 +319,3 @@ Universe Lab evidence, and a production-oriented read-only Observer.
 does not claim formal verification, an independent security audit, or completion
 of the full 32 × 64 × 10,000 capacity target. Those boundaries remain explicit
 in [Lab capacity](docs/LAB_CAPACITY.md) and [Security policy](SECURITY.md).
-
-## License
-
-Dual-licensed: **AGPL-3.0** (see [LICENSE](LICENSE)) or a **commercial license** (see [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md) / [LICENSING.md](LICENSING.md)). Commercial licensing: andrew@xteam.pro
