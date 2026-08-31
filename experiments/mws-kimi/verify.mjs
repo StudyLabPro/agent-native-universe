@@ -9,7 +9,7 @@
  * Required environment:
  *   MWS_API_KEY   API key of an MWS service account
  * Optional:
- *   MWS_BASE_URL  defaults to the project-vxgxs2 OpenAI-compatible endpoint
+ *   MWS_BASE_URL  defaults to the <mws-project-id> OpenAI-compatible endpoint
  *   MWS_MODEL     defaults to kimi-k2-6
  */
 
@@ -23,7 +23,7 @@ import { LlmRouter, OpenAICompatibleProvider } from "../../dist/distributed-v1.j
 import { MeteredCognitiveLoop, PersistentResourceEconomy } from "../../dist/autonomous.js";
 
 const API_KEY = process.env.MWS_API_KEY;
-const BASE_URL = process.env.MWS_BASE_URL ?? "https://gpt.mwsapis.ru/projects/project-vxgxs2/openai/v1";
+const BASE_URL = process.env.MWS_BASE_URL ?? "https://gpt.mwsapis.ru/projects/<mws-project-id>/openai/v1";
 const MODEL = process.env.MWS_MODEL ?? "kimi-k2-6";
 
 if (!API_KEY) {

@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+
+import { LlmGateway } from "../dist/lab/index.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -43,6 +46,10 @@ test("anu lab delegates to the strict structured runner without changing existin
   assert.equal(directHelp.status, 0, directHelp.stderr);
   assert.equal(parseSingleJson(directHelp.stdout).usage, "anu lab <command> [options]");
 
+  const gatewayHelp = invoke("dist/lab/runner.js", ["gateway", "--help"]);
+  assert.equal(gatewayHelp.status, 0, gatewayHelp.stderr);
+  assert.match(parseSingleJson(gatewayHelp.stdout).usage, /--api-key-file/);
+
   const invalid = invoke("dist/cli/index.js", ["lab", "population", "--universes", "01"]);
   assert.equal(invalid.status, 2);
   assert.equal(invalid.stdout, "");
@@ -55,6 +62,22 @@ test("anu lab delegates to the strict structured runner without changing existin
   const unknown = invoke("dist/lab/runner.js", ["serve", "--write", "yes"]);
   assert.equal(unknown.status, 2);
   assert.equal(parseSingleJson(unknown.stderr).error.code, "invalid_usage");
+
+  const missingUpstream = invoke("dist/lab/runner.js", ["gateway"]);
+  assert.equal(missingUpstream.status, 2);
+  assert.match(parseSingleJson(missingUpstream.stderr).error.message, /requires --upstream/);
+
+  const emptyModels = invoke("dist/lab/runner.js", [
+    "gateway", "--upstream", "https://provider.example/v1", "--models=,,",
+  ]);
+  assert.equal(emptyModels.status, 2);
+  assert.match(parseSingleJson(emptyModels.stderr).error.message, /non-empty model names/);
+
+  const unsafeUpstream = invoke("dist/lab/runner.js", [
+    "gateway", "--upstream", "http://provider.example/v1",
+  ]);
+  assert.equal(unsafeUpstream.status, 2);
+  assert.match(parseSingleJson(unsafeUpstream.stderr).error.message, /must use HTTPS/);
 
   const principles = invoke("dist/cli/index.js", ["principles"]);
   assert.equal(principles.status, 0, principles.stderr);
@@ -325,4 +348,168 @@ test("serve binds all interfaces by default and closes gracefully on SIGTERM", a
   assert.equal(signal, null);
   assert.deepEqual(stdoutLines.map((line) => line.status), ["listening", "stopping", "stopped"]);
   assert.equal(stderr, "");
+});
+
+test("gateway reads its provider key from a file and closes with structured lifecycle output", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-lab-cli-gateway-"));
+  t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
+  const keyPath = join(fixtureRoot, "provider.key");
+  const auditPath = join(fixtureRoot, "gateway.jsonl");
+  const providerSecret = "sk-cli-provider-secret-must-not-appear";
+  await writeFile(keyPath, `${providerSecret}\n`, { encoding: "utf8", mode: 0o600 });
+
+  const child = spawn(
+    process.execPath,
+    [
+      "dist/lab/runner.js",
+      "gateway",
+      "--upstream",
+      "https://provider.example/v1",
+      "--api-key-file",
+      keyPath,
+      "--models",
+      "model-a",
+      "--audit",
+      auditPath,
+      "--port",
+      "0",
+    ],
+    { cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+  });
+
+  assert.ok(child.stdout);
+  assert.ok(child.stderr);
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  const stdoutLines = [];
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const lines = createInterface({ input: child.stdout });
+  const linesClosed = once(lines, "close");
+  const listening = new Promise((resolveListening, rejectListening) => {
+    const timeout = setTimeout(
+      () => rejectListening(new Error(`gateway did not listen; stderr=${stderr}`)),
+      5_000,
+    );
+    lines.on("line", (line) => {
+      const parsed = JSON.parse(line);
+      stdoutLines.push(parsed);
+      if (parsed.status === "listening") {
+        clearTimeout(timeout);
+        resolveListening(parsed);
+      }
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timeout);
+      rejectListening(new Error(`gateway exited before listening: code=${code} signal=${signal} stderr=${stderr}`));
+    });
+  });
+
+  const started = await listening;
+  assert.equal(started.command, "gateway");
+  assert.equal(started.host, "127.0.0.1");
+  assert.equal(started.upstreamCredential, "file");
+  assert.ok(Number.isInteger(started.port) && started.port > 0);
+  assert.equal((await fetch(`http://127.0.0.1:${started.port}/readyz`)).status, 200);
+
+  assert.equal(child.kill("SIGTERM"), true);
+  const [exitCode, signal] = await once(child, "exit");
+  await linesClosed;
+  const stdout = stdoutLines.map((line) => JSON.stringify(line)).join("\n");
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(signal, null);
+  assert.deepEqual(stdoutLines.map((line) => line.status), ["listening", "stopping", "stopped"]);
+  assert.ok(!stdout.includes(providerSecret));
+  assert.ok(!stderr.includes(providerSecret));
+  assert.equal(stderr, "");
+});
+
+test("a cognitive CLI run binds the gateway upstream identity into its manifest", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-lab-gateway-identity-"));
+  t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
+  const upstream = createServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain the bounded request; prompt content is intentionally not retained.
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "identity-test",
+      choices: [{ message: { role: "assistant", content: JSON.stringify({ actions: [{ type: "observe" }] }) } }],
+      usage: { prompt_tokens: 4, completion_tokens: 4, total_tokens: 8 },
+    }));
+  });
+  await new Promise((resolvePromise) => upstream.listen(0, "127.0.0.1", resolvePromise));
+  const upstreamPort = upstream.address().port;
+  const gatewayToken = "gateway-identity-token-0123456789abcdef";
+  const gateway = new LlmGateway({
+    upstreamUrl: `http://127.0.0.1:${upstreamPort}/v1`,
+    authToken: gatewayToken,
+    allowedModels: ["model-a"],
+  });
+  const { port } = await gateway.listen(0);
+  t.after(async () => {
+    await gateway.close();
+    await new Promise((resolvePromise) => upstream.close(resolvePromise));
+  });
+  const identity = await (await fetch(`http://127.0.0.1:${port}/identity`)).json();
+
+  const child = spawn(
+    process.execPath,
+    [
+      "dist/lab/runner.js",
+      "genesis-1",
+      "--cohort",
+      "B",
+      "--data-dir",
+      fixtureRoot,
+      "--agents",
+      "1",
+      "--ticks",
+      "1",
+      "--metric-every",
+      "1",
+      "--checkpoint-every",
+      "1",
+      "--seed",
+      "gateway-identity-test",
+    ],
+    {
+      cwd: repositoryRoot,
+      env: {
+        ...process.env,
+        ANU_LLM_API_KEY: gatewayToken,
+        ANU_LLM_BASE_URL: `http://127.0.0.1:${port}/v1`,
+        ANU_LLM_IDENTITY_URL: `http://127.0.0.1:${port}/identity`,
+        ANU_LLM_MODEL: "model-a",
+        ANU_LLM_AGENTS_PER_TICK: "1",
+        ANU_LLM_CONCURRENCY: "1",
+        ANU_LLM_MAX_TOKENS: "64",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [exitCode, signal] = await once(child, "exit");
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(signal, null);
+  const summary = parseSingleJson(stdout).summary;
+  const manifest = JSON.parse(await readFile(
+    join(fixtureRoot, "genesis-1", "U0001", summary.runId, "manifest.json"),
+    "utf8",
+  ));
+  assert.match(
+    manifest.cognitionId,
+    new RegExp(`^cognition-llm-b-v1:model-a@${identity.id}:apt1:mt64$`),
+  );
 });

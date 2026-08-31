@@ -9,6 +9,10 @@ from the same Node.js 22 image:
   authentication plus the Traefik route;
 - `lab-runner` is an explicit, one-shot `runner` profile that writes experiment
   evidence and exits.
+- `lab-llm-gateway` is an explicit `cognitive` profile and the only role with a
+  provider credential and non-internal egress network;
+- `lab-runner-cognitive` shares that profile, writes cognitive evidence, and
+  can reach only the internal gateway network.
 
 The deployment deliberately does not give the lab access to the Docker API.
 Neither service mounts `docker.sock`, publishes a host port, runs privileged, or
@@ -27,6 +31,9 @@ node dist/lab/runner.js serve --data-dir /data --port 3000
 node dist/lab/runner.js serve --data-dir /data --port 3000 \
   --auth-token-file /run/secrets/anu_lab_observer_token
 node dist/lab/runner.js run --data-dir /data --universes N --agents N --ticks N
+node dist/lab/runner.js gateway --upstream https://provider.example/v1 \
+  --api-key-file /run/secrets/provider-key --auth-token-file /run/secrets/gateway-token \
+  --models MODEL --audit /audit/gateway.jsonl
 node dist/lab/runner.js attest --data-dir /data --universe-id U0001 --run-id RUN_ID
 node dist/lab/runner.js verify-attestation --data-dir /data \
   --universe-id U0001 --run-id RUN_ID --expected sha256:HASH
@@ -45,7 +52,8 @@ CLI reports `paused`. Re-running the identical command automatically resumes
 only after semantic replay matches that checkpoint and the event-chain tail.
 Mid-tick crash evidence is never truncated or silently repaired and therefore
 still requires diagnosis. The long-running observer handles `SIGTERM`
-gracefully as before.
+gracefully as before. The gateway aborts tracked upstream work, drains its
+serialized audit queue, and emits structured `stopping` and `stopped` records.
 
 ## Infrastructure prerequisites
 
@@ -69,9 +77,11 @@ The following Traefik resources must already exist:
 - an external token file readable as container UID 1000.
 
 Only the opt-in `lab-observer-edge` joins the shared edge network. The default
-observer and experiment runner join only the Compose-owned `control` network,
-which is declared `internal: true`. All roles use the named `lab-evidence`
-volume; observers mount it read-only.
+observer and logical experiment runner join only the Compose-owned `control`
+network, which is declared `internal: true`. In the cognitive profile, the
+worker joins only internal `llm-control`; the gateway joins `llm-control` plus
+the separate non-internal `llm-egress` network. No gateway port is published.
+All runners use the named `lab-evidence` volume; observers mount it read-only.
 Compose also applies explicit CPU and memory ceilings; tune
 `ANU_LAB_CPUS`/`ANU_LAB_MEMORY_LIMIT` only after measuring the shared host.
 
@@ -83,6 +93,7 @@ for validation and the first run:
 
 ```bash
 docker compose --env-file .env.example -f compose.lab.yml config
+docker compose --env-file .env.example -f compose.lab.yml --profile cognitive config
 docker compose --env-file .env.example -f compose.lab.yml build lab-observer
 ```
 
@@ -107,6 +118,14 @@ includes token contents in structured logs or error responses. Rotating it
 therefore requires replacing the external file and recreating the edge
 container. Do not put the token itself in `.env`, Compose labels, or command
 arguments.
+
+The cognitive profile follows the same file-backed policy for two independent
+secrets: `ANU_LLM_PROVIDER_KEY_FILE` points to a provider-scoped credential and
+`ANU_LLM_GATEWAY_TOKEN_FILE` points to the worker-to-gateway Bearer token. The
+checked-in values are `/dev/null`, so the profile cannot start accidentally.
+The provider key must carry a provider-side hard spend limit; the gateway token
+must contain at least 32 token68 bytes. Full setup and failure semantics are in
+`docs/LLM_GATEWAY.md`.
 
 To override a value without creating a repository-local secret file, export it
 in the shell or provide an env file stored outside the repository:
@@ -180,6 +199,16 @@ Run one logical experiment in a disposable container:
 
 ```bash
 docker compose --env-file .env.example -f compose.lab.yml --profile runner run --rm lab-runner
+```
+
+Run the opt-in cognitive topology only with an external env file that points to
+the two external secret files and names the real HTTPS upstream/model:
+
+```bash
+docker compose --env-file /absolute/path/anu-cognitive.env \
+  -f compose.lab.yml --profile cognitive up --build \
+  --abort-on-container-exit --exit-code-from lab-runner-cognitive \
+  lab-runner-cognitive
 ```
 
 After configuring both the external token file and the independent Traefik
@@ -302,6 +331,7 @@ Do not add any of the following to a lab service:
 - direct host bindings for port 3000;
 - provider API keys in Compose labels, commands, or repository files.
 
-Future LLM access should pass through a dedicated gateway that alone has an
-egress network and file-mounted provider secrets. Universe workers should stay
-on internal networks.
+LLM access passes through the dedicated `lab-llm-gateway`, which alone has the
+egress network and file-mounted provider credential. Universe workers remain on
+internal networks. Do not connect `lab-runner-cognitive` to `llm-egress`, the
+edge network, the default bridge, or a host network.

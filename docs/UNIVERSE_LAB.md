@@ -363,14 +363,16 @@ plane, not a positive result for the research hypothesis. It includes role-free
 deterministic cognition, eight task families, external evaluation, primitive
 action costs, topology changes, capability contracts, population execution,
 metrics, pressure, replay, delivered messages, submission attestations, bounded
-capability execution, and read-only observation.
+capability execution, read-only observation, and an opt-in isolated LLM egress
+gateway for cognitive cohorts.
 
 Several experiments remain intentionally separate:
 
 - local and external LLM cohorts with inference responses captured as replay
   inputs;
 - physical four-node universes for transport, BFT, partition, and crash tests;
-- LLM gateway egress, provider billing, and provider-failure pressure;
+- repeated provider-failure pressure experiments and reconciliation against
+  provider billing exports;
 - evolutionary selection, recombination, and control populations;
 - signed external anchoring of final evidence hashes;
 - implementation of logical-v1.1 `spawn`, `clone`, `merge`, `reserve`, and `trade`
@@ -387,8 +389,17 @@ Current operational limits are equally important:
 - complete-state checkpoints can dominate disk use at short intervals;
 - application token rotation requires an edge-container recreate because the
   secret is deliberately read only once.
+- gateway request/token counters are process-local, and its accounted-token
+  stop threshold can be crossed by the final bounded in-flight burst; hard
+  financial limits remain provider-side controls.
 
 Consequently, a successful run proves reproducible execution and measurement;
 it does not by itself prove emergence. Claims of specialization or organization
 require repeated populations, action-derived labels, controls, and a
 multidimensional comparison rather than one aggregate score.
+
+The gateway's `/identity` hash binds the configured upstream URL into cognitive
+run identity without exposing that URL to the worker manifest. The operational
+audit deliberately excludes prompt and response content and is not part of the
+hash-chained evidence stream. See `docs/LLM_GATEWAY.md` for the exact trust and
+metering boundary.

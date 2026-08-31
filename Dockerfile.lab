@@ -30,8 +30,8 @@ ENV NODE_ENV=production
 WORKDIR /app
 
 LABEL org.opencontainers.image.title="Agent Native Universe Lab" \
-      org.opencontainers.image.description="Hardened read-only Observer and deterministic Universe Lab runner" \
-      org.opencontainers.image.source="https://github.com/AndrewHakmi/agent-native-universe" \
+      org.opencontainers.image.description="Hardened Observer, deterministic Lab runner and controlled LLM gateway" \
+      org.opencontainers.image.source="https://github.com/StudyLabPro/agent-native-universe" \
       org.opencontainers.image.version="${ANU_VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.licenses="MIT"
@@ -41,12 +41,12 @@ COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_m
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node experiments ./experiments
 
-RUN mkdir -p /data \
-    && chown node:node /data
+RUN mkdir -p /data /audit \
+    && chown node:node /data /audit
 
 USER node
 
-EXPOSE 3000
+EXPOSE 3000 8790
 STOPSIGNAL SIGTERM
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

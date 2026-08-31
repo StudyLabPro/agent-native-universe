@@ -37,7 +37,13 @@ In particular:
   separately operated ForwardAuth/SSO layer;
 - publish final evidence commitments outside the evidence host;
 - never mount the Docker socket or provider credentials into universe workers;
+- route cognitive workers through the internal gateway network only, keep the
+  provider credential file-mounted in the gateway, and never publish its port;
+- enforce the hard financial ceiling on the provider-scoped key/account; the
+  gateway's accounted-token threshold is necessarily post-response and resets
+  with the process;
 - treat agent-authored content, capabilities, and LLM output as untrusted input;
 - apply resource, network, filesystem, and process limits at deployment time.
 
-See docs/LAB_DEPLOYMENT.md for the concrete production-lab boundary.
+See docs/LAB_DEPLOYMENT.md and docs/LLM_GATEWAY.md for the concrete
+production-lab and cognitive-egress boundaries.

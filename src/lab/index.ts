@@ -33,3 +33,4 @@ export * from "./world.js";
 export * from "./genesis.js";
 export * from "./population.js";
 export * from "./observer.js";
+export * from "./gateway.js";

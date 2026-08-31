@@ -1,7 +1,7 @@
 # Agent Native Universe
 
-[![CI](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml/badge.svg)](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/AndrewHakmi/agent-native-universe)](https://github.com/AndrewHakmi/agent-native-universe/releases)
+[![CI](https://github.com/StudyLabPro/agent-native-universe/actions/workflows/ci.yml/badge.svg)](https://github.com/StudyLabPro/agent-native-universe/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/StudyLabPro/agent-native-universe)](https://github.com/StudyLabPro/agent-native-universe/releases)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-5FA04E)](https://nodejs.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-87f5bd.svg)](LICENSE)
 
@@ -240,6 +240,27 @@ model, commands, and current logical-v1.1 limitations. See
 See [Lab capacity](docs/LAB_CAPACITY.md) for the runnable current-checkout
 profile, completed single-reference-universe canary, storage measurements, and
 remaining steps before the full population can be considered validated.
+
+### Controlled LLM egress
+
+The opt-in cognitive deployment now separates the provider credential from the
+universe process. `lab-runner-cognitive` has only an internal route to
+`lab-llm-gateway`; the gateway is the sole role with provider egress. It
+enforces client authentication, model and request limits, bounded concurrency
+and payloads, fail-closed usage validation, and a metadata-only audit trail.
+
+```bash
+node dist/lab/runner.js gateway --help
+docker compose --env-file /absolute/path/anu-cognitive.env \
+  -f compose.lab.yml --profile cognitive up --build \
+  --abort-on-container-exit --exit-code-from lab-runner-cognitive \
+  lab-runner-cognitive
+```
+
+The local token threshold is an accounted-usage circuit breaker, not a hard
+pre-spend guarantee; the dedicated provider key must have its own hard billing
+limit. See [LLM gateway](docs/LLM_GATEWAY.md) for the trust boundary, secret
+wiring, identity binding and failure semantics.
 
 ## Imports
 
