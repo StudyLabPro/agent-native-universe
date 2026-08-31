@@ -5,6 +5,24 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Controlled LLM egress
+
+- Added a dependency-free OpenAI-compatible gateway and `anu lab gateway` CLI
+  command. The gateway holds the provider credential, exposes only bounded
+  non-streaming chat completions, requires strong client authentication for
+  non-loopback binds, enforces model/request/rate/concurrency limits, validates
+  usage fail-closed, and writes a bounded metadata-only audit trail.
+- Added an opt-in Compose cognitive topology: the universe worker has only an
+  internal route to the gateway, while the gateway alone joins the egress
+  network and receives the file-mounted provider secret. The worker reads a
+  separate file-mounted gateway token.
+- Gateway identity hashes the configured upstream and is read before the
+  cognitive manifest is created, preventing two upstream URLs behind the same
+  gateway hostname from silently sharing evidence identity.
+- Documented the metering boundary explicitly: the local accounted-token value
+  is a post-response stop threshold, while the hard financial cap belongs to
+  the provider-scoped key/account.
+
 ### Universe Lab
 
 - Genesis runs can now put a model in the loop: cognition cohorts record every

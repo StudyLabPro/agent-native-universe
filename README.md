@@ -241,6 +241,27 @@ See [Lab capacity](docs/LAB_CAPACITY.md) for the runnable current-checkout
 profile, completed single-reference-universe canary, storage measurements, and
 remaining steps before the full population can be considered validated.
 
+### Controlled LLM egress
+
+The opt-in cognitive deployment now separates the provider credential from the
+universe process. `lab-runner-cognitive` has only an internal route to
+`lab-llm-gateway`; the gateway is the sole role with provider egress. It
+enforces client authentication, model and request limits, bounded concurrency
+and payloads, fail-closed usage validation, and a metadata-only audit trail.
+
+```bash
+node dist/lab/runner.js gateway --help
+docker compose --env-file /absolute/path/anu-cognitive.env \
+  -f compose.lab.yml --profile cognitive up --build \
+  --abort-on-container-exit --exit-code-from lab-runner-cognitive \
+  lab-runner-cognitive
+```
+
+The local token threshold is an accounted-usage circuit breaker, not a hard
+pre-spend guarantee; the dedicated provider key must have its own hard billing
+limit. See [LLM gateway](docs/LLM_GATEWAY.md) for the trust boundary, secret
+wiring, identity binding and failure semantics.
+
 ## Imports
 
 ```ts

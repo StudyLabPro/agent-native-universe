@@ -26,6 +26,7 @@ import {
 import { LlmRouter, OpenAICompatibleProvider } from "../v1/economy-llm.js";
 import { LlmCognition, type CognitionPort } from "./cognition.js";
 import { GenesisRunPausedError, runGenesis } from "./genesis.js";
+import { LlmGateway } from "./gateway.js";
 import { startObserverServer } from "./observer.js";
 import {
   MAX_POPULATION_PARALLELISM,
@@ -44,7 +45,7 @@ const DEFAULT_OBSERVER_HOST = "0.0.0.0";
 const DEFAULT_OBSERVER_PORT = 3_000;
 const MAX_PATH_BYTES = 4_096;
 const MAX_CONFIG_BYTES = 1_048_576;
-const MAX_AUTH_TOKEN_FILE_BYTES = 4_098;
+const MAX_SECRET_FILE_BYTES = 4_098;
 const MAX_TICKS = 10_000_000;
 const MAX_SEED_BYTES = 1_024;
 const RESOURCE_KINDS = [
@@ -109,6 +110,11 @@ const VERIFY_ATTESTATION_OPTIONS = new Set([
   "expected",
 ]);
 const SERVE_OPTIONS = new Set(["auth-token-file", "data-dir", "host", "port"]);
+const GATEWAY_OPTIONS = new Set([
+  "audit", "api-key-env", "api-key-file", "auth-token-file", "host", "max-audit-bytes",
+  "max-in-flight", "max-requests", "max-response-bytes", "max-total-tokens", "models", "port",
+  "rate-per-minute", "timeout-ms", "upstream",
+]);
 
 interface JsonSink {
   write(chunk: string): unknown;
@@ -142,6 +148,7 @@ const HELP = {
     attest: "create or recover a deterministic final evidence attestation",
     "verify-attestation": "verify evidence and an externally published commitment",
     serve: "serve read-only evidence HTTP endpoints",
+    gateway: "run the single controlled LLM egress point (§20)",
   },
   commonRunOptions: {
     "--data-dir": "evidence root (default: ./runs)",
@@ -158,6 +165,7 @@ const HELP = {
     "anu lab attest --data-dir ./runs --universe-id U0001 --run-id RUN_ID",
     "anu lab verify-attestation --data-dir ./runs --universe-id U0001 --run-id RUN_ID --expected sha256:HASH",
     "anu lab serve --data-dir ./runs --host 0.0.0.0 --port 3000 [--auth-token-file PATH]",
+    "anu lab gateway --upstream https://host/v1 --api-key-file /run/secrets/provider-key --models kimi-k2-6 --max-total-tokens 200000",
   ],
 } as const;
 
@@ -209,6 +217,9 @@ export async function runLabCli(
         return 0;
       case "serve":
         await executeServe(argv.slice(1), io);
+        return 0;
+      case "gateway":
+        await executeGateway(argv.slice(1), io);
         return 0;
       default:
         throw new CliUsageError(`Unknown Lab command: ${command}`);
@@ -303,7 +314,7 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
   const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
   const shutdown = installRunAbortController();
   try {
-    const cognition = createCohortCognition(options.values.get("cohort"));
+    const cognition = await createCohortCognition(options.values.get("cohort"));
     if (cognition !== undefined && arm !== "A") {
       throw new CliUsageError("--cohort applies to arm A only; a control arm that thinks with a model is not a control");
     }
@@ -513,11 +524,17 @@ function parseBaselineArmList(raw: string | undefined): BaselineArm[] {
  * B and C need a provider, and refusing to invent one keeps a mislabelled run
  * from being recorded as cognitive evidence.
  */
-function createCohortCognition(raw: string | undefined): CognitionPort | undefined {
+async function createCohortCognition(raw: string | undefined): Promise<CognitionPort | undefined> {
   if (raw === undefined || raw === "A" || raw === "a") return undefined;
   const cohort = raw.toUpperCase();
   if (cohort !== "B" && cohort !== "C") throw new Error(`Unknown cohort ${raw}; expected A, B or C`);
-  const apiKey = process.env.ANU_LLM_API_KEY;
+  const apiKeyFile = process.env.ANU_LLM_API_KEY_FILE;
+  if (apiKeyFile !== undefined && process.env.ANU_LLM_API_KEY !== undefined) {
+    throw new Error("Set only one of ANU_LLM_API_KEY and ANU_LLM_API_KEY_FILE");
+  }
+  const apiKey = apiKeyFile === undefined
+    ? process.env.ANU_LLM_API_KEY
+    : await readSecretFile(safePath(apiKeyFile, "ANU_LLM_API_KEY_FILE"), "LLM API key");
   const baseUrl = process.env.ANU_LLM_BASE_URL;
   const model = process.env.ANU_LLM_MODEL;
   if (!baseUrl || !model) {
@@ -530,17 +547,85 @@ function createCohortCognition(raw: string | undefined): CognitionPort | undefin
     ...(apiKey === undefined ? {} : { apiKey }),
     timeoutMs: 180_000,
   }));
-  // The host disambiguates equally-named deployments on different providers;
-  // the full URL stays out of the manifest, and the API key never goes near it.
-  const host = new URL(baseUrl).host;
+  // A direct provider is identified by its endpoint host. A gateway deployment
+  // supplies ANU_LLM_IDENTITY_URL so the manifest binds the gateway's hash of
+  // the real upstream rather than the gateway service name.
+  const treatmentIdentity = await resolveCognitionTreatmentIdentity(baseUrl, model);
   return new LlmCognition({
     cohort,
     completion: router,
-    model: `${model}@${host}`,
+    model: `${model}@${treatmentIdentity}`,
     agentsPerTick: positiveEnv("ANU_LLM_AGENTS_PER_TICK", 4),
     concurrency: positiveEnv("ANU_LLM_CONCURRENCY", 4),
     maxTokens: positiveEnv("ANU_LLM_MAX_TOKENS", 2_048),
   });
+}
+
+async function resolveCognitionTreatmentIdentity(baseUrl: string, model: string): Promise<string> {
+  const explicit = process.env.ANU_LLM_TREATMENT_ID;
+  const identityUrl = process.env.ANU_LLM_IDENTITY_URL;
+  if (explicit !== undefined && identityUrl !== undefined) {
+    throw new Error("Set only one of ANU_LLM_TREATMENT_ID and ANU_LLM_IDENTITY_URL");
+  }
+  if (explicit !== undefined) return explicit;
+  if (identityUrl === undefined) return new URL(baseUrl).host;
+
+  const providerUrl = new URL(baseUrl);
+  const configuredIdentityUrl = new URL(identityUrl);
+  if (configuredIdentityUrl.origin !== providerUrl.origin) {
+    throw new Error("ANU_LLM_IDENTITY_URL must have the same origin as ANU_LLM_BASE_URL");
+  }
+  const response = await fetch(configuredIdentityUrl, { signal: AbortSignal.timeout(5_000) });
+  if (!response.ok) throw new Error(`LLM gateway identity returned HTTP ${response.status}`);
+  const text = await readBoundedIdentityResponse(response, 4_096);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("LLM gateway identity response is not valid JSON");
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new Error("LLM gateway identity response is invalid");
+  }
+  const identity = parsed as { schemaVersion?: unknown; id?: unknown; models?: unknown };
+  if (
+    identity.schemaVersion !== 1
+    || typeof identity.id !== "string"
+    || !/^gateway-v1-[a-f0-9]{32}$/.test(identity.id)
+  ) {
+    throw new Error("LLM gateway identity response is invalid");
+  }
+  if (
+    identity.models !== "any"
+    && (!Array.isArray(identity.models)
+      || !identity.models.every((candidate) => typeof candidate === "string")
+      || !identity.models.includes(model))
+  ) {
+    throw new Error(`LLM gateway identity does not allow model ${model}`);
+  }
+  return identity.id;
+}
+
+async function readBoundedIdentityResponse(response: Response, limit: number): Promise<string> {
+  if (response.body === null) return "";
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      total += result.value.length;
+      if (total > limit) {
+        await reader.cancel();
+        throw new Error("LLM gateway identity response is too large");
+      }
+      chunks.push(result.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total).toString("utf8");
 }
 
 function positiveEnv(name: string, fallback: number): number {
@@ -647,7 +732,7 @@ async function executeServe(argv: readonly string[], io: LabCliIo): Promise<void
   const authTokenFile = options.values.get("auth-token-file");
   const authToken = authTokenFile === undefined
     ? undefined
-    : await readObserverAuthTokenFile(safePath(authTokenFile, "auth-token-file"));
+    : await readSecretFile(safePath(authTokenFile, "auth-token-file"), "Observer authentication token");
   const server = await startObserverServer({
     dataDir,
     host,
@@ -666,7 +751,7 @@ async function executeServe(argv: readonly string[], io: LabCliIo): Promise<void
   });
 }
 
-async function readObserverAuthTokenFile(path: string): Promise<string> {
+async function readSecretFile(path: string, label: string): Promise<string> {
   let file: FileHandle | undefined;
   let secretBytes: Buffer | undefined;
   try {
@@ -674,26 +759,27 @@ async function readObserverAuthTokenFile(path: string): Promise<string> {
     if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) throw new Error("invalid");
     file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const info = await file.stat();
-    if (!info.isFile() || info.size > MAX_AUTH_TOKEN_FILE_BYTES) throw new Error("invalid");
+    if (!info.isFile() || info.size > MAX_SECRET_FILE_BYTES) throw new Error("invalid");
 
-    const bytes = Buffer.alloc(MAX_AUTH_TOKEN_FILE_BYTES + 1);
+    const bytes = Buffer.alloc(MAX_SECRET_FILE_BYTES + 1);
     secretBytes = bytes;
     let offset = 0;
-    while (offset <= MAX_AUTH_TOKEN_FILE_BYTES) {
+    while (offset <= MAX_SECRET_FILE_BYTES) {
       const result = await file.read(bytes, offset, bytes.length - offset, offset);
       if (result.bytesRead === 0) break;
       offset += result.bytesRead;
     }
-    if (offset > MAX_AUTH_TOKEN_FILE_BYTES) throw new Error("invalid");
+    if (offset > MAX_SECRET_FILE_BYTES) throw new Error("invalid");
     const content = bytes.subarray(0, offset);
     if (!isUtf8(content)) throw new Error("invalid");
 
     let token = content.toString("utf8");
     if (token.endsWith("\r\n")) token = token.slice(0, -2);
     else if (token.endsWith("\n")) token = token.slice(0, -1);
+    if (token.length === 0) throw new Error("invalid");
     return token;
   } catch {
-    throw new Error("Observer authentication token file could not be read or is invalid");
+    throw new Error(`${label} file could not be read or is invalid`);
   } finally {
     secretBytes?.fill(0);
     await file?.close().catch(() => undefined);
@@ -940,6 +1026,156 @@ function installRunAbortController(): {
       process.off("SIGTERM", abort);
     },
   };
+}
+
+async function executeGateway(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, GATEWAY_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "gateway",
+      status: "ok",
+      usage: "anu lab gateway --upstream URL [--api-key-file PATH | --api-key-env NAME] "
+        + "[--auth-token-file PATH] [--models a,b] [--max-requests N] [--max-total-tokens N] "
+        + "[--rate-per-minute N] [--max-in-flight N] [--max-response-bytes N] "
+        + "[--audit PATH] [--max-audit-bytes N] [--host HOST] [--port 0..65535] [--timeout-ms N]",
+      notes: [
+        "The provider credential is read from a no-follow file or from the environment variable named by --api-key-env, never from an argument.",
+        "Only POST /v1/chat/completions is forwarded; streaming is refused; the audit log holds metadata, never message content.",
+        "--max-total-tokens is a post-response stop threshold, not a hard billing cap; set the hard financial limit at the provider.",
+      ],
+    });
+    return;
+  }
+
+  const upstream = options.values.get("upstream");
+  if (upstream === undefined) throw new CliUsageError("gateway requires --upstream URL");
+  const apiKeyFile = options.values.get("api-key-file");
+  const apiKeyEnv = options.values.get("api-key-env");
+  if (apiKeyFile !== undefined && apiKeyEnv !== undefined) {
+    throw new CliUsageError("gateway accepts only one of --api-key-file and --api-key-env");
+  }
+  const apiKey = apiKeyFile !== undefined
+    ? await readSecretFile(safePath(apiKeyFile, "api-key-file"), "Gateway provider API key")
+    : apiKeyEnv === undefined ? undefined : process.env[apiKeyEnv];
+  if (apiKeyEnv !== undefined && (apiKey === undefined || apiKey.length === 0)) {
+    throw new CliUsageError(`gateway: environment variable ${apiKeyEnv} is empty or unset`);
+  }
+  const authTokenFile = options.values.get("auth-token-file");
+  const authToken = authTokenFile === undefined
+    ? undefined
+    : await readSecretFile(safePath(authTokenFile, "auth-token-file"), "Gateway authentication token");
+  const rawModels = options.values.get("models");
+  const models = rawModels?.split(",").map((model) => model.trim());
+  if (rawModels !== undefined && (models === undefined || models.length === 0 || models.some((model) => model.length === 0))) {
+    throw new CliUsageError("--models must contain a comma-separated list of non-empty model names");
+  }
+  const host = optionHost(options.values.get("host") ?? "127.0.0.1");
+  const port = optionInteger(options.values, "port", 8790, 0, 65_535);
+  const maxRequests = optionalPositiveInteger(options.values, "max-requests");
+  const maxTotalTokens = optionalPositiveInteger(options.values, "max-total-tokens");
+  const ratePerMinute = optionalPositiveInteger(options.values, "rate-per-minute");
+  const maxInFlight = optionalPositiveInteger(options.values, "max-in-flight");
+  const maxResponseBytes = optionalPositiveInteger(options.values, "max-response-bytes");
+  const maxAuditBytes = optionalPositiveInteger(options.values, "max-audit-bytes");
+  const timeoutMs = optionalPositiveInteger(options.values, "timeout-ms");
+  const audit = options.values.get("audit");
+
+  let gateway: LlmGateway;
+  try {
+    gateway = new LlmGateway({
+      upstreamUrl: upstream,
+      ...(apiKey === undefined ? {} : { apiKey }),
+      ...(authToken === undefined ? {} : { authToken }),
+      ...(models === undefined ? {} : { allowedModels: models }),
+      ...(maxRequests === undefined ? {} : { maxRequests }),
+      ...(maxTotalTokens === undefined ? {} : { maxTotalTokens }),
+      ...(ratePerMinute === undefined ? {} : { ratePerMinute }),
+      ...(maxInFlight === undefined ? {} : { maxInFlight }),
+      ...(maxResponseBytes === undefined ? {} : { maxResponseBytes }),
+      ...(maxAuditBytes === undefined ? {} : { maxAuditBytes }),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      ...(audit === undefined ? {} : { auditPath: safePath(audit, "audit") }),
+    });
+  } catch (error) {
+    throw new CliUsageError(safeErrorMessage(error));
+  }
+  let bound: { host: string; port: number };
+  try {
+    bound = await gateway.listen(port, host);
+  } catch (error) {
+    if (error instanceof Error && /non-loopback bind without client Bearer/.test(error.message)) {
+      throw new CliUsageError(error.message);
+    }
+    throw error;
+  }
+  installGatewayShutdown(gateway, io);
+  writeJson(io.stdout, {
+    command: "gateway",
+    status: "listening",
+    host: bound.host,
+    port: bound.port,
+    authentication: authToken === undefined ? "none" : "bearer",
+    upstreamCredential: apiKey === undefined ? "none" : apiKeyFile === undefined ? `env:${apiKeyEnv}` : "file",
+    limits: {
+      models: models && models.length > 0 ? models : "any",
+      maxRequests: maxRequests ?? "unlimited",
+      maxTotalTokens: maxTotalTokens ?? "unlimited",
+      ratePerMinute: ratePerMinute ?? "unlimited",
+      maxInFlight: maxInFlight ?? 4,
+      maxResponseBytes: maxResponseBytes ?? 8_388_608,
+      maxAuditBytes: audit === undefined ? "disabled" : maxAuditBytes ?? 67_108_864,
+    },
+    audit: audit ?? "disabled",
+  });
+}
+
+function optionalPositiveInteger(values: ReadonlyMap<string, string>, name: string): number | undefined {
+  return parseInteger(values.get(name), name, 1, Number.MAX_SAFE_INTEGER);
+}
+
+function installGatewayShutdown(gateway: LlmGateway, io: LabCliIo): void {
+  let stopping = false;
+  let forceTimer: NodeJS.Timeout | undefined;
+  const shutdown = (signal: "SIGINT" | "SIGTERM"): void => {
+    if (stopping) return;
+    stopping = true;
+    writeJson(io.stdout, { command: "gateway", status: "stopping", signal, ...gateway.stats() });
+    forceTimer = setTimeout(() => {
+      process.exitCode = 1;
+      try {
+        writeJson(io.stderr, {
+          command: "gateway",
+          status: "error",
+          error: { code: "shutdown_timeout", message: "Gateway shutdown exceeded 10 seconds" },
+        });
+      } finally {
+        // A stuck filesystem or socket must not keep a supposedly stopped
+        // gateway alive with its credential and egress route indefinitely.
+        process.exit(1);
+      }
+    }, 10_000);
+    forceTimer.unref();
+    void gateway.close().then(() => {
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+      if (forceTimer !== undefined) clearTimeout(forceTimer);
+      writeJson(io.stdout, { command: "gateway", status: "stopped", signal, ...gateway.stats() });
+    }).catch((error: unknown) => {
+      process.exitCode = 1;
+      process.off("SIGINT", onSigint);
+      process.off("SIGTERM", onSigterm);
+      if (forceTimer !== undefined) clearTimeout(forceTimer);
+      writeJson(io.stderr, {
+        command: "gateway",
+        status: "error",
+        error: { code: "shutdown_failed", message: safeErrorMessage(error) },
+      });
+    });
+  };
+  const onSigint = (): void => shutdown("SIGINT");
+  const onSigterm = (): void => shutdown("SIGTERM");
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
 }
 
 function installObserverShutdown(server: Server, io: LabCliIo): void {
