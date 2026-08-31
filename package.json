@@ -43,7 +43,8 @@
     "demo": "npm run build && node dist/examples/payment-network.js",
     "lab": "npm run build && node dist/lab/runner.js",
     "lab:capacity-profile": "npm run build && node --expose-gc scripts/lab-capacity-profile.mjs",
-    "check": "npm run build && npm test",
+    "check": "npm test && npm run check:governance",
+    "check:governance": "node .github/scripts/check-github-actions-policy.mjs",
     "release:verify": "npm run check && npm run demo:living && npm pack --dry-run",
     "demo:living": "npm run build && node dist/examples/living-network.js"
   },

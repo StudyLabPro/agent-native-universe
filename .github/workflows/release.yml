@@ -5,9 +5,7 @@ on:
     tags:
       - "v*.*.*"
 
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -17,11 +15,15 @@ jobs:
   github-release:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: write
+      packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v7
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
@@ -31,6 +33,18 @@ jobs:
           set -euo pipefail
           package_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).version')"
           test "${GITHUB_REF_NAME}" = "v${package_version}"
+          git fetch --no-tags origin master
+          release_commit="$(git rev-list --max-count=1 "${GITHUB_REF_NAME}")"
+          git merge-base --is-ancestor "${release_commit}" origin/master
+      - name: Refuse an already-published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if release_is_draft="$(gh release view "${GITHUB_REF_NAME}" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            test "${release_is_draft}" = "true"
+          fi
       - run: npm ci --ignore-scripts
       - name: Verify release behavior and package contents
         run: npm run release:verify
@@ -63,7 +77,7 @@ jobs:
           npm sbom --sbom-format cyclonedx > "release-artifacts/agent-native-universe-v${package_version}.sbom.cdx.json"
           cd release-artifacts
           sha256sum ./*.tgz ./*.json > SHA256SUMS
-      - name: Create or update GitHub Release
+      - name: Create draft, upload assets, and publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -73,6 +87,8 @@ jobs:
             gh release create "${GITHUB_REF_NAME}" \
               --verify-tag \
               --title "Agent Native Universe ${GITHUB_REF_NAME}" \
-              --notes-file CHANGELOG.md
+              --notes-file CHANGELOG.md \
+              --draft
           fi
           gh release upload "${GITHUB_REF_NAME}" release-artifacts/* --clobber
+          gh release edit "${GITHUB_REF_NAME}" --draft=false

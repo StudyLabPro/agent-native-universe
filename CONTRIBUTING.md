@@ -10,9 +10,8 @@ surface; CI also verifies the Node.js 24 Active LTS line.
 
 ```bash
 npm ci --ignore-scripts
-npm test
-npm run demo:living
-npm pack --dry-run
+npm run check
+docker compose --env-file .env.example -f compose.lab.yml config --quiet
 ```
 
 Before opening a pull request:
@@ -25,6 +24,12 @@ Before opening a pull request:
 4. keep runtime dependencies at zero unless the change has a compelling,
    reviewed operational reason;
 5. run git diff --check and the complete test universe.
+
+GitHub validates ready pull requests through the path-aware PR Gate. Draft pull
+requests do not consume runner work. Use the manually dispatched Heavy
+Validation workflow when Node.js 24 compatibility, the production image,
+dependency security, or capacity behavior needs additional validation. See
+`docs/GITHUB_GOVERNANCE.md` for the stable check and release contracts.
 
 ## Universe Lab changes
 

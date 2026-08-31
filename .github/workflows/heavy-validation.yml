@@ -1,0 +1,84 @@
+name: Heavy Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - compatibility
+          - container
+          - security
+          - benchmark
+
+permissions:
+  contents: read
+
+concurrency:
+  group: heavy-validation-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    name: Heavy Validation (${{ inputs.scope }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'security' || inputs.scope == 'benchmark' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install exact development dependencies on Node.js 22
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'security' || inputs.scope == 'benchmark' }}
+        run: npm ci --ignore-scripts
+
+      - name: Verify behavior and publishable package
+        if: ${{ inputs.scope == 'full' }}
+        run: npm run release:verify
+
+      - name: Audit the production dependency surface
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'security' }}
+        run: npm audit --omit=dev --audit-level=moderate
+
+      - name: Run the bounded capacity profile
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'benchmark' }}
+        run: npm run lab:capacity-profile
+
+      - name: Set up Node.js 24 compatibility runtime
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'compatibility' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install exact development dependencies on Node.js 24
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'compatibility' }}
+        run: npm ci --ignore-scripts
+
+      - name: Verify compatibility on Node.js 24
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'compatibility' }}
+        run: npm test
+
+      - name: Validate the fail-closed Compose model
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'container' }}
+        run: docker compose --env-file .env.example -f compose.lab.yml config --quiet
+
+      - name: Build the production Observer image
+        if: ${{ inputs.scope == 'full' || inputs.scope == 'container' }}
+        run: docker build --file Dockerfile.lab --tag anu-lab:validation .
