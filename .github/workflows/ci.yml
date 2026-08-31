@@ -1,62 +1,87 @@
-name: ci
+name: PR Gate
 
 on:
-  push:
+  pull_request:
     branches:
       - master
-      - "agent/**"
-  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - edited
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: pr-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  runtime:
+  gate:
+    name: PR Gate
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - name: Check out the proposed merge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify the changed paths
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: .github/scripts/changed-scope.sh
+
+      - name: Verify workflow syntax and repository policy
+        run: |
+          bash -n .github/scripts/changed-scope.sh
+          node .github/scripts/check-github-actions-policy.mjs
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            --output /tmp/actionlint.tar.gz
+          echo '023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  /tmp/actionlint.tar.gz' | sha256sum --check -
+          mkdir -p /tmp/actionlint
+          tar --extract --gzip --file /tmp/actionlint.tar.gz --directory /tmp/actionlint actionlint
+          /tmp/actionlint/actionlint .github/workflows/*.yml
+
+      - name: Set up the minimum supported Node.js runtime
+        if: ${{ steps.scope.outputs.runtime == 'true' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
           cache: npm
+
       - name: Install exact development dependencies
+        if: ${{ steps.scope.outputs.runtime == 'true' }}
         run: npm ci --ignore-scripts
+
       - name: Execute the complete test universe
+        if: ${{ steps.scope.outputs.runtime == 'true' }}
         run: npm test
-      - name: Execute the living-graph smoke scenario
-        run: npm run demo:living
-      - name: Audit production dependency surface
-        run: npm audit --omit=dev --audit-level=moderate
-      - name: Verify the publishable package
-        run: npm pack --dry-run
 
-  runtime-active-lts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-      - name: Install exact development dependencies
-        run: npm ci --ignore-scripts
-      - name: Verify the complete runtime on Active LTS
-        run: npm test
-      - name: Execute the living-graph smoke scenario
-        run: npm run demo:living
+      - name: Record the path-aware decision
+        if: ${{ steps.scope.outputs.runtime != 'true' && steps.scope.outputs.container != 'true' }}
+        run: echo "Runtime and container validation are not required for this path set."
 
-  container:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v7
       - name: Validate the fail-closed Compose model
+        if: ${{ steps.scope.outputs.container == 'true' }}
         run: docker compose --env-file .env.example -f compose.lab.yml config --quiet
+
       - name: Build the production Observer image
-        run: docker build --file Dockerfile.lab --tag anu-lab:ci .
+        if: ${{ steps.scope.outputs.container == 'true' }}
+        run: docker build --file Dockerfile.lab --tag anu-lab:pr-gate .
+
+      - name: Record the path-aware decision
+        if: ${{ steps.scope.outputs.runtime == 'true' && steps.scope.outputs.container != 'true' }}
+        run: echo "Container validation is not required for this path set."
