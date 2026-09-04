@@ -32,10 +32,15 @@ by calendar units.
 
 The scientific engines refuse a live manifest fail-closed
 (`assertLabManifestImplementation`, `ReplayEngine`, `LabProtocolVerifier`,
-`LogicalUniverse`): evidence of engine `genesis-live-v1.0.0` is never projected
-as logical or cognitive evidence. The live engine (phase L3) extends the same
-gate with its own branch; until then the identity exists so that older builds
-fail closed on it.
+`LogicalUniverse`, `EvidenceStore`): evidence of engine `genesis-live-v1.0.0`
+is never projected as logical or cognitive evidence. Since phase L3a the same
+gates accept live evidence for exactly one caller — the live engine, which
+passes an explicit live projection (`ReplayProjectionOptions.live`,
+`LabProtocolVerifierOptions.live`, `GenesisRunOptions.live`,
+`EvidenceStoreOptions.live`). Every scientific reader calls them without it:
+`anu lab replay`, `attest` and `verify-attestation` still refuse a stored live
+run, and evidence discovery (`EvidenceStore.openExisting`) still reports it as
+an unsupported implementation.
 
 ### Per-command allowlist
 
@@ -43,7 +48,7 @@ fail closed on it.
 |---|---|
 | `population`, `run`, `baselines` | `genesis-1` only |
 | `genesis-1` | `genesis-1`; `genesis-live-canary` only with `--cohort B\|C`, arm A, universe `U0901+` |
-| `live` | `genesis-live` only (the supervisor itself arrives in L3; the command fails closed until then) |
+| `live` | `genesis-live` only (the epoch engine arrived in L3a as a library; the command and its supervisor arrive in L3c, and it fails closed until then) |
 | `replay`, `attest`, `verify-attestation`, `serve` | every registered id — readers never guess |
 
 `runPopulation` refuses non-scientific configs at the library level as well, and
@@ -60,10 +65,14 @@ Open-ended life is a **chain of bounded epochs with absolute tick numbering**.
 - Ticks never restart: `config.ticks(k) = genesisFrom.tick + epochTicks`,
   `startTick = genesisFrom.tick`. The reducer's monotonic-time rule, latency
   arithmetic and deadline expiry all keep working across epochs.
-- `config.live.genesisFrom` pins the parent's `{runId, tick, seq, eventHash,
-  stateHash, runtimeHash, genesisStateHash}`. It lives inside the config, so it
-  enters `configHash` and therefore `runId`: the child's identity is a pure
-  function of what the parent left on disk.
+- `config.live.genesisFrom` pins the parent's `{runId, engineVersion, tick,
+  seq, eventHash, stateHash, runtimeHash, genesisStateHash, runtime,
+  compaction}`. It lives inside the config, so it enters `configHash` and
+  therefore `runId`: the child's identity is a pure function of what the parent
+  left on disk. `runtime` is the parent's final `CheckpointRuntimeState`, which
+  the child continues; `compaction` records how the inherited genesis was
+  derived; `engineVersion` is what `--accept-parent-engine` has to match when a
+  chain crosses an engine change.
 - The boundary `k → k+1` is **idempotent**: each step (`run.completed`,
   summary and attestation, `chain/<k>.json`, `genesis.json` and
   `manifest.json` of `k+1`, `run.started{inherited}`) checks for its artifact
@@ -79,6 +88,46 @@ Calibration oracles never cross a boundary: calibration tasks stop being
 generated `deadlineTicks + 1` ticks before the epoch ends and the last upkeep
 expires what is still open (`task.expired{reason:"epoch_boundary"}`). External
 tasks have no oracle and may cross.
+
+### 2.1 Engine — how an epoch runs (phase L3a)
+
+`src/lab/live/epoch.ts` is the whole spine; there is no second runtime.
+
+| Step | Function | What it does |
+|---|---|---|
+| plan | `planLiveEpoch` | Reads `chain/`, derives `genesisFrom` from the parent's committed evidence (its final checkpoint, cross-checked against its summary; a replay when the checkpoint is missing), builds the epoch's config and manifest. A pure function of the disk state. |
+| prepare | `runLiveEpoch` | Writes `manifest.json`, `config.json` and `genesis.json` of the epoch before its first event. |
+| run | `runGenesis` (shared) | The same bounded runner the scientific track uses: `LogicalUniverse`, replay-verify, `summary.json`, `attestations/final.json`. |
+| link | `LiveChainIndex.writeLink` | `chain/<k>.json`, immutable and dense (epoch `k` needs `k-1`). |
+| audit | `verifyLiveChain` | Replays the chain from epoch 0, re-derives every inherited genesis from its parent's replayed final state, recomputes every summary and attestation. |
+
+- The live policy is `CohortPolicy(C, LiveIdlePolicy)`, composed to exactly
+  `cohort-c-live-idle-v1`. `genesis.ts` and `protocol-verifier.ts` receive it
+  as an injected factory — importing it would break the science guard's rule
+  that the scientific instruments never reach `src/lab/live/*`.
+- Rules that differ between a bounded run and an epoch live once, in
+  `src/lab/epoch-rules.ts`, and are called by both the world and the verifier:
+  the calibration stop, the boundary sweep, the inherited `run.started`
+  payload and `compactWorldState`.
+- The calibration realization is seeded from the universe (a derived
+  `taskStream.realizationSeed`), not from each epoch's `runId`, so the child
+  continues the parent's stream instead of starting a new one; the cursor and
+  RNG state travel in `genesisFrom.runtime`.
+- A live universe may carry an empty `pressures` schedule: its physics arrive
+  as recorded operator input, never as a configured schedule.
+- `WorldState.counters` are lifetime totals maintained by the one reducer in
+  live states only; `metrics.ts` prefers them over map lengths when present,
+  which is what will let a bounded world archive settled records without
+  changing what a metric means.
+- Epoch-0 physics of the universe: `experiments/genesis-live/config.json`.
+
+Not implemented in this build, each a seam that fails closed rather than a
+silent gap: recorded task sources, the evaluator port and verdicts, the
+`llmTokens` economy and exhaustion, `physics/inbox.jsonl` pressures (phase
+L3b); archival and compaction (`compactWorldState` refuses every kind but
+`none`), the outage and disk supervisor and the `anu lab live` command
+(phase L3c). Passing `taskSource`, `evaluator`, `pressureSource`, `archive` or
+`supervisor` to `runLiveEpoch` is refused, not ignored.
 
 ## 3. Recorded-input rules
 
@@ -214,4 +263,7 @@ IAM role bindings applied by hand, ACME path for the Observer edge.
 | L1b live cognition port, `LiveIdlePolicy`, observation budget | delivered (`5f1097b`) |
 | L4 Observer live surface — `/api/live`, run head/state, ETag/304 | delivered (`fb0c1bc`, merged `aa677f3`) |
 | L9 permanent CI gate — hardened science-isolation guard | delivered (`3a6ab0a`, merged `3ad5dd1`) |
-| C1 canary · L3 live engine · L5 infrastructure · L6 site · L7 link inheritance · L8 background extensions | pending; dependencies and criteria in the design |
+| L3a live engine — epoch chain, inherited genesis, idempotent boundary, live projection | delivered (§2.1) |
+| L3b live engine — recorded task sources, verdicts, economy, recorded physics | pending; seams declared and failing closed |
+| L3c live engine — archival and compaction, supervisor, `anu lab live` | pending; seams declared and failing closed |
+| C1 canary · L5 infrastructure · L6 site · L7 link inheritance · L8 background extensions | pending; dependencies and criteria in the design |

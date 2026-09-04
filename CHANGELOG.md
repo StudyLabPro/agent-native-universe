@@ -127,6 +127,62 @@ follows [Semantic Versioning](https://semver.org/).
   tier-tagged provider each. The `live` command itself is unchanged and still
   fails closed as "not implemented in this build".
 
+### Genesis-Live — phase L3a (epoch spine: chain, inherited genesis, idempotent boundary)
+
+- A live universe is now a chain of bounded epochs on one absolute tick axis.
+  `config.ticks(k) = genesisFrom.tick + epochTicks`, `run.started{inherited}`
+  is committed at the parent's final tick, and an inherited epoch creates no
+  genesis population — it continues the parent's agents, links, tasks and
+  treasury. `LiveGenesisFrom` pins the parent's `runId`, engine, tick, seq,
+  event hash, state hash, runtime (with its hash) and the compaction rule, and
+  lives inside `GenesisConfig.live`, so it enters `configHash` and therefore
+  the child's `runId`: an epoch's identity is a pure function of what its
+  parent left on disk.
+- `src/lab/live/epoch.ts` builds the chain: `planLiveEpoch` derives the next
+  epoch from the disk state alone, `runLiveEpoch`/`runLiveUniverse` run and
+  link it, `verifyLiveChain` performs the full audit by replaying the chain
+  from epoch 0 — re-deriving every inherited genesis from its parent's
+  replayed final state and recomputing every summary and attestation rather
+  than trusting them. `chain/<epoch>.json` (`LiveChainIndex`, immutable and
+  dense) is an index, not a source of truth.
+- The boundary `k → k+1` is idempotent at every point: `run.completed`,
+  `summary.json`/`attestations/final.json`, `chain/<k>.json`,
+  `manifest.json`+`genesis.json` of `k+1`, `run.started{inherited}`. Each step
+  is re-derived and writes only what is missing; identical bytes are tolerated,
+  differing bytes are an `EvidenceConflictError`. `kill -9` at any of the four
+  points converges to the same `runId(k+1)` and the same first-tick state hash
+  (`test/lab-live-boundary.test.mjs` kills real processes to prove it).
+- Live-mode projection, and only for the live engine:
+  `assertLabManifestImplementation`, `ReplayEngine`, `LabProtocolVerifier`,
+  `LogicalUniverse` and `EvidenceStore` accept a live manifest when — and only
+  when — the caller passes an explicit live projection. Every scientific
+  reader calls them without it and keeps refusing live evidence fail-closed,
+  including `anu lab replay`/`attest`/`verify-attestation` and evidence
+  discovery. The live idle policy is injected as a factory rather than
+  imported, so the science guard's import rule holds unchanged.
+- Shared live rules live once in `src/lab/epoch-rules.ts` and are called by
+  both the world and the verifier (single embodiment): calibration generation
+  stops `deadlineTicks + 1` ticks before an epoch ends, the final upkeep
+  expires anything still open as `task.expired{reason: "epoch_boundary"}`
+  (a live-only reducer rule), and `compactWorldState` derives an inherited
+  genesis — refusing any compaction kind this build does not implement.
+  No calibration oracle can cross a boundary; oracles exist only in memory.
+- `WorldState.counters` are maintained by the one reducer in live states only,
+  and `metrics.ts` prefers them over map lengths when present, so a bounded
+  world can archive settled records later without changing what a metric
+  means. A logical or cognitive state still carries neither `mode` nor
+  `counters` — asserted on the keys of the canonical JSON.
+- A live universe may carry an empty `pressures` schedule (its physics arrive
+  as recorded operator input), its calibration realization is seeded from the
+  universe rather than from each epoch's `runId` so the stream continues
+  across boundaries, and `CohortPolicy` composition is idempotent for a
+  fallback that already carries the cohort-qualified live literal.
+- Added `experiments/genesis-live/config.json` (the epoch-0 physics of the
+  live universe) and the tests `test/lab-live-{epochs,boundary}.test.mjs`.
+  Still to come: recorded task sources, verdicts and economy (L3b), and
+  archival, the supervisor and the `live` command (L3c) — each declared as a
+  seam that fails closed today.
+
 ### Genesis-Live — phase L4 (Observer live surface)
 
 - `GET /api/live` returns the live universe head: `currentRunId`, epoch,
