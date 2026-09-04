@@ -5,6 +5,7 @@ import { createRunEvidenceAttestation } from "./evidence-attestation.js";
 import { writeFinalAttestationInternal } from "./evidence-attestation-storage.js";
 import { createLogicalPolicyById } from "./baselines.js";
 import { CohortPolicy, type CognitionPort } from "./cognition.js";
+import type { LiveRecordedInputs } from "./live-ports.js";
 import type { LogicalPolicy } from "./policy-schedule.js";
 import { createRunManifest } from "./manifest.js";
 import { NeutralPolicy } from "./neutral-policy.js";
@@ -77,6 +78,19 @@ export interface LiveGenesisOptions {
    * when `config.live.genesisFrom` is present.
    */
   genesisState?: WorldState;
+  /**
+   * Identity of the port that grades recorded external work. Hashed into the
+   * runId exactly as `cognitionId` is, so a chain graded by one evaluator can
+   * never silently recover a chain graded by another. Required in live mode;
+   * an epoch that grades nothing but calibration work names the oracle.
+   */
+  evaluatorId: string;
+  /**
+   * External work, verdicts and operator physics. Supplied to the world so it
+   * can commit them as events; a replay never sees them, because everything
+   * they produced is already in the chain.
+   */
+  recordedInputs?: LiveRecordedInputs;
 }
 
 export class GenesisRunPausedError extends Error {
@@ -140,6 +154,7 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
         // identity, rerunning the same cohort against a different model
         // would recover the earlier run's evidence instead of running.
         ...(cognition === undefined ? {} : { cognitionId: cognition.id }),
+        ...(live === undefined ? {} : { evaluatorId: live.evaluatorId }),
       },
   );
   // Every projection of this run — the universe, both replays and the
@@ -178,6 +193,7 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
         await options.onCheckpoint?.(checkpoint);
       },
       ...(live?.genesisState === undefined ? {} : { genesisState: live.genesisState }),
+      ...(live?.recordedInputs === undefined ? {} : { recordedInputs: live.recordedInputs }),
       ...(options.fsyncEveryTick === true ? { fsyncEveryTick: true } : {}),
       ...(recovery.kind === "checkpoint"
         ? { resumeFrom: recovery.checkpoint, pendingOracles: recovery.pendingOracles }

@@ -37,6 +37,7 @@ import {
   verifyLiveChain,
 } from "../dist/lab/live/epoch.js";
 import { LIVE_UNIVERSE_ID } from "../dist/lab/live/identity.js";
+import { LIVE_ORACLE_EVALUATOR_ID } from "../dist/lab/live/evaluator-port.js";
 import { liveTestConfig, scriptedLiveCognition } from "./live-fixture.mjs";
 
 async function tempDir(t, prefix) {
@@ -164,6 +165,9 @@ test("an epoch's identity is a pure function of what its parent left on disk", a
     mode: "live",
     policyId: LAB_LIVE_POLICY_ID,
     cognitionId: cognition.id,
+    // Phase L3b: the port that grades recorded work is part of the live
+    // identity, exactly as the consulted model is.
+    evaluatorId: LIVE_ORACLE_EVALUATOR_ID,
   });
   assert.notEqual(forgedManifest.runId, planned.manifest.runId);
 
@@ -504,13 +508,14 @@ test("mode and counters are absent from the keys of a logical checkpoint and pre
 /* Seams left open for L3b and L3c, and the scientific refusals        */
 /* ------------------------------------------------------------------ */
 
-test("the recorded-input, archive and supervisor seams fail closed", async (t) => {
+test("the archive and supervisor seams fail closed", async (t) => {
   const root = await tempDir(t, "anu-live-seams-");
   const base = { dataRoot: root, config: liveTestConfig(), cognition: scriptedLiveCognition() };
+  // The three recorded-input seams were filled in phase L3b (see
+  // test/lab-live-inputs.test.mjs and test/lab-live-economy.test.mjs); these
+  // two remain, and a caller that supplies one still gets a refusal rather
+  // than a silently ignored argument.
   const seams = {
-    taskSource: /recorded task sources \(phase L3b\) is not implemented/,
-    evaluator: /evaluator port and verdicts \(phase L3b\) is not implemented/,
-    pressureSource: /recorded operator physics \(phase L3b\) is not implemented/,
     archive: /archival and compaction \(phase L3c\) is not implemented/,
     supervisor: /supervisor \(phase L3c\) is not implemented/,
   };
@@ -518,6 +523,12 @@ test("the recorded-input, archive and supervisor seams fail closed", async (t) =
     await assert.rejects(() => planLiveEpoch({ ...base, [seam]: {} }), pattern);
     await assert.rejects(() => runLiveEpoch({ ...base, [seam]: {} }), pattern);
   }
+
+  // Recorded work nobody can grade is refused up front, not left to hang.
+  await assert.rejects(
+    () => planLiveEpoch({ ...base, taskSource: { id: "x", async next() { return []; } } }),
+    /A recorded task source needs an evaluator port/,
+  );
 
   // Compaction is a recorded rule, not a convention: an unknown kind is
   // refused by the config and by the derivation, never silently ignored.

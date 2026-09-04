@@ -259,6 +259,14 @@ export interface RunManifest {
    * runId so runs of different models can never share evidence.
    */
   cognitionId?: string;
+  /**
+   * Identity of the port that graded recorded (external) work — the grader
+   * model or the verdict inbox. Present exactly in `live` mode and hashed into
+   * the runId, for the same reason `cognitionId` is: a verdict is a recorded
+   * input, and evidence graded by one evaluator must never stand in for
+   * evidence graded by another.
+   */
+  evaluatorId?: string;
   runId: string;
   universeId: string;
   seed: string;
@@ -298,7 +306,13 @@ export interface LabLinkState {
 
 export interface LabTaskState {
   id: string;
-  family: TaskFamily;
+  /**
+   * One of the frozen eight families, or the live-only `external` literal for
+   * a task that entered the world as a recorded input (phase L3b). The literal
+   * is refused outside `mode: "live"` by the reducer, so a scientific state can
+   * never carry it.
+   */
+  family: LiveTaskFamily;
   input: JsonValue;
   createdTick: number;
   deadlineTick: number;
@@ -437,7 +451,7 @@ export interface LiveWorldCounters {
 
 export interface TaskObservation {
   id: string;
-  family: TaskFamily;
+  family: LiveTaskFamily;
   input: JsonValue;
   createdTick: number;
   deadlineTick: number;
@@ -564,6 +578,7 @@ export type LabEventType =
   | "capability.used"
   | "agent.learning.updated"
   | "cognition.recorded"
+  | "verdict.recorded"
   | "pressure.applied"
   | "violation.recorded"
   | "metrics.recorded"
@@ -627,6 +642,24 @@ export interface CheckpointRuntimeState {
   taskStream: TaskStreamCheckpoint;
   /** Null means the selected custom policy did not expose resumable state. */
   policy: NeutralPolicyCheckpoint | null;
+  /**
+   * Genesis-Live only (phase L3b): how long each agent has been unable to
+   * think. Absent from every logical and cognitive runtime, so their
+   * checkpoints and `runtimeHash` are byte-identical to what they always were.
+   *
+   * It lives in the runtime rather than in `WorldState` for the same reason the
+   * task stream does: it is deterministic bookkeeping the world and the
+   * protocol verifier each rebuild from the same rule, not a fact the events
+   * assert. Carrying it across an epoch boundary (`genesisFrom.runtime`) is
+   * what makes the grace period continuous over a universe's whole life
+   * instead of restarting every epoch.
+   */
+  exhaustion?: LiveExhaustionCheckpoint;
+}
+
+/** Consecutive starving ticks per agent, in agent-id order. */
+export interface LiveExhaustionCheckpoint {
+  starving: Array<{ agentId: string; ticks: number }>;
 }
 
 export interface Checkpoint {

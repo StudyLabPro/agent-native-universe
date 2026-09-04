@@ -34,6 +34,8 @@ export const LIVE_CANARY_FIRST_UNIVERSE_NUMBER = 901;
 export interface LiveEpochManifestOptions {
   /** Identity of the live cognition port (tiers, prompt, gateway identity, content budget). */
   cognitionId: string;
+  /** Identity of the port that grades recorded external work (phase L3b). */
+  evaluatorId: string;
 }
 
 /**
@@ -54,6 +56,7 @@ export function createLiveEpochManifest(
     mode: "live",
     policyId: LAB_LIVE_POLICY_ID,
     cognitionId: options.cognitionId,
+    evaluatorId: options.evaluatorId,
   });
   if (
     manifest.engineVersion !== LAB_LIVE_ENGINE_VERSION

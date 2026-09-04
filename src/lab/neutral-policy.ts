@@ -1,5 +1,6 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
 import { compareCodeUnits } from "./canonical.js";
+import { learningFamilyOf } from "./epoch-rules.js";
 import { LAB_POLICY_ID } from "./manifest.js";
 import {
   PPM,
@@ -167,6 +168,11 @@ function exploreTopology(
 export function solveTask(task: TaskObservation): JsonValue {
   const input = objectValue(task.input, `${task.family} input`);
   switch (task.family) {
+    // Live-only recorded work. It has no hidden oracle and no closed-form
+    // answer, so the deterministic solver refuses it instead of inventing one;
+    // external tasks are graded by a recorded verdict (phase L3b).
+    case "external":
+      throw new Error("External tasks have no deterministic solution");
     case "arithmetic": {
       const left = integerValue(input.left, "arithmetic.left");
       const right = integerValue(input.right, "arithmetic.right");
@@ -262,9 +268,11 @@ function chooseTask(
   let bestScore = -1n;
   let best: TaskObservation[] = [];
   for (const task of ordered) {
-    const attempts = agent.learning.attempts[task.family] ?? 0;
-    const successes = agent.learning.successes[task.family] ?? 0;
-    const learnedUtility = agent.learning.utilityPpm[task.family];
+    // External work is never scored by the bandit: it has no learning key.
+    const family = learningFamilyOf(task.family);
+    const attempts = family === undefined ? 0 : agent.learning.attempts[family] ?? 0;
+    const successes = family === undefined ? 0 : agent.learning.successes[family] ?? 0;
+    const learnedUtility = family === undefined ? undefined : agent.learning.utilityPpm[family];
     nonNegativeSafeInteger(attempts, "bandit attempts");
     nonNegativeSafeInteger(successes, "bandit successes");
     if (successes > attempts) throw new Error(`Successes exceed attempts for ${task.family}`);

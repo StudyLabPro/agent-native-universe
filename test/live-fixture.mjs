@@ -5,6 +5,7 @@
  * the crash driver that the boundary test spawns and kills.
  */
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
+import { computeEventHash } from "../dist/lab/events.js";
 
 export const LIVE_TEST_COGNITION_ID = "cognition-live-test-v1:scripted:cb65536";
 
@@ -52,7 +53,11 @@ export function liveTestConfig(overrides = {}) {
  * `silent: true` returns no records at all, which is how the tests prove that
  * an unsteered live agent idles instead of receiving a computed answer.
  */
-export function scriptedLiveCognition({ id = LIVE_TEST_COGNITION_ID, silent = false } = {}) {
+export function scriptedLiveCognition({
+  id = LIVE_TEST_COGNITION_ID,
+  silent = false,
+  tier = "fast",
+} = {}) {
   return {
     id,
     cohort: "C",
@@ -78,8 +83,34 @@ export function scriptedLiveCognition({ id = LIVE_TEST_COGNITION_ID, silent = fa
           usage: { inputTokens: 8, outputTokens: 8, totalTokens: 16 },
           latencyMs: 1,
           actions,
+          // A live record states the tier it was consulted at: the world
+          // charges `llmTokens` for the thought at that tier's price.
+          tier,
         };
       });
     },
   };
+}
+
+/**
+ * Re-link and re-sign a tampered event list so the hash chain is internally
+ * consistent again.
+ *
+ * Without this a forged event is caught by the chain before the protocol
+ * verifier ever looks at it, and a test that expected the verifier to refuse
+ * the forgery would pass for the wrong reason. Re-signing removes the cheap
+ * refusal and leaves only the expensive one: whether the rules regenerate what
+ * the events claim.
+ */
+export function resignEventChain(events) {
+  const resigned = [];
+  let previousHash = events[0].previousHash;
+  for (const event of events) {
+    const next = { ...structuredClone(event), previousHash };
+    delete next.hash;
+    next.hash = computeEventHash(next);
+    previousHash = next.hash;
+    resigned.push(next);
+  }
+  return resigned;
 }

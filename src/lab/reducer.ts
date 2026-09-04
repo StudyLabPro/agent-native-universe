@@ -1,6 +1,12 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
 import { executeCapabilityPlan, validateCapabilityPublication } from "./capability-registry.js";
 import { hashValue } from "./canonical.js";
+import {
+  LIVE_COGNITION_OVERDRAFT_REASON,
+  assertExternalTask,
+  isExternalTask,
+  learningFamilyOf,
+} from "./epoch-rules.js";
 import { deterministicId } from "./ids.js";
 import {
   LAB_SCHEMA_VERSION,
@@ -228,7 +234,18 @@ export function prepareWorldEventTransition(
       break;
     }
     case "agent.retired": {
-      assertPhase(event, "pressure");
+      // Retirement by operator physics happens in the pressure phase and is
+      // caused by the pressure event. Retirement by exhaustion happens in the
+      // upkeep of a live tick and has no cause but the agent's own balance —
+      // it is regenerated from the state by `LiveExhaustionTracker`, so it
+      // needs no causal parent to be verifiable.
+      const exhausted = data.reason === "exhausted";
+      if (exhausted) {
+        if (state.mode !== "live") throw new Error("Retirement by exhaustion is a live-only rule");
+        assertPhase(event, "upkeep");
+      } else {
+        assertPhase(event, "pressure");
+      }
       const agentId = requireActorDataAgent(event);
       const agent = requireAgent(state, agentId);
       assertNoTarget(event, "agent.retired");
@@ -237,8 +254,12 @@ export function prepareWorldEventTransition(
       }
       const retiredTick = nonNegativeInteger(data.retiredTick, "retiredTick");
       if (retiredTick !== event.tick) throw new Error("retiredTick must equal the retirement event tick");
-      if (data.reason !== "pressure") throw new Error("agent.retired requires reason pressure");
-      requireCausation(event, "agent.retired");
+      if (exhausted) {
+        if (event.causationId !== undefined) throw new Error("Retirement by exhaustion has no causal parent");
+      } else {
+        if (data.reason !== "pressure") throw new Error("agent.retired requires reason pressure");
+        requireCausation(event, "agent.retired");
+      }
       mutation = () => {
         agent.active = false;
         agent.retiredTick = retiredTick;
@@ -250,7 +271,19 @@ export function prepareWorldEventTransition(
       assertSystemEvent(event, "task.created");
       const task = parseTask(optionalRecord(data.task) ?? data);
       if (state.tasks[task.id]) throw new Error(`Task ${task.id} already exists`);
-      if (!TASK_FAMILIES.has(task.family)) throw new Error(`Unknown task family ${task.family}`);
+      // A recorded external task is the one family the seed cannot produce, so
+      // it is admitted only under `mode: "live"`, only when the event declares
+      // itself a recorded input, and only in the exact shape a recorded input
+      // may take — including an id that commits to its own content.
+      const external = data.source !== undefined;
+      if (external) {
+        if (state.mode !== "live") throw new Error("A recorded task source is a live-only rule");
+        if (data.source !== "external") throw new Error(`Unknown task.created source ${String(data.source)}`);
+        if (!isExternalTask(task)) throw new Error("A recorded external task must carry family external");
+        assertExternalTask(task, event.tick);
+      } else if (!TASK_FAMILIES.has(task.family as TaskFamily)) {
+        throw new Error(`Unknown task family ${task.family}`);
+      }
       if (task.status !== "available") throw new Error("New tasks must start available");
       if (task.createdTick !== event.tick) throw new Error("Task createdTick must equal the event tick");
       if (task.deadlineTick <= task.createdTick) throw new Error("Task deadlineTick must be after createdTick");
@@ -333,8 +366,24 @@ export function prepareWorldEventTransition(
       const accepted = requiredBoolean(data.accepted, "accepted");
       const qualityPpm = nonNegativeInteger(data.qualityPpm, "qualityPpm");
       if (qualityPpm > PPM) throw new Error("qualityPpm must not exceed 1,000,000");
-      if (qualityPpm !== (accepted ? PPM : 0)) {
-        throw new Error("Evaluation accepted and qualityPpm are inconsistent");
+      // Calibration work is graded by the hidden oracle and is therefore
+      // all-or-nothing. External work is graded by a recorded verdict on a
+      // continuum, and the evaluator that produced it is named in the event.
+      const externalWork = isExternalTask(task);
+      if (externalWork) {
+        if (state.mode !== "live") throw new Error("Recorded verdicts are a live-only rule");
+        const evaluatorId = requiredString(data.evaluatorId, "evaluatorId");
+        if (evaluatorId.length > 128) throw new Error("evaluatorId must be at most 128 characters");
+        if (accepted !== (qualityPpm > 0)) {
+          throw new Error("A recorded verdict accepts exactly when it grants positive quality");
+        }
+      } else {
+        if (data.evaluatorId !== undefined) {
+          throw new Error("Only recorded external work carries an evaluatorId");
+        }
+        if (qualityPpm !== (accepted ? PPM : 0)) {
+          throw new Error("Evaluation accepted and qualityPpm are inconsistent");
+        }
       }
       if (nonNegativeInteger(data.violations, "violations") !== 0) {
         throw new Error("Logical v1.1 evaluator violations must be zero");
@@ -347,10 +396,18 @@ export function prepareWorldEventTransition(
         throw new Error(`Evaluation latency ${latencyTicks} does not match task age ${expectedLatency}`);
       }
       const agent = requireAgent(state, submission.agentId);
-      const taskCount = incrementCounter(agent.taskCounts[task.family], `taskCounts.${task.family}`);
-      const attempts = incrementCounter(agent.learning.attempts[task.family], `learning.attempts.${task.family}`);
-      const successes = accepted
-        ? incrementCounter(agent.learning.successes[task.family], `learning.successes.${task.family}`)
+      // Specialization is measured over exactly the frozen eight families, so
+      // external work never reaches `taskCounts` or `learning`; it is counted
+      // in the live-only `counters` instead.
+      const learningFamily = learningFamilyOf(task.family);
+      const taskCount = learningFamily === undefined
+        ? undefined
+        : incrementCounter(agent.taskCounts[learningFamily], `taskCounts.${learningFamily}`);
+      const attempts = learningFamily === undefined
+        ? undefined
+        : incrementCounter(agent.learning.attempts[learningFamily], `learning.attempts.${learningFamily}`);
+      const successes = accepted && learningFamily !== undefined
+        ? incrementCounter(agent.learning.successes[learningFamily], `learning.successes.${learningFamily}`)
         : undefined;
       mutation = () => {
         submission.accepted = accepted;
@@ -359,9 +416,11 @@ export function prepareWorldEventTransition(
         task.status = "completed";
         task.completedTick = completedTick;
         task.evaluationEventId = event.eventId;
-        agent.taskCounts[task.family] = taskCount;
-        agent.learning.attempts[task.family] = attempts;
-        if (successes !== undefined) agent.learning.successes[task.family] = successes;
+        if (learningFamily !== undefined) {
+          agent.taskCounts[learningFamily] = taskCount!;
+          agent.learning.attempts[learningFamily] = attempts!;
+          if (successes !== undefined) agent.learning.successes[learningFamily] = successes;
+        }
         countLive(state, (counters) => {
           counters.tasksCompleted += 1;
           if (accepted) counters.acceptedTasks += 1;
@@ -488,11 +547,25 @@ export function prepareWorldEventTransition(
       break;
     }
     case "resource.spent": {
-      assertPhase(event, "resolution");
+      // Two shapes, one embodiment. In the resolution phase this is the root
+      // payment of an action the agent chose. In the observation phase of a
+      // live epoch it is the price of the thought that was just recorded: it
+      // is caused by its `cognition.recorded` event, which is what makes
+      // "the debit always immediately follows the record" checkable.
+      const thinking = event.phase === "observation";
+      if (thinking) {
+        if (state.mode !== "live") throw new Error("The cognition debit is a live-only rule");
+        assertPhase(event, "observation");
+      } else {
+        assertPhase(event, "resolution");
+      }
       const agentId = requireActorDataAgent(event);
       const agent = requireAgent(state, agentId);
       if (!agent.active) throw new Error(`Inactive agent ${agentId} cannot spend resources`);
-      if (event.targetId !== undefined || event.causationId !== undefined) {
+      if (event.targetId !== undefined) throw new Error("resource.spent cannot have a targetId");
+      if (thinking) {
+        requireCausation(event, "the live cognition debit");
+      } else if (event.causationId !== undefined) {
         throw new Error("resource.spent is a root action payment and cannot have targetId or causationId");
       }
       const resources = cloneResources(agent.resources);
@@ -507,6 +580,7 @@ export function prepareWorldEventTransition(
         credit(resourceSpent, kind, parsed[kind]);
       }
       const action = requiredAction(data.action, "resource.spent action");
+      if (thinking && action !== "reason") throw new Error("The live cognition debit is charged as reason");
       const actionCount = incrementCounter(agent.actionCounts[action], `actionCounts.${action}`);
       mutation = () => {
         assignResources(agent.resources, resources);
@@ -758,6 +832,35 @@ export function prepareWorldEventTransition(
       mutation = () => {};
       break;
 
+    case "verdict.recorded": {
+      // The grader's answer, verbatim, exactly as `cognition.recorded` carries
+      // a model's. State-neutral for the same reason: what the evaluator said
+      // is evidence, and only the `task.evaluated` that follows it may move
+      // the world.
+      if (state.mode !== "live") throw new Error("Recorded verdicts are a live-only rule");
+      assertPhase(event, "evaluation");
+      assertSystemEvent(event, "verdict.recorded");
+      const submission = requireSubmission(state, requiredString(data.submissionId, "verdict.submissionId"));
+      const task = requireTask(state, requiredString(data.taskId, "verdict.taskId"));
+      if (task.id !== submission.taskId) throw new Error("A verdict must name its submission's task");
+      if (!isExternalTask(task)) throw new Error("Only recorded external work is graded by a recorded verdict");
+      if (task.status !== "submitted") throw new Error(`Task ${task.id} is ${task.status}, not submitted`);
+      requiredString(data.evaluatorId, "verdict.evaluatorId");
+      requiredString(data.content, "verdict.content");
+      const usage = optionalRecord(data.usage);
+      if (usage === undefined) throw new Error("verdict.recorded requires a usage record");
+      for (const field of ["inputTokens", "outputTokens", "totalTokens"]) {
+        nonNegativeInteger(usage[field], `verdict.usage.${field}`);
+      }
+      assertExactKeys(
+        data,
+        ["taskId", "submissionId", "evaluatorId", "content", "usage"],
+        "verdict.recorded data",
+      );
+      mutation = () => {};
+      break;
+    }
+
     case "agent.learning.updated": {
       throw new Error("agent.learning.updated is unsupported; learning is derived from task.evaluated");
     }
@@ -770,7 +873,20 @@ export function prepareWorldEventTransition(
       break;
     }
     case "violation.recorded": {
-      assertPhase(event, "resolution");
+      // The one violation that is not about an action the agent chose: a
+      // consultation the world could not fully charge for. It belongs to the
+      // observation phase because that is where the debt was incurred.
+      const overdraft = event.phase === "observation";
+      if (overdraft) {
+        if (state.mode !== "live") throw new Error("The cognition overdraft violation is a live-only rule");
+        if (data.reason !== LIVE_COGNITION_OVERDRAFT_REASON) {
+          throw new Error(`Unknown observation-phase violation ${String(data.reason)}`);
+        }
+        if (data.action !== "reason") throw new Error("A cognition overdraft is recorded against reason");
+        requireCausation(event, "the cognition overdraft violation");
+      } else {
+        assertPhase(event, "resolution");
+      }
       const agentId = requireActorDataAgent(event);
       const agent = requireAgent(state, agentId);
       assertNoTarget(event, "violation.recorded");
@@ -929,7 +1045,7 @@ function parseTask(value: Record<string, unknown>): LabTaskState {
   if (!["available", "claimed", "submitted", "completed", "expired"].includes(status)) throw new Error(`Invalid task status ${status}`);
   return {
     id: requiredString(value.id, "task.id"),
-    family: requiredString(value.family, "task.family") as TaskFamily,
+    family: requiredString(value.family, "task.family") as LiveTaskFamily,
     input: cloneJsonValue(requiredJsonValue(value.input, "task.input")),
     createdTick: nonNegativeInteger(value.createdTick, "task.createdTick"),
     deadlineTick: nonNegativeInteger(value.deadlineTick, "task.deadlineTick"),

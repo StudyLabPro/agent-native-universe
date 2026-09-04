@@ -36,7 +36,7 @@ import { stat } from "node:fs/promises";
 import { EvidenceConflictError, EvidenceStore, LiveChainIndex } from "../artifacts.js";
 import { hashValue } from "../canonical.js";
 import type { CognitionPort } from "../cognition.js";
-import { compactWorldState } from "../epoch-rules.js";
+import { compactWorldState, isExternalTask } from "../epoch-rules.js";
 import { createRunEvidenceAttestation } from "../evidence-attestation.js";
 import { runGenesis, type GenesisRunOptions } from "../genesis.js";
 import { LAB_LIVE_ENGINE_VERSION } from "../manifest.js";
@@ -53,6 +53,13 @@ import {
   type WorldState,
   LAB_SCHEMA_VERSION,
 } from "../types.js";
+import type {
+  LiveEvaluatorPort,
+  LivePressureSource,
+  LiveRecordedInputs,
+  LiveTaskSource,
+} from "../live-ports.js";
+import { LIVE_ORACLE_EVALUATOR_ID } from "./evaluator-port.js";
 import { createLiveIdlePolicy } from "./live-idle-policy.js";
 import { LIVE_DATA_ROOT_SEGMENT, LIVE_UNIVERSE_ID, createLiveEpochManifest } from "./identity.js";
 
@@ -81,17 +88,18 @@ export interface LiveBoundaryContext {
 }
 
 /**
- * Recorded-input seams of phases L3b and L3c. They are declared here so that
- * the shape of the call is fixed and a caller that supplies one gets a clear
- * refusal instead of a silently ignored argument.
+ * The ports an epoch takes. The three recorded-input ports arrived in phase
+ * L3b; the two remaining seams are declared here so that the shape of the call
+ * is fixed and a caller that supplies one gets a clear refusal instead of a
+ * silently ignored argument.
  */
 export interface LiveRecordedInputPorts {
-  /** `CalibrationTaskSource` / `FileTaskSource` / `CompositeTaskSource` (L3b). */
-  taskSource?: unknown;
-  /** `OracleEvaluator` / `LlmEvaluator` / `InboxEvaluator` (L3b). */
-  evaluator?: unknown;
-  /** `RecordedPressureSource` over `physics/inbox.jsonl` (L3b). */
-  pressureSource?: unknown;
+  /** `FileTaskSource` / `CompositeTaskSource` over `tasks/inbox.jsonl` (L3b). */
+  taskSource?: LiveTaskSource;
+  /** `LlmEvaluator` / `InboxEvaluator` (L3b); absent means calibration work only. */
+  evaluator?: LiveEvaluatorPort;
+  /** `RecordedPressureSource` / `FilePressureSource` over `physics/inbox.jsonl` (L3b). */
+  pressureSource?: LivePressureSource;
   /** Archive windows and state compaction (L3c). */
   archive?: unknown;
   /** Outage and disk guards of `anu lab live` (L3c). */
@@ -190,9 +198,6 @@ export function assertLiveUniverseConfig(base: GenesisConfig): void {
 
 function assertNoUnimplementedPorts(options: LiveRecordedInputPorts): void {
   const pending: Array<[keyof LiveRecordedInputPorts, string]> = [
-    ["taskSource", "recorded task sources (phase L3b)"],
-    ["evaluator", "the evaluator port and verdicts (phase L3b)"],
-    ["pressureSource", "recorded operator physics (phase L3b)"],
     ["archive", "bounded-world archival and compaction (phase L3c)"],
     ["supervisor", "the outage and disk supervisor (phase L3c)"],
   ];
@@ -201,6 +206,25 @@ function assertNoUnimplementedPorts(options: LiveRecordedInputPorts): void {
       throw new Error(`${String(key)}: ${what} is not implemented in this build`);
     }
   }
+  // Recorded work that nobody can grade would hang until its deadline and then
+  // expire; refusing the combination up front is the honest failure.
+  if (options.taskSource !== undefined && options.evaluator === undefined) {
+    throw new Error("A recorded task source needs an evaluator port: external work has no oracle");
+  }
+}
+
+/** The evaluator identity of an epoch, named even when only oracles grade. */
+export function liveEvaluatorIdOf(options: LiveRecordedInputPorts): string {
+  return options.evaluator?.id ?? LIVE_ORACLE_EVALUATOR_ID;
+}
+
+/** The recorded-input ports this build passes into the shared runner. */
+function recordedInputsOf(options: LiveRecordedInputPorts): LiveRecordedInputs {
+  return {
+    ...(options.taskSource === undefined ? {} : { taskSource: options.taskSource }),
+    ...(options.evaluator === undefined ? {} : { evaluator: options.evaluator }),
+    ...(options.pressureSource === undefined ? {} : { pressureSource: options.pressureSource }),
+  };
 }
 
 function chainIndexOf(dataRoot: string, universeId: string): LiveChainIndex {
@@ -249,21 +273,35 @@ export async function planLiveEpoch(options: LiveUniverseOptions): Promise<LiveE
   const universeId = options.universeId ?? LIVE_UNIVERSE_ID;
   const links = await chainIndexOf(options.dataRoot, universeId).readLinks();
   const parent = links.at(-1);
+  const manifestOptions = {
+    cognitionId: options.cognition.id,
+    evaluatorId: liveEvaluatorIdOf(options),
+  };
   if (parent === undefined) {
     const config = liveEpochConfig(options.config);
     return {
       epoch: 0,
       config,
-      manifest: createLiveEpochManifest(config, universeId, { cognitionId: options.cognition.id }),
+      manifest: createLiveEpochManifest(config, universeId, manifestOptions),
     };
   }
   assertParentEngine(parent.engineVersion, options.acceptParentEngine);
   const inherited = await inheritFromParent(options.dataRoot, universeId, parent);
+  // An epoch that inherits open external work must be able to grade it: the
+  // grader is not a per-epoch convenience, it is part of the universe.
+  if (
+    options.evaluator === undefined
+    && Object.values(inherited.genesisState.tasks).some((task) => (
+      isExternalTask(task) && task.status !== "completed" && task.status !== "expired"
+    ))
+  ) {
+    throw new Error("This universe carries open external work; the next epoch needs an evaluator port");
+  }
   const config = liveEpochConfig(options.config, inherited.genesisFrom);
   return {
     epoch: parent.epoch + 1,
     config,
-    manifest: createLiveEpochManifest(config, universeId, { cognitionId: options.cognition.id }),
+    manifest: createLiveEpochManifest(config, universeId, manifestOptions),
     genesisState: inherited.genesisState,
     parent,
   };
@@ -397,6 +435,8 @@ export async function runLiveEpoch(options: LiveUniverseOptions): Promise<LiveEp
     live: {
       createFallbackPolicy: () => createLiveIdlePolicy("live"),
       ...(plan.genesisState === undefined ? {} : { genesisState: plan.genesisState }),
+      evaluatorId: liveEvaluatorIdOf(options),
+      recordedInputs: recordedInputsOf(options),
     },
     fsyncEveryTick: plan.config.live!.fsyncEveryTick,
     ...(options.signal === undefined ? {} : { signal: options.signal }),

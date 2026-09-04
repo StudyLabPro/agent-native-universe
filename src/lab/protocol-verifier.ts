@@ -3,9 +3,18 @@ import { createGenesisAgents } from "./agent-factory.js";
 import { compareCodeUnits, hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import {
+  LIVE_COGNITION_OVERDRAFT_REASON,
+  LiveExhaustionTracker,
+  assertExternalTask,
   calibrationTaskCount,
   epochBoundaryExpiries,
+  externalTaskId,
   inheritedGenesisOf,
+  isExternalTask,
+  liveThinkingDebit,
+  openTaskBacklog,
+  proportionalReward,
+  type LiveExternalTaskInput,
 } from "./epoch-rules.js";
 import { equalJson, type PendingOracle } from "./evaluator.js";
 import { deterministicId } from "./ids.js";
@@ -20,7 +29,7 @@ import {
   type DeferredPolicyViolation,
   type PolicyDecision,
 } from "./policy-schedule.js";
-import { PressureEngine } from "./pressure-engine.js";
+import { PressureEngine, parsePressureSpec, pressureEffect } from "./pressure-engine.js";
 import { RESOURCE_KINDS, ResourcePhysics } from "./resource-physics.js";
 import { DeterministicRng } from "./rng.js";
 import { DeterministicTaskStream, taskStreamRng, type GeneratedTask } from "./task-stream.js";
@@ -28,9 +37,11 @@ import {
   PPM,
   type CheckpointRuntimeState,
   type GenesisConfig,
+  type LabTaskState,
   type LiveGenesisFrom,
   type LabEvent,
   type LabEventType,
+  type LiveThinkTier,
   type PrimitiveActionType,
   type ResourceVector,
   type RunManifest,
@@ -82,14 +93,28 @@ const EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>
 });
 
 /**
- * Live epochs add exactly one phase to the frozen table: the final upkeep of
- * an epoch expires the calibration work that would otherwise cross the
- * boundary. The logical table itself is unchanged, so a bounded run is
- * verified by exactly the phases it always was.
+ * Live epochs widen the frozen table in four places, all of them recorded-input
+ * or bounded-world rules that do not exist in a bounded run:
+ *
+ *  - the final upkeep expires calibration work that would otherwise cross the
+ *    epoch boundary (phase L3a);
+ *  - a recorded thought is paid for in the observation phase, immediately after
+ *    the `cognition.recorded` that caused it, and an overdrawn payment records
+ *    its violation there too (phase L3b);
+ *  - an agent that can no longer think is retired in the upkeep (phase L3b);
+ *  - a recorded verdict is committed in the evaluation phase before the
+ *    `task.evaluated` it justifies (phase L3b).
+ *
+ * The logical table itself is unchanged, so a bounded run is verified by
+ * exactly the phases it always was.
  */
 const LIVE_EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>> = Object.freeze({
   ...EVENT_PHASES,
   "task.expired": ["task_generation", "upkeep"],
+  "resource.spent": ["resolution", "observation"],
+  "violation.recorded": ["resolution", "observation"],
+  "agent.retired": ["pressure", "upkeep"],
+  "verdict.recorded": ["evaluation"],
 });
 
 interface ExpectedPressureEvent {
@@ -197,6 +222,8 @@ export class LabProtocolVerifier {
   readonly #initialAgentTotals: ResourceVector;
   readonly #oracles = new Map<string, JsonValue>();
   readonly #submissions: PendingSubmission[] = [];
+  /** Live only: the exhaustion clock, regenerated tick by tick from the states. */
+  readonly #exhaustion = new LiveExhaustionTracker();
 
   #started = false;
   #genesisAgentIndex = 0;
@@ -211,6 +238,16 @@ export class LabProtocolVerifier {
   #boundaryExpiryExpected: string[] | undefined;
   #generatedExpected: GeneratedTask[] | undefined;
   #generatedIndex = 0;
+  /** Live only: the debit (and its overdraft violation) a recorded thought owes. */
+  #thinkingExpected: ExpectedThinkingEvent[] = [];
+  /** Live only: the upkeep's exhaustion retirements, once regenerated. */
+  #exhaustionExpected: string[] | undefined;
+  /** Live only: the recorded verdict that must be followed by its evaluation. */
+  #pendingVerdict: string | undefined;
+  /** The random source of this tick's physics; shared by schedule and inbox. */
+  #tickPressureRng: DeterministicRng | undefined;
+  /** Live only: once recorded work enters a tick, no calibration work may follow. */
+  #recordedTaskSeen = false;
   #rewards: ExpectedReward[] = [];
   #messageChain: MessageChain | undefined;
   #openPayment: PaymentAnchor | undefined;
@@ -284,6 +321,7 @@ export class LabProtocolVerifier {
         }
         this.#policy.restore(this.#genesisFrom.runtime.policy, this.#policyRng);
       }
+      this.#exhaustion.restore(this.#genesisFrom.runtime.exhaustion);
       this.#currentTick = this.#genesisTick;
       this.#tickCompleted = true;
     } else if (options.live?.genesisState !== undefined) {
@@ -313,6 +351,13 @@ export class LabProtocolVerifier {
     if (rank < this.#lastPhaseRank) this.#fail(event, "phase moves backwards within a tick");
     this.#lastPhaseRank = rank;
 
+    // The price of a recorded thought is owed immediately, so nothing at all
+    // may come between the record and its debit.
+    if (this.#thinkingExpected.length > 0) {
+      this.#verifyThinkingEvent(event);
+      return;
+    }
+
     if (event.type === "cognition.recorded") {
       // Recorded cognition is an input to the decision phase, not an outcome of
       // it: accept it here and let it steer the schedule regenerated below.
@@ -322,7 +367,9 @@ export class LabProtocolVerifier {
       if (this.#policyDecisions !== undefined) {
         this.#fail(event, "cognition must be recorded before the decision phase of its tick");
       }
-      this.#cognitionRecords.push(decodeCognitionRecord(event, (reason) => this.#fail(event, reason)));
+      const record = decodeCognitionRecord(event, this.#live, (reason) => this.#fail(event, reason));
+      this.#cognitionRecords.push(record);
+      if (this.#live) this.#expectThinkingDebit(event, record, state);
       return;
     }
 
@@ -340,8 +387,16 @@ export class LabProtocolVerifier {
 
     switch (event.type) {
       case "pressure.applied":
+        this.#verifyPressure(event, state);
+        break;
       case "agent.retired":
-        this.#verifyPressure(event);
+        // Two provenances: operator physics (pressure phase, caused by its
+        // pressure event) and exhaustion (upkeep, regenerated from the state).
+        if (event.phase === "upkeep") this.#verifyExhaustionRetirement(event, state);
+        else this.#verifyPressure(event, state);
+        break;
+      case "verdict.recorded":
+        this.#verifyVerdict(event, state);
         break;
       case "task.expired":
         this.#verifyExpiry(event);
@@ -350,6 +405,10 @@ export class LabProtocolVerifier {
         this.#verifyGeneratedTask(event, state);
         break;
       case "resource.spent":
+        // An observation-phase spend is the price of a thought and is only
+        // ever verified through the queue above; reaching the switch means it
+        // had no `cognition.recorded` in front of it.
+        if (event.phase === "observation") this.#fail(event, "a thinking debit has no recorded thought before it");
         this.#verifyPayment(event, state);
         break;
       case "task.submitted":
@@ -399,6 +458,9 @@ export class LabProtocolVerifier {
       case "capability.published": this.#verifyPaidOutcome(event, "publishCapability", state); break;
       case "capability.used": this.#verifyPaidOutcome(event, "useCapability", state); break;
       case "violation.recorded": {
+        if (event.phase === "observation") {
+          this.#fail(event, "an overdraft violation has no thinking debit before it");
+        }
         const action = requiredAction(event.data.action, event);
         if (event.causationId !== undefined) {
           this.#verifyPaidOutcome(event, action, state);
@@ -443,6 +505,7 @@ export class LabProtocolVerifier {
     return {
       taskStream: this.#tasks.checkpoint(),
       policy: this.#policy.checkpoint?.() ?? null,
+      ...(this.#live ? { exhaustion: this.#exhaustion.checkpoint() } : {}),
     };
   }
 
@@ -528,7 +591,15 @@ export class LabProtocolVerifier {
     this.#policyDecisions = undefined;
     this.#policyViolations = undefined;
     this.#cognitionRecords = [];
-    const pressure = this.#pressure.forTick(tick, state, this.#pressureRng.fork(tick));
+    this.#thinkingExpected = [];
+    this.#exhaustionExpected = undefined;
+    this.#pendingVerdict = undefined;
+    this.#recordedTaskSeen = false;
+    // One fork per tick, shared by the configured schedule and the recorded
+    // physics inbox, exactly as the world shares it. A fork is
+    // consumption-independent, so the two cannot shift each other.
+    this.#tickPressureRng = this.#pressureRng.fork(tick);
+    const pressure = this.#pressure.forTick(tick, state, this.#tickPressureRng);
     this.#pressureExpected = [
       ...pressure.events.map((draft) => ({ type: "pressure.applied" as const, data: draft.data })),
       ...pressure.retiredAgentIds.map((agentId) => ({
@@ -559,12 +630,127 @@ export class LabProtocolVerifier {
       if (this.#submissions.length > 0) this.#fail(event, "submitted tasks are missing deterministic evaluations");
       if (this.#rewards.length > 0) this.#fail(event, "accepted evaluation rewards are incomplete");
     }
+    if (rank > PHASE_RANK.observation && this.#thinkingExpected.length > 0) {
+      this.#fail(event, "a recorded thought is missing the debit it owes");
+    }
+    if (rank > PHASE_RANK.evaluation && this.#pendingVerdict !== undefined) {
+      this.#fail(event, "a recorded verdict is missing its evaluation");
+    }
     if (rank >= PHASE_RANK.resolution) this.#ensurePolicySchedule(state);
     if (rank > PHASE_RANK.resolution) this.#finalizeResolution(event, state);
-    if (rank >= PHASE_RANK.upkeep) this.#ensureBoundaryExpiry(state);
+    if (rank >= PHASE_RANK.upkeep) {
+      this.#ensureExhaustion(state);
+      this.#ensureBoundaryExpiry(state);
+    }
   }
 
-  #verifyPressure(event: LabEvent): void {
+  /* ------------------------------------------------------------------ */
+  /* Live: the economy of thinking (phase L3b)                           */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * What the world owes for the thought just recorded, recomputed from the
+   * recorded usage, the tier price of the config and the current physics.
+   *
+   * Nothing in the event says what the debit should be — the verifier derives
+   * it — so a run cannot under-charge itself for thinking, and an overdrawn
+   * balance cannot be quietly forgiven.
+   */
+  #expectThinkingDebit(event: LabEvent, record: CognitionRecord, state: WorldState): void {
+    if (record.tier === undefined) {
+      this.#fail(event, "a live cognition record must state the tier it was consulted at");
+    }
+    if (record.usage.totalTokens <= 0) return;
+    const agent = state.agents[record.agentId];
+    if (agent === undefined || !agent.active) return;
+    let debit;
+    try {
+      debit = liveThinkingDebit(
+        this.config,
+        state.physics,
+        record.tier,
+        record.usage.totalTokens,
+        agent.resources,
+      );
+    } catch (error) {
+      this.#fail(event, `thinking price is undefined: ${errorMessage(error)}`);
+    }
+    this.#thinkingExpected = [{
+      type: "resource.spent",
+      actorId: record.agentId,
+      causationId: event.eventId,
+      data: { agentId: record.agentId, cost: debit.cost, action: "reason" } as unknown as JsonObject,
+      ...(debit.overdraft ? { overdraft: true } : {}),
+    }];
+  }
+
+  #verifyThinkingEvent(event: LabEvent): void {
+    const expected = this.#thinkingExpected.shift()!;
+    if (
+      event.type !== expected.type
+      || event.phase !== "observation"
+      || event.actorId !== expected.actorId
+      || event.targetId !== undefined
+      || event.causationId !== expected.causationId
+    ) {
+      this.#fail(event, `the thinking ${expected.type === "resource.spent" ? "debit" : "overdraft violation"} is missing, misplaced or misattributed`);
+    }
+    assertExact(event.data, expected.data, event, this.#fail.bind(this), "thinking debit data");
+    if (expected.overdraft !== true) return;
+    // An overdrawn debit says so, in the same phase, caused by the debit.
+    this.#thinkingExpected.push({
+      type: "violation.recorded",
+      actorId: expected.actorId,
+      causationId: event.eventId,
+      data: {
+        agentId: expected.actorId,
+        action: "reason",
+        reason: LIVE_COGNITION_OVERDRAFT_REASON,
+        count: 1,
+      } as unknown as JsonObject,
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Live: exhaustion (phase L3b)                                        */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * The upkeep's retirements, regenerated from the same rule the world
+   * applies over the same sequence of states. Called exactly once per tick.
+   */
+  #ensureExhaustion(state: WorldState): void {
+    if (!this.#live || this.#exhaustionExpected !== undefined) return;
+    this.#exhaustionExpected = this.#exhaustion.review(this.manifest, this.config, state);
+  }
+
+  #verifyExhaustionRetirement(event: LabEvent, state: WorldState): void {
+    if (!this.#live) this.#fail(event, "retirement by exhaustion is a live-only rule");
+    this.#ensureExhaustion(state);
+    const expected = this.#exhaustionExpected!.shift();
+    if (expected === undefined) this.#fail(event, "unexpected exhaustion retirement");
+    if (event.actorId !== expected || event.targetId !== undefined || event.causationId !== undefined) {
+      this.#fail(event, "exhaustion retirement provenance differs from the regenerated schedule");
+    }
+    assertExact(
+      event.data,
+      { agentId: expected, retiredTick: event.tick, reason: "exhausted" },
+      event,
+      this.#fail.bind(this),
+      "exhaustion retirement data",
+    );
+  }
+
+  #verifyPressure(event: LabEvent, state: WorldState): void {
+    // A live epoch's physics arrive as recorded operator input rather than
+    // from a configured schedule, so a `pressure.applied` with nothing pending
+    // is not an error — it is the input. What it DID is still regenerated
+    // here, from the same `pressureEffect` and the same forked RNG, so an
+    // operator cannot choose which agents a retirement takes.
+    if (this.#live && this.#pressureExpected.length === 0 && event.type === "pressure.applied") {
+      this.#verifyRecordedPressure(event, state);
+      return;
+    }
     const expected = this.#pressureExpected.shift();
     if (expected === undefined || event.type !== expected.type) this.#fail(event, "unexpected or out-of-order pressure event");
     if (event.type === "pressure.applied") {
@@ -585,9 +771,41 @@ export class LabProtocolVerifier {
     assertExact(event.data, expected.data, event, this.#fail.bind(this), "agent.retired data");
   }
 
+  /**
+   * One recorded pressure: accepted by form, applied by the one rule.
+   *
+   * The event carries the operator's spec; everything the spec produced —
+   * including which agents a `retire_agent_fraction` takes — is recomputed
+   * from `pressureEffect` against this tick's forked RNG and must match the
+   * payload byte for byte.
+   */
+  #verifyRecordedPressure(event: LabEvent, state: WorldState): void {
+    assertNoParticipants(event, this.#fail.bind(this));
+    let spec;
+    try {
+      spec = parsePressureSpec(event.data as Record<string, unknown>, {
+        tick: event.tick,
+        allowedExtra: ["retiredAgentIds"],
+      });
+    } catch (error) {
+      this.#fail(event, `recorded pressure is not admissible: ${errorMessage(error)}`);
+    }
+    const effect = pressureEffect(event.tick, spec, state, this.#tickPressureRng!);
+    assertExact(event.data, effect.event.data, event, this.#fail.bind(this), "recorded pressure data");
+    this.#pressureExpected = effect.retiredAgentIds.map((agentId) => ({
+      type: "agent.retired" as const,
+      actorId: agentId,
+      causationId: event.eventId,
+      data: { agentId, retiredTick: event.tick, reason: "pressure" } as unknown as JsonObject,
+    }));
+  }
+
   #verifyExpiry(event: LabEvent): void {
     assertNoParticipants(event, this.#fail.bind(this));
     if (event.phase === "upkeep") {
+      if (this.#exhaustionExpected !== undefined && this.#exhaustionExpected.length > 0) {
+        this.#fail(event, "the epoch-boundary sweep precedes the upkeep's exhaustion retirements");
+      }
       const expectedBoundaryId = this.#boundaryExpiryExpected?.shift();
       if (expectedBoundaryId === undefined) this.#fail(event, "unexpected epoch-boundary task.expired event");
       assertExact(
@@ -634,13 +852,140 @@ export class LabProtocolVerifier {
 
   #verifyGeneratedTask(event: LabEvent, state: WorldState): void {
     if (this.#expiryExpected.length > 0) this.#fail(event, "task.created precedes required expiry events");
+    if (event.data.source !== undefined) {
+      this.#verifyRecordedTask(event, state);
+      return;
+    }
     this.#ensureGenerated(state);
+    if (this.#recordedTaskSeen) this.#fail(event, "calibration work cannot follow recorded work in a tick");
     const expected = this.#generatedExpected![this.#generatedIndex];
     if (expected === undefined) this.#fail(event, "unexpected deterministic task");
     assertNoParticipants(event, this.#fail.bind(this));
     assertExact(event.data, { task: expected.task }, event, this.#fail.bind(this), "generated task");
     this.#oracles.set(expected.task.id, structuredClone(expected.expected));
     this.#generatedIndex += 1;
+  }
+
+  /**
+   * Recorded external work, accepted by form rather than regenerated.
+   *
+   * The verifier never reads `tasks/inbox.jsonl` — a replay must work from the
+   * chain alone. What it checks instead is that the payload is a well-formed
+   * external task whose id is the commitment to its own content, that it did
+   * not jump the tick's calibration work, and that the bounded world had room
+   * for it. An operator can put work into the world; it cannot put anything
+   * else in.
+   */
+  #verifyRecordedTask(event: LabEvent, state: WorldState): void {
+    if (!this.#live) this.#fail(event, "a recorded task source is a live-only rule");
+    this.#ensureGenerated(state);
+    if (this.#generatedIndex !== this.#generatedExpected!.length) {
+      this.#fail(event, "recorded work precedes the tick's calibration work");
+    }
+    assertNoParticipants(event, this.#fail.bind(this));
+    if (event.data.source !== "external") this.#fail(event, `unknown task.created source ${String(event.data.source)}`);
+    const payload = event.data.task;
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      this.#fail(event, "task.created must carry a task object");
+    }
+    const raw = payload as Record<string, unknown>;
+    const input = raw.input as Partial<LiveExternalTaskInput> | undefined;
+    if (input === null || typeof input !== "object" || Array.isArray(input)) {
+      this.#fail(event, "a recorded external task must carry an input object");
+    }
+    // Rebuilt field by field, so an extra field anywhere in the payload
+    // changes the hash and is refused.
+    const task = {
+      id: String(raw.id),
+      family: "external",
+      input: {
+        kind: input!.kind,
+        slug: input!.slug,
+        prompt: input!.prompt,
+        rubric: input!.rubric,
+      },
+      createdTick: raw.createdTick,
+      deadlineTick: raw.deadlineTick,
+      status: "available",
+    } as unknown as LabTaskState;
+    try {
+      assertExternalTask(task, event.tick);
+    } catch (error) {
+      this.#fail(event, `recorded external task is not admissible: ${errorMessage(error)}`);
+    }
+    if (task.id !== externalTaskId(
+      task.createdTick,
+      task.deadlineTick,
+      task.input as unknown as LiveExternalTaskInput,
+    )) {
+      this.#fail(event, "recorded external task id is not the commitment to its own content");
+    }
+    assertExact(event.data, { task, source: "external" }, event, this.#fail.bind(this), "recorded external task");
+    if (openTaskBacklog(state) >= this.config.taskStream.maxBacklog) {
+      this.#fail(event, "recorded work exceeds the bounded backlog");
+    }
+    this.#recordedTaskSeen = true;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Live: recorded verdicts (phase L3b)                                 */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * A recorded verdict is accepted by form, exactly as a recorded model answer
+   * is: what a grader said cannot be regenerated. What IS checked is that it
+   * came from the evaluator this epoch's manifest names, that it grades the
+   * submission whose evaluation comes next, and that it is on record BEFORE
+   * that evaluation — the order that makes the grade auditable rather than
+   * asserted.
+   */
+  #verifyVerdict(event: LabEvent, state: WorldState): void {
+    if (!this.#live) this.#fail(event, "recorded verdicts are a live-only rule");
+    assertNoParticipants(event, this.#fail.bind(this));
+    if (this.#pendingVerdict !== undefined) this.#fail(event, "a recorded verdict is already awaiting its evaluation");
+    const pending = this.#submissions[0];
+    if (pending === undefined) this.#fail(event, "a recorded verdict has no pending submission");
+    const data = event.data as Record<string, unknown>;
+    if (data.submissionId !== pending.id) this.#fail(event, "a recorded verdict must grade the next pending submission");
+    const submission = state.submissions[pending.id];
+    if (submission === undefined) this.#fail(event, `unknown pending submission ${pending.id}`);
+    const task = state.tasks[submission.taskId];
+    if (task === undefined || !isExternalTask(task)) {
+      this.#fail(event, "only recorded external work is graded by a recorded verdict");
+    }
+    if (data.taskId !== task.id) this.#fail(event, "a recorded verdict must name its submission's task");
+    if (data.evaluatorId !== this.manifest.evaluatorId) {
+      this.#fail(event, "a recorded verdict must come from the evaluator this manifest names");
+    }
+    if (typeof data.content !== "string") this.#fail(event, "a recorded verdict carries its answer verbatim");
+    const usage = data.usage as Record<string, unknown> | undefined;
+    if (usage === null || typeof usage !== "object" || Array.isArray(usage)) {
+      this.#fail(event, "a recorded verdict carries a usage record");
+    }
+    for (const field of ["inputTokens", "outputTokens", "totalTokens"]) {
+      const value = usage![field];
+      if (!Number.isSafeInteger(value) || (value as number) < 0) {
+        this.#fail(event, `a recorded verdict usage.${field} must be a non-negative safe integer`);
+      }
+    }
+    assertExact(
+      event.data,
+      {
+        taskId: task.id,
+        submissionId: pending.id,
+        evaluatorId: this.manifest.evaluatorId,
+        content: data.content,
+        usage: {
+          inputTokens: usage!.inputTokens,
+          outputTokens: usage!.outputTokens,
+          totalTokens: usage!.totalTokens,
+        },
+      },
+      event,
+      this.#fail.bind(this),
+      "recorded verdict data",
+    );
+    this.#pendingVerdict = pending.id;
   }
 
   #ensurePolicySchedule(state: WorldState): void {
@@ -1055,26 +1400,61 @@ export class LabProtocolVerifier {
     if (submission === undefined) this.#fail(event, `unknown pending submission ${pending.id}`);
     const task = state.tasks[submission.taskId];
     if (task === undefined) this.#fail(event, `unknown task ${submission.taskId}`);
-    const oracle = this.#oracles.get(task.id);
-    if (oracle === undefined) this.#fail(event, `missing deterministic oracle for ${task.id}`);
-    const accepted = equalJson(oracle, submission.result);
-    const expectedData = {
-      taskId: task.id,
-      submissionId: submission.id,
-      accepted,
-      qualityPpm: accepted ? PPM : 0,
-      latencyTicks: event.tick - task.createdTick,
-      violations: 0,
-      completedTick: event.tick,
-    };
+    // Calibration work is regenerated against its hidden oracle; recorded
+    // external work is graded by the verdict that must already be on record.
+    const external = isExternalTask(task);
+    let accepted: boolean;
+    let qualityPpm: number;
+    let expectedData: Record<string, unknown>;
+    if (external) {
+      if (this.#pendingVerdict !== submission.id) {
+        this.#fail(event, "recorded external work is evaluated only after its recorded verdict");
+      }
+      qualityPpm = event.data.qualityPpm as number;
+      if (!Number.isSafeInteger(qualityPpm) || qualityPpm < 0 || qualityPpm > PPM) {
+        this.#fail(event, "a recorded grade must be an integer in [0, 1000000] ppm");
+      }
+      accepted = qualityPpm > 0;
+      expectedData = {
+        taskId: task.id,
+        submissionId: submission.id,
+        accepted,
+        qualityPpm,
+        latencyTicks: event.tick - task.createdTick,
+        violations: 0,
+        evaluatorId: this.manifest.evaluatorId,
+        completedTick: event.tick,
+      };
+      this.#pendingVerdict = undefined;
+    } else {
+      if (this.#pendingVerdict !== undefined) {
+        this.#fail(event, "calibration work is graded by its oracle, never by a recorded verdict");
+      }
+      const oracle = this.#oracles.get(task.id);
+      if (oracle === undefined) this.#fail(event, `missing deterministic oracle for ${task.id}`);
+      accepted = equalJson(oracle, submission.result);
+      qualityPpm = accepted ? PPM : 0;
+      expectedData = {
+        taskId: task.id,
+        submissionId: submission.id,
+        accepted,
+        qualityPpm,
+        latencyTicks: event.tick - task.createdTick,
+        violations: 0,
+        completedTick: event.tick,
+      };
+    }
     if (event.actorId !== submission.agentId || event.targetId !== undefined || event.causationId !== pending.eventId) {
       this.#fail(event, "task.evaluated provenance differs from its submission");
     }
     assertExact(event.data, expectedData, event, this.#fail.bind(this), "task evaluation");
     this.#oracles.delete(task.id);
-    if (accepted && this.#physics.canAfford(state.treasury, this.config.acceptedTaskReward)) {
+    const reward = qualityPpm === PPM
+      ? this.config.acceptedTaskReward
+      : proportionalReward(this.config.acceptedTaskReward, qualityPpm);
+    if (accepted && this.#physics.canAfford(state.treasury, reward)) {
       this.#rewards = RESOURCE_KINDS.flatMap((resource) => {
-        const amount = this.config.acceptedTaskReward[resource];
+        const amount = reward[resource];
         return amount === 0 ? [] : [{
           actorId: "@treasury" as const,
           targetId: submission.agentId,
@@ -1124,7 +1504,13 @@ export class LabProtocolVerifier {
     if (this.#tickCompleted) this.#fail(event, "duplicate tick.completed");
     const requiredMetrics = this.#currentTick % this.config.metricEvery === 0 || this.#currentTick === this.config.ticks;
     if (this.#metricsSeen !== requiredMetrics) this.#fail(event, "required metric schedule was not satisfied");
-    if (this.#messageChain !== undefined || this.#submissions.length > 0 || this.#rewards.length > 0) {
+    if (
+      this.#messageChain !== undefined
+      || this.#submissions.length > 0
+      || this.#rewards.length > 0
+      || this.#thinkingExpected.length > 0
+      || this.#pendingVerdict !== undefined
+    ) {
       this.#fail(event, "tick.completed has unresolved causal work");
     }
     assertNoParticipants(event, this.#fail.bind(this));
@@ -1133,6 +1519,9 @@ export class LabProtocolVerifier {
     this.#finalizeSkippedPhases(PHASE_RANK.upkeep, event, state);
     if (this.#boundaryExpiryExpected !== undefined && this.#boundaryExpiryExpected.length > 0) {
       this.#fail(event, "epoch-boundary task expiry events are missing");
+    }
+    if (this.#exhaustionExpected !== undefined && this.#exhaustionExpected.length > 0) {
+      this.#fail(event, "exhaustion retirement events are missing");
     }
     this.#tickCompleted = true;
   }
@@ -1173,6 +1562,7 @@ export function assertReplayConfiguration(manifest: RunManifest, config: Genesis
     policyId: manifest.policyId,
     mode: manifest.mode,
     ...(manifest.cognitionId === undefined ? {} : { cognitionId: manifest.cognitionId }),
+    ...(manifest.evaluatorId === undefined ? {} : { evaluatorId: manifest.evaluatorId }),
   });
   if (hashValue(manifest) !== hashValue(expected)) {
     throw new ProtocolVerificationError("Manifest identity or runId is not deterministic for this config");
@@ -1257,14 +1647,26 @@ function cohortOf(policyId: string): "A" | "B" | "C" {
   return letter.toUpperCase() as "A" | "B" | "C";
 }
 
-/** Rebuild a record from its event without trusting the payload's shape. */
-function decodeCognitionRecord(event: LabEvent, fail: (reason: string) => never): CognitionRecord {
+/**
+ * Rebuild a record from its event without trusting the payload's shape.
+ *
+ * A cognitive cohort's decisions depend only on the actions, so everything
+ * else is deliberately zeroed — the verifier must not be able to depend on a
+ * field it does not check. A live epoch is different: the world charges for
+ * the tokens the record reports, at the tier the record names, so both are
+ * kept and both become part of what the debit is checked against.
+ */
+function decodeCognitionRecord(
+  event: LabEvent,
+  live: boolean,
+  fail: (reason: string) => never,
+): CognitionRecord {
   const data = event.data as Record<string, unknown>;
   const actions = data.actions;
   if (!Array.isArray(actions)) fail("cognition.recorded requires an actions array");
   if (typeof data.cohort !== "string") fail("cognition.recorded requires a cohort");
   if (typeof event.actorId !== "string") fail("cognition.recorded requires an actorId");
-  return {
+  const record: CognitionRecord = {
     tick: event.tick,
     agentId: event.actorId,
     cohort: data.cohort as "A" | "B" | "C",
@@ -1275,6 +1677,35 @@ function decodeCognitionRecord(event: LabEvent, fail: (reason: string) => never)
     latencyMs: 0,
     actions: structuredClone(actions) as CognitionRecord["actions"],
   };
+  if (!live) return record;
+  const usage = data.usage as Record<string, unknown> | undefined;
+  if (usage === null || typeof usage !== "object" || Array.isArray(usage)) {
+    fail("a live cognition.recorded requires a usage record");
+  }
+  for (const field of ["inputTokens", "outputTokens", "totalTokens"] as const) {
+    const value = usage![field];
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+      fail(`a live cognition.recorded usage.${field} must be a non-negative safe integer`);
+    }
+    record.usage[field] = value as number;
+  }
+  const tier = data.tier;
+  if (tier !== undefined && !LIVE_TIERS.includes(tier as LiveThinkTier)) {
+    fail(`a live cognition.recorded names an unknown tier ${String(tier)}`);
+  }
+  if (tier !== undefined) record.tier = tier as LiveThinkTier;
+  return record;
+}
+
+const LIVE_TIERS: readonly LiveThinkTier[] = Object.freeze(["fast", "standard", "deliberate"]);
+
+/** One event the world owes immediately after a recorded thought. */
+interface ExpectedThinkingEvent {
+  type: "resource.spent" | "violation.recorded";
+  actorId: string;
+  causationId: string;
+  data: JsonObject;
+  overdraft?: boolean;
 }
 
 function multiplyResources(resources: ResourceVector, count: number): ResourceVector {

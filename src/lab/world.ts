@@ -5,10 +5,17 @@ import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import { createObservationFrame, observeWorldFromFrame } from "./environment.js";
 import {
+  LIVE_COGNITION_OVERDRAFT_REASON,
+  LiveExhaustionTracker,
   calibrationTaskCount,
   epochBoundaryExpiries,
   inheritedGenesisOf,
+  isExternalTask,
+  liveThinkingDebit,
+  openTaskBacklog,
+  proportionalReward,
 } from "./epoch-rules.js";
+import type { LiveRecordedInputs } from "./live-ports.js";
 import { IndependentEvaluator, type PendingOracle } from "./evaluator.js";
 import type { LabEventRecorder } from "./event-recorder.js";
 import { createLabEvent } from "./events.js";
@@ -30,7 +37,7 @@ import {
   type LogicalPolicy,
   type PolicyDecision,
 } from "./policy-schedule.js";
-import { PressureEngine } from "./pressure-engine.js";
+import { PressureEngine, pressureEffect } from "./pressure-engine.js";
 import { initialWorldState, prepareWorldEventTransition } from "./reducer.js";
 import { RESOURCE_KINDS, ResourcePhysics } from "./resource-physics.js";
 import { DeterministicRng } from "./rng.js";
@@ -40,6 +47,7 @@ import {
   PPM,
   ZERO_RESOURCES,
   type Checkpoint,
+  type Evaluation,
   type GenesisConfig,
   type LabEvent,
   type LabEventDraft,
@@ -89,6 +97,12 @@ export interface LogicalUniverseOptions {
    * population. Live-only: a logical or cognitive manifest refuses it.
    */
   genesisState?: WorldState;
+  /**
+   * The recorded-input ports of a live epoch (phase L3b): external work,
+   * verdicts and operator physics. Live-only, and each is optional: a live
+   * universe with no inbox simply runs on calibration work alone.
+   */
+  recordedInputs?: LiveRecordedInputs;
 }
 
 const UNSUPPORTED_ACTIONS = new Set<PrimitiveActionType>([
@@ -114,6 +128,9 @@ export class LogicalUniverse {
   readonly #pressureRng: DeterministicRng;
   readonly #resolutionRng: DeterministicRng;
   readonly #initialAgentTotals: ResourceVector;
+  readonly #live: boolean;
+  readonly #recordedInputs: LiveRecordedInputs;
+  readonly #exhaustion = new LiveExhaustionTracker();
 
   #world: WorldState;
   #initialTotal: ResourceVector | undefined;
@@ -165,6 +182,7 @@ export class LogicalUniverse {
       policyId: manifest.policyId,
       mode: manifest.mode,
       ...(manifest.cognitionId === undefined ? {} : { cognitionId: manifest.cognitionId }),
+      ...(manifest.evaluatorId === undefined ? {} : { evaluatorId: manifest.evaluatorId }),
     });
     if (hashValue(manifest) !== hashValue(expectedManifest)) {
       throw new Error("Manifest identity or runId is not deterministic for this config and policy");
@@ -186,6 +204,11 @@ export class LogicalUniverse {
     this.#onMetrics = options.onMetrics;
     this.#onCheckpoint = options.onCheckpoint;
     this.#fsyncEveryTick = options.fsyncEveryTick === true;
+    this.#live = liveMode;
+    if (!liveMode && options.recordedInputs !== undefined) {
+      throw new Error("Recorded inputs belong to a live epoch only");
+    }
+    this.#recordedInputs = options.recordedInputs ?? {};
     const rootRng = new DeterministicRng(hashValue({
       domain: "agent-native-universe/lab/logical-universe/v1",
       runId: manifest.runId,
@@ -222,6 +245,9 @@ export class LogicalUniverse {
         }
         this.#policy.restore(genesisFrom.runtime.policy, this.#policyRng);
       }
+      // The grace period of exhaustion is continuous over the life of the
+      // universe, not restarted every epoch.
+      this.#exhaustion.restore(genesisFrom.runtime.exhaustion);
       this.#nextTick = genesisFrom.tick + 1;
     }
     if (options.resumeFrom !== undefined) this.#restore(options.resumeFrom);
@@ -380,6 +406,7 @@ export class LogicalUniverse {
     }
     this.#taskStream.restore(checkpoint.runtime.taskStream);
     this.#policy.restore(checkpoint.runtime.policy, this.#policyRng);
+    this.#exhaustion.restore(checkpoint.runtime.exhaustion);
     this.#world = structuredClone(checkpoint.state);
     this.#nextTick = checkpoint.tick + 1;
     this.#initialTotal = totalResources(this.#world);
@@ -394,15 +421,15 @@ export class LogicalUniverse {
     this.#tickRunning = true;
     const tick = this.#nextTick;
     try {
-      await this.#applyPressures(tick);
+      await this.#applyPressures(tick, signal);
       await this.#expireTasks(tick);
-      await this.#generateTasks(tick);
+      await this.#generateTasks(tick, signal);
       await this.#consultCognition(tick, signal);
       const decisions = await this.#decide(tick);
       const pendingEvaluation: string[] = [];
       const ordered = this.#resolutionRng.fork(tick).shuffle(decisions);
       for (const decision of ordered) await this.#resolve(decision, tick, pendingEvaluation);
-      await this.#evaluate(pendingEvaluation, tick);
+      await this.#evaluate(pendingEvaluation, tick, signal);
 
       const recordMetrics = tick % this.config.metricEvery === 0 || tick === this.config.ticks;
       if (recordMetrics) {
@@ -416,6 +443,9 @@ export class LogicalUniverse {
         await this.#onMetrics?.(structuredClone(metrics));
       }
 
+      // Upkeep. An agent that can no longer think and holds no work leaves the
+      // world first, so the boundary sweep below sees the settled population.
+      await this.#reviewExhaustion(tick);
       // Upkeep of the final tick: nothing with a hidden oracle may cross into
       // the next epoch, because oracles live only in memory.
       await this.#expireAtEpochBoundary(tick);
@@ -440,8 +470,16 @@ export class LogicalUniverse {
     }
   }
 
-  async #applyPressures(tick: number): Promise<void> {
-    const result = this.#pressure.forTick(tick, this.#world, this.#pressureRng.fork(tick));
+  async #applyPressures(tick: number, signal?: AbortSignal): Promise<void> {
+    // One random source for the whole tick's physics, forked from the run's
+    // root: the configured schedule (a bounded run) and the recorded operator
+    // physics (a live epoch) draw from the same stream in event order, and a
+    // fork is consumption-independent, so neither can shift the other.
+    const rng = this.#pressureRng.fork(tick);
+    // The configured schedule, in exactly the shape it has always had: every
+    // scheduled pressure of the tick, then the retirements the tick's
+    // `retire_agent_fraction` caused. Nothing about a bounded run changes.
+    const result = this.#pressure.forTick(tick, this.#world, rng);
     let retirementPressure: LabEvent | undefined;
     for (const event of result.events) {
       const committed = await this.#commit(event);
@@ -449,13 +487,48 @@ export class LogicalUniverse {
     }
     for (const agentId of result.retiredAgentIds) {
       if (!retirementPressure) throw new Error("Retirement pressure has no committed causal event");
+      await this.#retireByPressure(agentId, tick, retirementPressure.eventId);
+    }
+    // Recorded operator physics. The control plane sets physics and only
+    // physics: the parser refuses a record addressed to an agent, and a
+    // `retire_agent_fraction` still draws its victims from `pressureRng`.
+    const recorded = await this.#recordedInputs.pressureSource?.next(tick, signal) ?? [];
+    for (const spec of recorded) {
+      if (spec.tick !== tick) throw new Error("A recorded pressure must apply on its own tick");
+      const effect = pressureEffect(tick, spec, this.#world, rng);
+      const committed = await this.#commit(effect.event);
+      for (const agentId of effect.retiredAgentIds) {
+        await this.#retireByPressure(agentId, tick, committed.eventId);
+      }
+    }
+  }
+
+  async #retireByPressure(agentId: string, tick: number, causationId: string): Promise<void> {
+    await this.#commit({
+      tick,
+      phase: "pressure",
+      type: "agent.retired",
+      actorId: agentId,
+      causationId,
+      data: { agentId, retiredTick: tick, reason: "pressure" },
+    });
+  }
+
+  /**
+   * Retirement by exhaustion: an agent that has held too few `llmTokens` to be
+   * consulted for `live.exhaustion.graceTicks` consecutive ticks, and holds no
+   * claimed work, leaves the world. The rule is a pure function of the states
+   * it has seen (`LiveExhaustionTracker`), so the protocol verifier regenerates
+   * it rather than trusting the event.
+   */
+  async #reviewExhaustion(tick: number): Promise<void> {
+    for (const agentId of this.#exhaustion.review(this.manifest, this.config, this.#world)) {
       await this.#commit({
         tick,
-        phase: "pressure",
+        phase: "upkeep",
         type: "agent.retired",
         actorId: agentId,
-        causationId: retirementPressure.eventId,
-        data: { agentId, retiredTick: tick, reason: "pressure" },
+        data: { agentId, retiredTick: tick, reason: "exhausted" },
       });
     }
   }
@@ -493,10 +566,8 @@ export class LogicalUniverse {
     }
   }
 
-  async #generateTasks(tick: number): Promise<void> {
-    const backlog = Object.values(this.#world.tasks)
-      .filter((task) => task.status !== "completed" && task.status !== "expired").length;
-    const capacity = Math.max(0, this.config.taskStream.maxBacklog - backlog);
+  async #generateTasks(tick: number, signal?: AbortSignal): Promise<void> {
+    const capacity = Math.max(0, this.config.taskStream.maxBacklog - openTaskBacklog(this.#world));
     const scaled = safePpmMultiply(this.config.taskStream.tasksPerTick, this.#world.physics.taskLoadPpm);
     const count = calibrationTaskCount(this.manifest, this.config, tick, Math.min(capacity, scaled));
     for (const generated of this.#taskStream.generate(tick, count)) {
@@ -506,6 +577,33 @@ export class LogicalUniverse {
         phase: "task_generation",
         type: "task.created",
         data: toJsonObject({ task: generated.task }),
+      });
+    }
+    await this.#admitRecordedTasks(tick, signal);
+  }
+
+  /**
+   * Recorded external work, admitted after the tick's calibration work so the
+   * verifier can regenerate the calibration prefix and then accept the
+   * recorded remainder by form. An external task carries no hidden oracle, so
+   * it is the one kind of work allowed to outlive its epoch.
+   */
+  async #admitRecordedTasks(tick: number, signal?: AbortSignal): Promise<void> {
+    const source = this.#recordedInputs.taskSource;
+    if (source === undefined) return;
+    const capacity = Math.max(0, this.config.taskStream.maxBacklog - openTaskBacklog(this.#world));
+    if (capacity === 0) return;
+    for (const task of await source.next(tick, capacity, signal)) {
+      if (!isExternalTask(task)) throw new Error("A recorded task source may only produce external tasks");
+      if (this.#world.tasks[task.id] !== undefined) {
+        throw new Error(`Recorded external task ${task.id} is already in the world`);
+      }
+      if (openTaskBacklog(this.#world) >= this.config.taskStream.maxBacklog) return;
+      await this.#commit({
+        tick,
+        phase: "task_generation",
+        type: "task.created",
+        data: toJsonObject({ task, source: "external" }),
       });
     }
   }
@@ -565,7 +663,13 @@ export class LogicalUniverse {
     }
 
     for (const record of records) {
-      await this.#commit({
+      // The tier is what the world charges for, so in live mode it is part of
+      // the evidence rather than an implementation detail of the port. It is
+      // schema-additive: no cognitive-cohort record carries it.
+      if (this.#live && record.tier === undefined) {
+        throw new Error("A live cognition record must state the tier it was consulted at");
+      }
+      const committed = await this.#commit({
         tick,
         phase: "observation",
         type: "cognition.recorded",
@@ -583,10 +687,61 @@ export class LogicalUniverse {
           ...(record.reasoningTokens === undefined ? {} : { reasoningTokens: record.reasoningTokens }),
           ...(record.finishReason === undefined ? {} : { finishReason: record.finishReason }),
           ...(record.truncated === true ? { truncated: true } : {}),
+          ...(record.tier === undefined ? {} : { tier: record.tier }),
         }),
       });
+      await this.#chargeThinking(committed, record, tick);
     }
     policy.load(records);
+  }
+
+  /**
+   * The price of one recorded thought, charged immediately after the thought
+   * is on record and caused by it.
+   *
+   * Thinking is the one thing a live agent does that the world cannot observe
+   * happening: the tokens were already burned outside the chain. Charging for
+   * them right here is what makes the economy of thinking real — an agent that
+   * only thinks spends itself down to nothing and is eventually retired — and
+   * charging them with `causationId` pointing at the record is what makes
+   * "the debit always immediately follows the record" a checkable claim.
+   */
+  async #chargeThinking(record: LabEvent, answer: CognitionRecord, tick: number): Promise<void> {
+    if (!this.#live || answer.tier === undefined) return;
+    if (answer.usage.totalTokens <= 0) return;
+    const agent = this.#world.agents[answer.agentId];
+    if (agent === undefined || !agent.active) return;
+    const debit = liveThinkingDebit(
+      this.config,
+      this.#world.physics,
+      answer.tier,
+      answer.usage.totalTokens,
+      agent.resources,
+    );
+    const spent = await this.#commit({
+      tick,
+      phase: "observation",
+      type: "resource.spent",
+      actorId: answer.agentId,
+      causationId: record.eventId,
+      data: toJsonObject({ agentId: answer.agentId, cost: debit.cost, action: "reason" }),
+    });
+    // An overdrawn consultation is charged down to zero and said so. Silently
+    // forgiving the shortfall would make the balance a fiction.
+    if (!debit.overdraft) return;
+    await this.#commit({
+      tick,
+      phase: "observation",
+      type: "violation.recorded",
+      actorId: answer.agentId,
+      causationId: spent.eventId,
+      data: {
+        agentId: answer.agentId,
+        action: "reason",
+        reason: LIVE_COGNITION_OVERDRAFT_REASON,
+        count: 1,
+      },
+    });
   }
 
   async #decide(tick: number): Promise<PolicyDecision[]> {
@@ -957,14 +1112,28 @@ export class LogicalUniverse {
     });
   }
 
-  async #evaluate(submissionIds: readonly string[], tick: number): Promise<void> {
+  async #evaluate(
+    submissionIds: readonly string[],
+    tick: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     for (const submissionId of submissionIds) {
       const submission = this.#world.submissions[submissionId];
       if (!submission) continue;
       const task = this.#world.tasks[submission.taskId];
       if (!task) continue;
       try {
-        const evaluation = this.#evaluator.evaluate(task, submission.id, submission.agentId, submission.result, tick);
+        // Two evaluators, one place. Calibration work has a hidden oracle and
+        // is graded exactly; recorded external work has none and is graded by
+        // a recorded verdict committed verbatim before the evaluation it
+        // justifies, exactly as a model's answer precedes the actions it
+        // steered.
+        const evaluation = isExternalTask(task)
+          ? await this.#recordVerdict(task.id, submission, tick, signal)
+          : this.#evaluator.evaluate(task, submission.id, submission.agentId, submission.result, tick);
+        const reward = evaluation.qualityPpm === PPM
+          ? this.config.acceptedTaskReward
+          : proportionalReward(this.config.acceptedTaskReward, evaluation.qualityPpm);
         const evaluated = await this.#commit({
           tick, phase: "evaluation", type: "task.evaluated", actorId: submission.agentId,
           causationId: submission.submittedEventId,
@@ -972,10 +1141,10 @@ export class LogicalUniverse {
         });
         if (
           evaluation.accepted
-          && this.#physics.canAfford(this.#world.treasury, this.config.acceptedTaskReward)
+          && this.#physics.canAfford(this.#world.treasury, reward)
         ) {
           for (const resource of RESOURCE_KINDS) {
-            const amount = this.config.acceptedTaskReward[resource];
+            const amount = reward[resource];
             if (amount === 0) continue;
             await this.#commit({
               tick,
@@ -999,6 +1168,55 @@ export class LogicalUniverse {
         await this.#violation(submission.agentId, "verify", `evaluation error: ${errorMessage(error)}`, tick);
       }
     }
+  }
+
+  /**
+   * Ask the evaluator port, commit its answer verbatim, and return the
+   * evaluation the verdict implies. The verdict event is state-neutral: it is
+   * what was said, not what the world did with it.
+   */
+  async #recordVerdict(
+    taskId: string,
+    submission: SubmissionState,
+    tick: number,
+    signal?: AbortSignal,
+  ): Promise<Evaluation & { evaluatorId: string }> {
+    const evaluator = this.#recordedInputs.evaluator;
+    if (evaluator === undefined) {
+      throw new Error("Recorded external work requires an evaluator port");
+    }
+    const task = this.#world.tasks[taskId]!;
+    const verdict = await evaluator.evaluate(
+      { task: structuredClone(task), submission: structuredClone(submission), tick },
+      signal,
+    );
+    if (verdict.evaluatorId !== this.manifest.evaluatorId) {
+      throw new Error("The verdict's evaluator is not the one this epoch's manifest names");
+    }
+    if (!Number.isSafeInteger(verdict.qualityPpm) || verdict.qualityPpm < 0 || verdict.qualityPpm > PPM) {
+      throw new Error("A recorded verdict must grade in [0, 1000000] ppm");
+    }
+    await this.#commit({
+      tick,
+      phase: "evaluation",
+      type: "verdict.recorded",
+      data: toJsonObject({
+        taskId: task.id,
+        submissionId: submission.id,
+        evaluatorId: verdict.evaluatorId,
+        content: verdict.content,
+        usage: verdict.usage,
+      }),
+    });
+    return {
+      taskId: task.id,
+      submissionId: submission.id,
+      accepted: verdict.qualityPpm > 0,
+      qualityPpm: verdict.qualityPpm,
+      latencyTicks: tick - task.createdTick,
+      violations: 0,
+      evaluatorId: verdict.evaluatorId,
+    };
   }
 
   async #violation(
@@ -1047,6 +1265,9 @@ export class LogicalUniverse {
     const runtime = {
       taskStream: this.#taskStream.checkpoint(),
       policy: this.#policy.checkpoint?.() ?? null,
+      // stateHash discipline: absent outside live, so a logical or cognitive
+      // runtime — and therefore its `runtimeHash` — is byte-identical.
+      ...(this.#live ? { exhaustion: this.#exhaustion.checkpoint() } : {}),
     };
     return {
       schemaVersion: LAB_SCHEMA_VERSION,

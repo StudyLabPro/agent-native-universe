@@ -55,6 +55,14 @@ export const LAB_LIVE_POLICY_PATTERN = /^cohort-c-live-idle-v1$/;
 /** Recorded-input task source of live epochs (calibration stream + inboxes). */
 export const LAB_LIVE_TASK_SOURCE_ID = "live-task-source-v1";
 /**
+ * The evaluator identity of a live epoch that grades nothing but calibration
+ * work — the hidden oracle, named rather than left blank. It is the default of
+ * `RunManifestOptions.evaluatorId` in live mode, so the identity is always
+ * present in the manifest and always hashed into the runId; an epoch that
+ * grades recorded work names its grader instead (phase L3b).
+ */
+export const LAB_LIVE_ORACLE_EVALUATOR_ID = "oracle-evaluator-v1";
+/**
  * Control-arm policies (experiment plan §33). Registered here because the
  * manifest is the authority on which implementation identities evidence may
  * claim; the implementations live in baselines.ts.
@@ -81,6 +89,12 @@ export interface RunManifestOptions {
    * exists.
    */
   cognitionId?: string;
+  /**
+   * Identity of the evaluator that graded recorded work (grader model or
+   * verdict inbox). Required in live mode and hashed into the runId; forbidden
+   * everywhere else, where every evaluation is the hidden-oracle one.
+   */
+  evaluatorId?: string;
 }
 
 /**
@@ -112,6 +126,17 @@ function assertValidCognitionId(cognitionId: string): void {
     || /[\u0000-\u001F\u007F]/.test(cognitionId)
   ) {
     throw new Error("Cognition id must be a non-empty control-character-free string of at most 128 characters");
+  }
+}
+
+function assertValidEvaluatorId(evaluatorId: string): void {
+  if (
+    typeof evaluatorId !== "string"
+    || evaluatorId.length === 0
+    || evaluatorId.length > 128
+    || /[\u0000-\u001F\u007F]/.test(evaluatorId)
+  ) {
+    throw new Error("Evaluator id must be a non-empty control-character-free string of at most 128 characters");
   }
 }
 
@@ -177,6 +202,9 @@ export function assertLabManifestImplementation(
       );
     }
     assertValidCognitionId(manifest.cognitionId as string);
+    // A verdict is a recorded input exactly like a model answer, so the port
+    // that produced it is part of what the evidence claims.
+    assertValidEvaluatorId(manifest.evaluatorId as string);
     return;
   }
   const cognitive = manifest.mode === "cognitive";
@@ -210,6 +238,9 @@ export function assertLabManifestImplementation(
   } else if (manifest.cognitionId !== undefined) {
     throw new Error("A logical manifest must not carry a cognitionId");
   }
+  if (manifest.evaluatorId !== undefined) {
+    throw new Error("Only a live manifest carries an evaluatorId; every other run uses the hidden oracle");
+  }
 }
 
 export function createRunManifest(
@@ -231,6 +262,12 @@ export function createRunManifest(
     assertValidCognitionId(options.cognitionId as string);
   } else if (options.cognitionId !== undefined) {
     throw new Error("A logical run manifest must not carry a cognitionId");
+  }
+  const evaluatorId = live ? options.evaluatorId ?? LAB_LIVE_ORACLE_EVALUATOR_ID : undefined;
+  if (live) {
+    assertValidEvaluatorId(evaluatorId as string);
+  } else if (options.evaluatorId !== undefined) {
+    throw new Error("Only a live run manifest carries an evaluatorId");
   }
   // The live policy literal is accepted only in live mode, and a live epoch
   // accepts only it: neither a neutral solver nor a baseline may steer Live.
@@ -254,6 +291,7 @@ export function createRunManifest(
     policyId,
     taskGeneratorId: live ? LAB_LIVE_TASK_SOURCE_ID : LAB_TASK_GENERATOR_ID,
     ...(options.cognitionId === undefined ? {} : { cognitionId: options.cognitionId }),
+    ...(evaluatorId === undefined ? {} : { evaluatorId }),
   };
   return {
     schemaVersion: config.schemaVersion,

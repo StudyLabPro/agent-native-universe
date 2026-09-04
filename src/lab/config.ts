@@ -218,9 +218,34 @@ function validateInheritedRuntime(runtime: CheckpointRuntimeState): void {
   if (runtime.policy !== null && (typeof runtime.policy !== "object" || Array.isArray(runtime.policy))) {
     throw new Error("live.genesisFrom.runtime.policy must be a policy checkpoint or null");
   }
+  // Phase L3b adds the exhaustion clock, so the grace period is continuous
+  // over the life of the universe instead of restarting every epoch. The
+  // recorded-input sources need no cursor: every record names the absolute
+  // tick it applies on, so the file and the tick decide together.
+  if (runtime.exhaustion !== undefined) {
+    const exhaustion = runtime.exhaustion;
+    if (typeof exhaustion !== "object" || exhaustion === null || !Array.isArray(exhaustion.starving)) {
+      throw new Error("live.genesisFrom.runtime.exhaustion must carry a starving array");
+    }
+    for (const entry of exhaustion.starving) {
+      if (typeof entry !== "object" || entry === null || typeof entry.agentId !== "string") {
+        throw new Error("live.genesisFrom.runtime.exhaustion entries must be {agentId, ticks}");
+      }
+      nonNegativeInteger(entry.ticks, "live.genesisFrom.runtime.exhaustion.ticks");
+    }
+    for (const entry of exhaustion.starving) {
+      for (const key of Object.keys(entry)) {
+        if (!["agentId", "ticks"].includes(key)) {
+          throw new Error(`live.genesisFrom.runtime.exhaustion entry contains unknown field ${key}`);
+        }
+      }
+    }
+    for (const key of Object.keys(exhaustion)) {
+      if (key !== "starving") throw new Error(`live.genesisFrom.runtime.exhaustion contains unknown field ${key}`);
+    }
+  }
   for (const key of Object.keys(runtime)) {
-    // `taskSource`/`pressureSource` cursors join this list in phase L3b.
-    if (!["taskStream", "policy"].includes(key)) {
+    if (!["taskStream", "policy", "exhaustion"].includes(key)) {
       throw new Error(`live.genesisFrom.runtime contains unknown field ${key}`);
     }
   }
