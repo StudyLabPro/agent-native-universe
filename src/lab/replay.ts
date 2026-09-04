@@ -8,7 +8,7 @@ import {
 } from "./events.js";
 import type { PendingOracle } from "./evaluator.js";
 import { assertLabManifestImplementation } from "./manifest.js";
-import { LabProtocolVerifier } from "./protocol-verifier.js";
+import { LabProtocolVerifier, type LiveProjectionOptions } from "./protocol-verifier.js";
 import { applyWorldEventMutable, initialWorldState } from "./reducer.js";
 import type {
   CheckpointRuntimeState,
@@ -17,6 +17,16 @@ import type {
   RunManifest,
   WorldState,
 } from "./types.js";
+
+/**
+ * Projection options. `live` is supplied only by the Genesis-Live engine and
+ * is what makes a `mode: "live"` manifest projectable at all: without it the
+ * manifest gate refuses live evidence exactly as it always has, so no
+ * scientific reader can project a live epoch by accident.
+ */
+export interface ReplayProjectionOptions {
+  live?: LiveProjectionOptions;
+}
 
 export interface ReplayResult {
   state: WorldState;
@@ -43,12 +53,13 @@ export class ReplayEngine {
     manifest: RunManifest,
     config: GenesisConfig,
     untilTick?: number,
+    options: ReplayProjectionOptions = {},
   ): ReplayResult {
-    assertLabManifestImplementation(manifest);
+    assertLabManifestImplementation(manifest, { live: options.live !== undefined });
     validateUntilTick(untilTick);
-    const protocol = new LabProtocolVerifier(manifest, config);
+    const protocol = new LabProtocolVerifier(manifest, config, options);
     let verification = initialEventChainVerification(manifest);
-    const state = initialWorldState(manifest);
+    const state = initialWorldState(manifest, options.live?.genesisState);
     let outputState: WorldState | undefined;
     let eventsApplied = 0;
     let finalEventHash = initialEventHash(manifest);
@@ -88,8 +99,9 @@ export class ReplayEngine {
     manifest: RunManifest,
     config: GenesisConfig,
     untilTick?: number,
+    options: ReplayProjectionOptions = {},
   ): Promise<ReplayResult> {
-    return replayEventStream(iterateEventFile(path), manifest, config, untilTick);
+    return replayEventStream(iterateEventFile(path), manifest, config, untilTick, false, options);
   }
 
   /** Verify a complete run or an incomplete stream ending exactly at a durable tick boundary. */
@@ -97,8 +109,9 @@ export class ReplayEngine {
     path: string,
     manifest: RunManifest,
     config: GenesisConfig,
+    options: ReplayProjectionOptions = {},
   ): Promise<ReplayResult> {
-    return replayEventStream(iterateEventFile(path), manifest, config, undefined, true);
+    return replayEventStream(iterateEventFile(path), manifest, config, undefined, true, options);
   }
 
   /** Replay from an fd-held evidence snapshot without resolving the pathname again. */
@@ -107,8 +120,9 @@ export class ReplayEngine {
     manifest: RunManifest,
     config: GenesisConfig,
     untilTick?: number,
+    options: ReplayProjectionOptions = {},
   ): Promise<ReplayResult> {
-    return replayEventStream(iterateEventHandle(handle), manifest, config, untilTick);
+    return replayEventStream(iterateEventHandle(handle), manifest, config, untilTick, false, options);
   }
 }
 
@@ -118,12 +132,13 @@ async function replayEventStream(
   config: GenesisConfig,
   untilTick?: number,
   allowIncompleteBoundary = false,
+  options: ReplayProjectionOptions = {},
 ): Promise<ReplayResult> {
-  assertLabManifestImplementation(manifest);
+  assertLabManifestImplementation(manifest, { live: options.live !== undefined });
   validateUntilTick(untilTick);
-  const protocol = new LabProtocolVerifier(manifest, config);
+  const protocol = new LabProtocolVerifier(manifest, config, options);
   let verification = initialEventChainVerification(manifest);
-  const state = initialWorldState(manifest);
+  const state = initialWorldState(manifest, options.live?.genesisState);
   let outputState: WorldState | undefined;
   let eventsApplied = 0;
   let finalEventHash = initialEventHash(manifest);
@@ -164,8 +179,9 @@ export function replayEvents(
   manifest: RunManifest,
   config: GenesisConfig,
   untilTick?: number,
+  options: ReplayProjectionOptions = {},
 ): ReplayResult {
-  return ReplayEngine.replay(events, manifest, config, untilTick);
+  return ReplayEngine.replay(events, manifest, config, untilTick, options);
 }
 
 function validateUntilTick(untilTick: number | undefined): void {

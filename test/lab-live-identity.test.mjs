@@ -140,17 +140,35 @@ test("live physics are validated only for genesis-live and refused elsewhere", (
   const unknownField = liveConfig();
   unknownField.live.models = ["kimi"];
   assert.throws(() => validateGenesisConfig(unknownField), /unknown field models/);
+  // Phase L3a completed the inherited-genesis record the design specifies:
+  // besides the five hashes it pins the parent's engine, the runtime the child
+  // continues and the compaction rule its genesis was derived with.
   const inherited = liveConfig();
   inherited.live.genesisFrom = {
     runId: "run-3ed209cf5feb4b39178c834e8a716312",
+    engineVersion: LAB_LIVE_ENGINE_VERSION,
     tick: 500,
     seq: 12_000,
     eventHash: "a".repeat(64),
     stateHash: "b".repeat(64),
     runtimeHash: "c".repeat(64),
     genesisStateHash: "d".repeat(64),
+    runtime: {
+      taskStream: {
+        sequence: 4,
+        rng: { algorithm: "xoshiro256**", streamSeed: "e".repeat(64), state: ["1", "2", "3", "4"] },
+      },
+      policy: { policyId: LAB_LIVE_POLICY_ID, explorationPpm: 0, streams: [] },
+    },
+    compaction: { kind: "none" },
   };
   assert.doesNotThrow(() => validateGenesisConfig(inherited));
+  const unknownCompaction = structuredClone(inherited);
+  unknownCompaction.live.genesisFrom.compaction = { kind: "windows" };
+  assert.throws(() => validateGenesisConfig(unknownCompaction), /Unsupported live.genesisFrom.compaction.kind/);
+  const noRuntime = structuredClone(inherited);
+  delete noRuntime.live.genesisFrom.runtime;
+  assert.throws(() => validateGenesisConfig(noRuntime), /genesisFrom.runtime must be an object/);
   inherited.live.genesisFrom.eventHash = "not-a-digest";
   assert.throws(() => validateGenesisConfig(inherited), /genesisFrom.eventHash/);
 });
@@ -179,12 +197,14 @@ test("a live epoch manifest comes from the shared builder and is refused by this
     manifest.runId,
   );
 
-  // Every projector of this build refuses live evidence fail-closed.
+  // Every projector refuses live evidence fail-closed unless the caller is the
+  // live engine itself, which is the only code that passes a live projection
+  // (phase L3a); the scientific readers never do.
   assert.throws(() => assertLabManifestImplementation(manifest), /Unsupported lab execution mode live/);
   assert.throws(() => ReplayEngine.replay([], manifest, config), /Unsupported lab execution mode live/);
   assert.throws(() => new LabProtocolVerifier(manifest, config), /not verifiable by this engine build/);
   const recorder = { manifest, append() { throw new Error("unreachable"); } };
-  assert.throws(() => new LogicalUniverse(manifest, config, recorder), /does not match this logical engine/);
+  assert.throws(() => new LogicalUniverse(manifest, config, recorder), /requires a cognition port/);
 
   // Logical and cognitive identities still pass the same gate.
   assert.doesNotThrow(() => assertLabManifestImplementation(createRunManifest(DEFAULT_GENESIS_CONFIG, "U0001")));

@@ -115,8 +115,23 @@ function assertValidCognitionId(cognitionId: string): void {
   }
 }
 
+export interface LabManifestProjectionOptions {
+  /**
+   * Accept `mode: "live"` evidence. Only the Genesis-Live engine passes this
+   * (`src/lab/live/epoch.ts` through `replay.ts`, `protocol-verifier.ts`,
+   * `world.ts` and `artifacts.ts`); every scientific reader — the CLI
+   * `replay`/`attest`/`verify-attestation` commands, evidence discovery,
+   * populations, baselines and the Pareto readout — calls this function
+   * without it and therefore keeps refusing a live manifest fail-closed.
+   */
+  live?: boolean;
+}
+
 /** Fail closed when evidence targets semantics other than this exact projector. */
-export function assertLabManifestImplementation(manifest: RunManifest): void {
+export function assertLabManifestImplementation(
+  manifest: RunManifest,
+  options: LabManifestProjectionOptions = {},
+): void {
   if (typeof manifest.experimentId !== "string" || manifest.experimentId.length === 0) {
     throw new Error("Lab manifest experimentId must be a non-empty string");
   }
@@ -138,16 +153,31 @@ export function assertLabManifestImplementation(manifest: RunManifest): void {
   if (!isLabExperimentId(manifest.experimentId)) {
     throw new Error(`Unsupported lab experimentId ${manifest.experimentId}`);
   }
-  // Genesis-Live evidence is refused by this projector on purpose: a live
-  // epoch is steered by recorded inputs that the logical and cognitive
-  // verifiers do not know how to regenerate or accept, so projecting it here
-  // would either fail late or, worse, silently reinterpret it. The live
-  // engine (phase L3) extends this gate with its own branch; until then the
-  // identity exists so that older builds fail closed on it.
+  // Genesis-Live evidence is refused by this projector unless the caller is
+  // the live engine itself: a live epoch is steered by recorded inputs that
+  // the logical and cognitive verifiers do not know how to regenerate or
+  // accept, so projecting it there would either fail late or, worse, silently
+  // reinterpret it.
   if (manifest.mode === "live") {
-    throw new Error(
-      `Unsupported lab execution mode live: engine ${LAB_LIVE_ENGINE_VERSION} evidence is not projectable by this build`,
-    );
+    if (options.live !== true) {
+      throw new Error(
+        `Unsupported lab execution mode live: engine ${LAB_LIVE_ENGINE_VERSION} evidence is not projectable by this build`,
+      );
+    }
+    if (manifest.engineVersion !== LAB_LIVE_ENGINE_VERSION) {
+      throw new Error(`Unsupported lab engineVersion ${manifest.engineVersion}; expected ${LAB_LIVE_ENGINE_VERSION}`);
+    }
+    assertExperimentModeCoupling(manifest.experimentId, manifest.mode);
+    if (!LAB_LIVE_POLICY_PATTERN.test(manifest.policyId)) {
+      throw new Error(`Unsupported lab policyId ${manifest.policyId}; expected ${LAB_LIVE_POLICY_ID}`);
+    }
+    if (manifest.taskGeneratorId !== LAB_LIVE_TASK_SOURCE_ID) {
+      throw new Error(
+        `Unsupported lab taskGeneratorId ${manifest.taskGeneratorId}; expected ${LAB_LIVE_TASK_SOURCE_ID}`,
+      );
+    }
+    assertValidCognitionId(manifest.cognitionId as string);
+    return;
   }
   const cognitive = manifest.mode === "cognitive";
   const expectedEngine = cognitive ? LAB_COGNITIVE_ENGINE_VERSION : LAB_ENGINE_VERSION;

@@ -13,6 +13,9 @@ import {
   type LabEvent,
   type LabLinkState,
   type LabTaskState,
+  type LiveInheritedGenesis,
+  type LiveTaskFamily,
+  type LiveWorldCounters,
   type MetricsSnapshot,
   type MessageState,
   type PhysicsState,
@@ -50,9 +53,28 @@ export interface PreparedWorldTransition {
   apply(committed: LabEvent): WorldState;
 }
 
-export function initialWorldState(manifest: RunManifest): WorldState {
+/**
+ * The world an epoch starts from.
+ *
+ * `genesisState` is the inherited genesis of a live epoch `k+1`: the parent
+ * epoch's final state as stored in `genesis.json` and pinned by
+ * `config.live.genesisFrom.genesisStateHash`. Only the identity fields are
+ * re-keyed to the child; everything the parent ended with — agents, links,
+ * tasks, treasury, counters, absolute tick — continues unchanged. A non-live
+ * manifest refuses it, and a live manifest without one starts epoch 0 exactly
+ * the way a logical run starts.
+ *
+ * stateHash discipline: `mode`/`counters` are emitted only for a live
+ * manifest, so a logical or cognitive state is byte-identical to what this
+ * function produced before Genesis-Live existed.
+ */
+export function initialWorldState(manifest: RunManifest, genesisState?: WorldState): WorldState {
   if (manifest.schemaVersion !== LAB_SCHEMA_VERSION) throw new Error("Unsupported lab manifest schema version");
-  return {
+  const live = manifest.mode === "live";
+  if (genesisState !== undefined && !live) {
+    throw new Error("An inherited genesis state belongs to a live epoch only");
+  }
+  const base: WorldState = {
     schemaVersion: LAB_SCHEMA_VERSION,
     runId: manifest.runId,
     universeId: manifest.universeId,
@@ -74,6 +96,51 @@ export function initialWorldState(manifest: RunManifest): WorldState {
     resourceSpent: cloneResources(ZERO_RESOURCES),
     metrics: [],
     completed: false,
+    ...(live ? { mode: "live" as const, counters: zeroCounters() } : {}),
+  };
+  if (genesisState === undefined) return base;
+  return inheritedWorldState(base, genesisState);
+}
+
+function inheritedWorldState(base: WorldState, genesisState: WorldState): WorldState {
+  if (genesisState.schemaVersion !== LAB_SCHEMA_VERSION) {
+    throw new Error("Inherited genesis state has an unsupported schema version");
+  }
+  if (genesisState.mode !== "live") throw new Error("Inherited genesis state is not a live world state");
+  if (!genesisState.started || !genesisState.completed) {
+    throw new Error("Inherited genesis state is not the completed final state of a parent epoch");
+  }
+  nonNegativeInteger(genesisState.tick, "inherited genesis tick");
+  const inherited = structuredClone(genesisState);
+  return {
+    ...inherited,
+    schemaVersion: base.schemaVersion,
+    runId: base.runId,
+    universeId: base.universeId,
+    configHash: base.configHash,
+    seed: base.seed,
+    // The parent's last tick is this epoch's genesis tick: absolute time never
+    // restarts, so `run.started{inherited}` is committed at exactly this tick
+    // and the first tick of the epoch is the next one.
+    tick: genesisState.tick,
+    started: false,
+    completed: false,
+    // `metrics` are the snapshots of one run, published as that run's
+    // `metrics.jsonl`; the child's file starts empty, so its state must too.
+    // Lifetime totals survive the boundary in `counters`, not here.
+    metrics: [],
+    mode: "live",
+    counters: inherited.counters ?? zeroCounters(),
+  };
+}
+
+function zeroCounters(): LiveWorldCounters {
+  return {
+    tasksCreated: 0,
+    tasksCompleted: 0,
+    submissions: 0,
+    acceptedTasks: 0,
+    externalTasks: 0,
   };
 }
 
@@ -107,8 +174,11 @@ export function prepareWorldEventTransition(
 
   switch (event.type) {
     case "run.started": {
-      if (event.seq !== 1 || event.tick !== 0 || event.phase !== "genesis") {
-        throw new Error("run.started must be the first genesis event at tick 0");
+      // Absolute ticks: a live epoch that continues another one starts at the
+      // parent's final tick, never at 0. Every other run starts at tick 0.
+      const inheritedEpoch = state.mode === "live" && state.tick > 0;
+      if (event.seq !== 1 || event.tick !== state.tick || event.phase !== "genesis") {
+        throw new Error(`run.started must be the first genesis event at tick ${state.tick}`);
       }
       assertSystemEvent(event, "run.started");
       if (state.started) throw new Error("run.started cannot be applied more than once");
@@ -118,6 +188,21 @@ export function prepareWorldEventTransition(
         ? parseResources(treasury, "run.started treasury")
         : undefined;
       const preparedPhysics = physics ? parsePhysics(physics, state.physics) : undefined;
+      const inherited = optionalRecord(data.inherited);
+      if (inheritedEpoch !== (inherited !== undefined)) {
+        throw new Error("run.started carries an inherited genesis exactly when it continues a parent epoch");
+      }
+      if (inherited !== undefined) {
+        parseInheritedGenesis(inherited, state);
+        // The inherited treasury is the parent's; replacing it with a fresh
+        // grant here would mint resources the conservation check never sees.
+        if (preparedTreasury === undefined || hashValue(preparedTreasury) !== hashValue(state.treasury)) {
+          throw new Error("An inherited run.started must restate the inherited treasury");
+        }
+        if (preparedPhysics !== undefined) {
+          throw new Error("An inherited run.started cannot reset the world physics");
+        }
+      }
       mutation = () => {
         state.started = true;
         if (preparedTreasury) state.treasury = preparedTreasury;
@@ -179,6 +264,10 @@ export function prepareWorldEventTransition(
       }
       mutation = () => {
         state.tasks[task.id] = task;
+        countLive(state, (counters) => {
+          counters.tasksCreated += 1;
+          if ((task.family as LiveTaskFamily) === "external") counters.externalTasks += 1;
+        });
       };
       break;
     }
@@ -222,6 +311,7 @@ export function prepareWorldEventTransition(
         state.submissionOrder.push(submission.id);
         task.status = "submitted";
         task.submittedBy = submission.agentId;
+        countLive(state, (counters) => { counters.submissions += 1; });
       };
       break;
     }
@@ -272,6 +362,10 @@ export function prepareWorldEventTransition(
         agent.taskCounts[task.family] = taskCount;
         agent.learning.attempts[task.family] = attempts;
         if (successes !== undefined) agent.learning.successes[task.family] = successes;
+        countLive(state, (counters) => {
+          counters.tasksCompleted += 1;
+          if (accepted) counters.acceptedTasks += 1;
+        });
       };
       break;
     }
@@ -308,13 +402,26 @@ export function prepareWorldEventTransition(
       break;
     }
     case "task.expired": {
-      assertPhase(event, "task_generation");
       assertSystemEvent(event, "task.expired");
       const task = requireTask(state, requiredString(data.taskId, "taskId"));
+      // A live epoch closes its own oracles: whatever calibration work is
+      // still open in the final upkeep expires with `epoch_boundary`, because
+      // a hidden oracle lives only in memory and cannot cross into the next
+      // epoch (design §4.B). Deadline expiry is unchanged everywhere else.
+      const boundary = data.reason === "epoch_boundary";
+      if (boundary) {
+        if (state.mode !== "live") throw new Error("epoch_boundary expiry is a live-only rule");
+        assertPhase(event, "upkeep");
+      } else {
+        assertPhase(event, "task_generation");
+        if (data.reason !== undefined) throw new Error(`Unknown task.expired reason ${String(data.reason)}`);
+      }
       if (task.status !== "available" && task.status !== "claimed") {
         throw new Error(`Task ${task.id} in status ${task.status} cannot expire`);
       }
-      if (event.tick <= task.deadlineTick) throw new Error(`Task ${task.id} cannot expire before its deadline passes`);
+      if (!boundary && event.tick <= task.deadlineTick) {
+        throw new Error(`Task ${task.id} cannot expire before its deadline passes`);
+      }
       mutation = () => {
         task.status = "expired";
       };
@@ -729,6 +836,40 @@ export function applyWorldEventMutable(state: WorldState, event: LabEvent): Worl
 /** Pure compatibility wrapper: the input state and event are never mutated. */
 export function reduceWorldEvent(state: WorldState, event: LabEvent): WorldState {
   return applyWorldEventMutable(structuredClone(state), event);
+}
+
+/**
+ * Bounded-world counters are live-only (`WorldState.counters`), so a logical
+ * or cognitive state passes through untouched and keeps its historical hash.
+ */
+function countLive(state: WorldState, update: (counters: LiveWorldCounters) => void): void {
+  if (state.counters === undefined) return;
+  update(state.counters);
+}
+
+/**
+ * The `inherited` block of a live `run.started`. Every field restates
+ * something the verifier already holds in `config.live.genesisFrom`, so the
+ * shape is checked here and the values are checked against the config by the
+ * protocol verifier — the event may not claim a parent of its own choosing.
+ */
+function parseInheritedGenesis(value: Record<string, unknown>, state: WorldState): LiveInheritedGenesis {
+  const inherited: LiveInheritedGenesis = {
+    parentRunId: requiredString(value.parentRunId, "inherited.parentRunId"),
+    parentEventHash: requiredString(value.parentEventHash, "inherited.parentEventHash"),
+    parentStateHash: requiredString(value.parentStateHash, "inherited.parentStateHash"),
+    genesisStateHash: requiredString(value.genesisStateHash, "inherited.genesisStateHash"),
+    startTick: nonNegativeInteger(value.startTick, "inherited.startTick"),
+  };
+  if (inherited.startTick !== state.tick) {
+    throw new Error("inherited.startTick must equal the tick the parent epoch ended at");
+  }
+  for (const key of Object.keys(value)) {
+    if (!["parentRunId", "parentEventHash", "parentStateHash", "genesisStateHash", "startTick"].includes(key)) {
+      throw new Error(`run.started inherited contains unknown field ${key}`);
+    }
+  }
+  return inherited;
 }
 
 function defaultPhysics(): PhysicsState {

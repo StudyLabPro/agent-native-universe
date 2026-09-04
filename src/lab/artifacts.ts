@@ -30,13 +30,16 @@ import {
 } from "./manifest.js";
 import { readBootId, readProcessStartTicks, requireProcessStartTicks } from "./process-identity.js";
 import { ReplayEngine } from "./replay.js";
-import type {
-  Checkpoint,
-  GenesisConfig,
-  MetricsSnapshot,
-  RunEvidenceAttestation,
-  RunManifest,
-  RunSummary,
+import {
+  LAB_SCHEMA_VERSION,
+  type Checkpoint,
+  type GenesisConfig,
+  type LiveChainLink,
+  type MetricsSnapshot,
+  type RunEvidenceAttestation,
+  type RunManifest,
+  type RunSummary,
+  type WorldState,
 } from "./types.js";
 
 export class EvidenceConflictError extends Error {
@@ -80,6 +83,13 @@ export interface EvidenceStoreOptions {
   retainEvents?: boolean;
   /** Address evidence by immutable run identity below the universe directory. */
   runId?: string;
+  /**
+   * Read and write `mode: "live"` evidence. Only the Genesis-Live engine sets
+   * this; evidence discovery (`openExisting`) and every scientific reader
+   * leave it off, so a live run directory stays "an unsupported
+   * implementation" to them exactly as before.
+   */
+  live?: boolean;
 }
 
 /**
@@ -104,12 +114,15 @@ export class EvidenceStore {
   readonly metricsPath: string;
   readonly summaryPath: string;
   readonly finalAttestationPath: string;
+  /** Inherited genesis of a live epoch (`genesis.json`); absent for epoch 0 and every bounded run. */
+  readonly genesisStatePath: string;
 
   #recorder: LabEventRecorder | undefined;
   #jsonTail: Promise<void> = Promise.resolve();
   #metricsTail: Promise<void> = Promise.resolve();
   #lastMetricTick = -1;
   readonly #retainEvents: boolean;
+  readonly #live: boolean;
 
   constructor(
     runsRoot: string,
@@ -136,7 +149,9 @@ export class EvidenceStore {
     this.metricsPath = containedPath(this.directory, "metrics.jsonl");
     this.summaryPath = containedPath(this.directory, "summary.json");
     this.finalAttestationPath = containedPath(this.attestationsDirectory, "final.json");
+    this.genesisStatePath = containedPath(this.directory, "genesis.json");
     this.#retainEvents = options.retainEvents !== false;
+    this.#live = options.live === true;
     registerFinalAttestationWriter(this, (attestation) => this.#writeFinalAttestation(attestation));
     registerEvidenceVerificationSnapshotProvider(
       this,
@@ -353,7 +368,7 @@ export class EvidenceStore {
   }
 
   async initialize(manifest: RunManifest, config: GenesisConfig): Promise<LabEventRecorder> {
-    validateManifest(manifest);
+    validateManifest(manifest, this.#live);
     if (manifest.experimentId !== this.experimentId || manifest.universeId !== this.universeId) {
       throw new Error("Manifest does not match the evidence directory");
     }
@@ -435,7 +450,7 @@ export class EvidenceStore {
 
   async readManifest(): Promise<RunManifest> {
     const manifest = await readCanonicalJson<RunManifest>(this.manifestPath, MAX_MANIFEST_BYTES);
-    validateManifest(manifest);
+    validateManifest(manifest, this.#live);
     if (manifest.experimentId !== this.experimentId || manifest.universeId !== this.universeId) {
       throw new Error("Stored manifest does not match its evidence directory");
     }
@@ -483,6 +498,30 @@ export class EvidenceStore {
       throw new Error("Stored final attestation does not match its evidence run");
     }
     return attestation;
+  }
+
+  /**
+   * The inherited genesis of a live epoch: the parent epoch's final state
+   * (after the compaction rule recorded in `config.live.genesisFrom`), from
+   * which this epoch's world is derived. Written once, immutably — a restart
+   * that re-derives it writes identical bytes and is tolerated; differing
+   * bytes are a conflict, never a silent overwrite.
+   */
+  async writeGenesisState(state: WorldState): Promise<void> {
+    if (!this.#live) throw new Error("A genesis state belongs to a live epoch only");
+    await this.#enqueueJson(() => this.#writeImmutable(this.genesisStatePath, state, "genesis state"));
+  }
+
+  async readGenesisState(): Promise<WorldState | undefined> {
+    const state = await readOptionalCanonicalJson<WorldState>(
+      this.genesisStatePath,
+      MAX_CHECKPOINT_BYTES,
+    );
+    if (!state) return undefined;
+    if (state.mode !== "live" || !state.completed) {
+      throw new Error("Stored genesis state is not the completed final state of a live epoch");
+    }
+    return state;
   }
 
   async readCheckpoint(tick: number): Promise<Checkpoint | undefined> {
@@ -653,15 +692,113 @@ export class EvidenceStore {
   }
 
   async #writeImmutable(path: string, value: unknown, label: string): Promise<void> {
-    const serialized = canonicalJson(value);
+    await writeImmutableArtifact(path, value, label);
+  }
+}
+
+/**
+ * Write once. A repeated write of identical bytes is tolerated — that is what
+ * makes an interrupted boundary crossing replayable — and differing bytes are
+ * an `EvidenceConflictError`, never a silent overwrite.
+ */
+async function writeImmutableArtifact(path: string, value: unknown, label: string): Promise<void> {
+  const serialized = canonicalJson(value);
+  try {
+    const existing = await readTextNoFollow(path, Buffer.byteLength(serialized, "utf8"));
+    if (existing === serialized) return;
+    throw new EvidenceConflictError(`Refusing to replace existing ${label}`);
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+  }
+  await atomicCanonicalWrite(path, serialized);
+}
+
+const MAX_CHAIN_LINK_BYTES = 65_536;
+
+/**
+ * The epoch index of a live universe: `<universe>/chain/<epoch>.json`.
+ *
+ * It is an index, not a source of truth. Every field it carries is derivable
+ * by replaying the epochs themselves, and a lost or damaged chain costs
+ * discovery speed, never evidence. Links are immutable and dense: epoch `k`
+ * may be written only after `k-1` exists.
+ */
+export class LiveChainIndex {
+  readonly directory: string;
+
+  constructor(runsRoot: string, experimentId: string, universeId: string) {
+    if (!runsRoot) throw new TypeError("Evidence runs root must not be empty");
+    assertSafeIdentifier(experimentId, "experiment id");
+    assertSafeIdentifier(universeId, "universe id");
+    this.directory = containedPath(resolve(runsRoot), experimentId, universeId, "chain");
+  }
+
+  linkPath(epoch: number): string {
+    nonNegativeSafeInteger(epoch, "chain epoch");
+    return containedPath(this.directory, `${epoch}.json`);
+  }
+
+  /** Every link, ordered by epoch, refusing gaps and mislabelled entries. */
+  async readLinks(): Promise<LiveChainLink[]> {
+    let entries: string[];
     try {
-      const existing = await readTextNoFollow(path, Buffer.byteLength(serialized, "utf8"));
-      if (existing === serialized) return;
-      throw new EvidenceConflictError(`Refusing to replace existing ${label}`);
+      entries = await withAnchoredDirectory(this.directory, {}, (directory) => readdir(directory.path));
     } catch (error) {
-      if (!isMissing(error)) throw error;
+      if (isMissing(error)) return [];
+      throw error;
     }
-    await atomicCanonicalWrite(path, serialized);
+    const epochs = entries
+      .map((entry) => {
+        const match = /^(0|[1-9][0-9]*)\.json$/.exec(entry);
+        if (!match) throw new Error(`Unexpected chain artifact ${entry}`);
+        return Number(match[1]);
+      })
+      .sort((left, right) => left - right);
+    const links: LiveChainLink[] = [];
+    for (const [index, epoch] of epochs.entries()) {
+      if (epoch !== index) throw new EvidenceConflictError(`Live chain has a gap at epoch ${index}`);
+      const link = await this.readLink(epoch);
+      if (link === undefined) throw new Error(`Chain link ${epoch} disappeared during read`);
+      links.push(link);
+    }
+    return links;
+  }
+
+  async readLink(epoch: number): Promise<LiveChainLink | undefined> {
+    const link = await readOptionalCanonicalJson<LiveChainLink>(this.linkPath(epoch), MAX_CHAIN_LINK_BYTES);
+    if (!link) return undefined;
+    validateChainLink(link, epoch);
+    return link;
+  }
+
+  async writeLink(link: LiveChainLink): Promise<void> {
+    validateChainLink(link, link.epoch);
+    if (link.epoch > 0 && (await this.readLink(link.epoch - 1)) === undefined) {
+      throw new EvidenceConflictError(`Live chain link ${link.epoch} has no parent link`);
+    }
+    await ensureNoSymlinkDirectoryHierarchy(this.directory);
+    await writeImmutableArtifact(this.linkPath(link.epoch), link, `chain link ${link.epoch}`);
+  }
+}
+
+function validateChainLink(link: LiveChainLink, epoch: number): void {
+  if (link.schemaVersion !== LAB_SCHEMA_VERSION) throw new Error("Chain link has an unsupported schema version");
+  if (link.epoch !== epoch) throw new EvidenceConflictError(`Chain link ${epoch} describes epoch ${link.epoch}`);
+  nonNegativeSafeInteger(link.epoch, "chain link epoch");
+  nonNegativeSafeInteger(link.startTick, "chain link startTick");
+  nonNegativeSafeInteger(link.ticks, "chain link ticks");
+  assertSafeIdentifier(link.runId, "chain link run id");
+  assertSafeIdentifier(link.universeId, "chain link universe id");
+  for (const field of ["eventHash", "stateHash", "commitment", "engineVersion", "cognitionId"] as const) {
+    if (typeof link[field] !== "string" || link[field].length === 0) {
+      throw new Error(`Chain link ${epoch} is missing ${field}`);
+    }
+  }
+  if ((link.epoch === 0) !== (link.parentRunId === undefined)) {
+    throw new EvidenceConflictError(`Chain link ${epoch} has a parent exactly when it is not epoch 0`);
+  }
+  if ((link.parentRunId === undefined) !== (link.parentCommitment === undefined)) {
+    throw new Error(`Chain link ${epoch} must carry both or neither parent field`);
   }
 }
 
@@ -1017,14 +1154,14 @@ async function readBytesBounded(
   return Buffer.concat(chunks, position);
 }
 
-function validateManifest(manifest: RunManifest): void {
+function validateManifest(manifest: RunManifest, live = false): void {
   assertSafeIdentifier(manifest.experimentId, "manifest experiment id");
   assertSafeIdentifier(manifest.runId, "manifest run id");
   assertSafeIdentifier(manifest.universeId, "manifest universe id");
   if (typeof manifest.seed !== "string" || manifest.seed.length === 0) {
     throw new Error("Manifest seed must be a non-empty string");
   }
-  assertLabManifestImplementation(manifest);
+  assertLabManifestImplementation(manifest, { live });
   if (!/^[0-9a-f]{64}$/.test(manifest.configHash)) throw new Error("Manifest configHash must be lowercase SHA-256");
 }
 

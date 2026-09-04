@@ -9,8 +9,9 @@ import type { LogicalPolicy } from "./policy-schedule.js";
 import { createRunManifest } from "./manifest.js";
 import { NeutralPolicy } from "./neutral-policy.js";
 import type { PendingOracle } from "./evaluator.js";
-import { ReplayEngine, type ReplayResult } from "./replay.js";
+import { ReplayEngine, type ReplayProjectionOptions, type ReplayResult } from "./replay.js";
 import {
+  LAB_LIVE_EXPERIMENT_ID,
   LAB_SCHEMA_VERSION,
   type Checkpoint,
   type GenesisConfig,
@@ -46,6 +47,36 @@ export interface GenesisRunOptions {
   recoverStaleLease?: boolean;
   /** Fsync the event log at every `tick.completed`. Durability only. */
   fsyncEveryTick?: boolean;
+  /**
+   * Observe every durable tick boundary after the checkpoint is on disk.
+   * Progress reporting only — it can neither write evidence nor change a
+   * hash — used by the live supervisor and by crash tests that need to fail a
+   * process exactly at a boundary.
+   */
+  onCheckpoint?: (checkpoint: Checkpoint) => void | Promise<void>;
+  /**
+   * Run this as a Genesis-Live epoch. Supplied only by the live engine
+   * (`src/lab/live/epoch.ts`), never by a scientific caller: without it a
+   * `genesis-live` config is refused exactly as before, because a logical
+   * manifest and the live experiment imply each other's absence.
+   *
+   * The fallback policy arrives as a factory rather than an instance for the
+   * same reason a control arm's policy is rebuilt from its identity — a run
+   * must use exactly what replay will use — and as an injected parameter
+   * rather than an import because the science guard forbids this file from
+   * reaching anything under `src/lab/live/`.
+   */
+  live?: LiveGenesisOptions;
+}
+
+export interface LiveGenesisOptions {
+  /** Builds a fresh `LiveIdlePolicy`; its composed identity must be the manifest's. */
+  createFallbackPolicy: () => LogicalPolicy;
+  /**
+   * The inherited genesis of epoch `k+1` (`genesis.json`), required exactly
+   * when `config.live.genesisFrom` is present.
+   */
+  genesisState?: WorldState;
 }
 
 export class GenesisRunPausedError extends Error {
@@ -76,13 +107,24 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
   if (cognition !== undefined && options.policy !== undefined) {
     throw new Error("A run takes either a cognition port or a baseline policy, never both");
   }
+  const live = options.live;
+  if (live !== undefined) {
+    if (config.experimentId !== LAB_LIVE_EXPERIMENT_ID) {
+      throw new Error(`A live epoch requires experiment ${LAB_LIVE_EXPERIMENT_ID}; got ${config.experimentId}`);
+    }
+    if (cognition === undefined) throw new Error("A live epoch requires a cognition port");
+    if (options.policy !== undefined) throw new Error("A live epoch takes no baseline policy");
+    if ((config.live?.genesisFrom !== undefined) !== (live.genesisState !== undefined)) {
+      throw new Error("An inherited live epoch requires exactly the genesis state its genesisFrom pins");
+    }
+  }
   // Never run with the caller's instance. A stateful policy that already
   // decided a previous run would draw from advanced RNG streams, and the
   // verifier — which always regenerates from a fresh instance — would refuse
   // the evidence after the compute was already spent. Deriving a fresh policy
   // from the identity guarantees the run uses exactly what replay will use.
   const policy = cognition !== undefined
-    ? new CohortPolicy(cognition.cohort, new NeutralPolicy())
+    ? new CohortPolicy(cognition.cohort, live === undefined ? new NeutralPolicy() : live.createFallbackPolicy())
     : options.policy === undefined
       ? undefined
       : createLogicalPolicyById(options.policy.id);
@@ -93,18 +135,29 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
       ? {}
       : {
         policyId: policy.id,
-        mode: cognition === undefined ? "logical" : "cognitive",
+        mode: cognition === undefined ? "logical" : live === undefined ? "cognitive" : "live",
         // The consulted model is part of the treatment: without it in the
         // identity, rerunning the same cohort against a different model
         // would recover the earlier run's evidence instead of running.
         ...(cognition === undefined ? {} : { cognitionId: cognition.id }),
       },
   );
+  // Every projection of this run — the universe, both replays and the
+  // verifier inside them — is told the same thing, so a live epoch is never
+  // half-projected as a bounded cognitive run.
+  const projection: ReplayProjectionOptions = live === undefined
+    ? {}
+    : {
+      live: {
+        createFallbackPolicy: live.createFallbackPolicy,
+        ...(live.genesisState === undefined ? {} : { genesisState: live.genesisState }),
+      },
+    };
   const evidence = new EvidenceStore(
     options.runsRoot,
     manifest.experimentId,
     manifest.universeId,
-    { retainEvents: false, runId: manifest.runId },
+    { retainEvents: false, runId: manifest.runId, ...(live === undefined ? {} : { live: true }) },
   );
   const releaseLease = await evidence.acquireWriterLease(manifest.runId, {
     recoverStale: options.recoverStaleLease === true,
@@ -112,14 +165,19 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
 
   try {
     await evidence.initialize(manifest, config);
-    const recovery = await recoverExistingRun(evidence, manifest, config);
+    if (live?.genesisState !== undefined) await evidence.writeGenesisState(live.genesisState);
+    const recovery = await recoverExistingRun(evidence, manifest, config, projection);
     if (recovery.kind === "completed") return recovery.summary;
 
     const universe = new LogicalUniverse(manifest, config, evidence.events, {
       ...(policy === undefined ? {} : { policy }),
       ...(cognition === undefined ? {} : { cognition }),
       onMetrics: (metrics) => evidence.appendMetrics(metrics),
-      onCheckpoint: (checkpoint) => evidence.writeCheckpoint(checkpoint),
+      onCheckpoint: async (checkpoint) => {
+        await evidence.writeCheckpoint(checkpoint);
+        await options.onCheckpoint?.(checkpoint);
+      },
+      ...(live?.genesisState === undefined ? {} : { genesisState: live.genesisState }),
       ...(options.fsyncEveryTick === true ? { fsyncEveryTick: true } : {}),
       ...(recovery.kind === "checkpoint"
         ? { resumeFrom: recovery.checkpoint, pendingOracles: recovery.pendingOracles }
@@ -131,7 +189,7 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
       throw new GenesisRunPausedError(manifest.runId, manifest.universeId, liveState.tick);
     }
 
-    const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config);
+    const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config, undefined, projection);
     assertReplayEquivalent(liveState, replay, config);
     const summary = await createSummary(evidence, manifest, config, replay);
     await evidence.writeSummary(summary);
@@ -161,6 +219,7 @@ async function recoverExistingRun(
   evidence: EvidenceStore,
   manifest: RunManifest,
   config: GenesisConfig,
+  projection: ReplayProjectionOptions,
 ): Promise<ExistingRunRecovery> {
   const stored = await evidence.readSummary();
   if (evidence.events.lastSeq === 0) {
@@ -168,7 +227,7 @@ async function recoverExistingRun(
     return { kind: "fresh" };
   }
 
-  const replay = await ReplayEngine.replayRecoverableFile(evidence.eventsPath, manifest, config);
+  const replay = await ReplayEngine.replayRecoverableFile(evidence.eventsPath, manifest, config, projection);
   if (!replay.state.completed) {
     if (stored) throw new EvidenceConflictError("A summary exists for an incomplete event stream");
     if (await evidence.readFinalAttestation()) {

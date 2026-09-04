@@ -4,6 +4,11 @@ import { createCapabilityState, executeCapabilityPlan } from "./capability-regis
 import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import { createObservationFrame, observeWorldFromFrame } from "./environment.js";
+import {
+  calibrationTaskCount,
+  epochBoundaryExpiries,
+  inheritedGenesisOf,
+} from "./epoch-rules.js";
 import { IndependentEvaluator, type PendingOracle } from "./evaluator.js";
 import type { LabEventRecorder } from "./event-recorder.js";
 import { createLabEvent } from "./events.js";
@@ -11,6 +16,8 @@ import { deterministicId } from "./ids.js";
 import {
   LAB_COGNITIVE_ENGINE_VERSION,
   LAB_ENGINE_VERSION,
+  LAB_LIVE_ENGINE_VERSION,
+  LAB_LIVE_TASK_SOURCE_ID,
   LAB_POLICY_ID,
   LAB_TASK_GENERATOR_ID,
   createRunManifest,
@@ -75,6 +82,13 @@ export interface LogicalUniverseOptions {
    * cannot affect any hash in the chain.
    */
   fsyncEveryTick?: boolean;
+  /**
+   * The inherited genesis of a live epoch `k+1` (`genesis.json`), required
+   * exactly when `config.live.genesisFrom` is present. The world continues
+   * from it at absolute tick `genesisFrom.tick` instead of creating a genesis
+   * population. Live-only: a logical or cognitive manifest refuses it.
+   */
+  genesisState?: WorldState;
 }
 
 const UNSUPPORTED_ACTIONS = new Set<PrimitiveActionType>([
@@ -103,6 +117,8 @@ export class LogicalUniverse {
 
   #world: WorldState;
   #initialTotal: ResourceVector | undefined;
+  /** Absolute tick of this run's genesis: 0, or the parent's final tick. */
+  #genesisTick = 0;
   #nextTick = 1;
   #initialized = false;
   #tickRunning = false;
@@ -118,15 +134,21 @@ export class LogicalUniverse {
     validateGenesisConfig(config);
     if (manifest.schemaVersion !== LAB_SCHEMA_VERSION) throw new Error("Manifest schema does not match the lab");
     const cognitiveMode = manifest.mode === "cognitive";
-    const expectedEngine = cognitiveMode ? LAB_COGNITIVE_ENGINE_VERSION : LAB_ENGINE_VERSION;
+    const liveMode = manifest.mode === "live";
+    const expectedEngine = liveMode
+      ? LAB_LIVE_ENGINE_VERSION
+      : cognitiveMode ? LAB_COGNITIVE_ENGINE_VERSION : LAB_ENGINE_VERSION;
     if (
       manifest.engineVersion !== expectedEngine
-      || (manifest.mode !== "logical" && !cognitiveMode)
-      || manifest.taskGeneratorId !== LAB_TASK_GENERATOR_ID
+      || (manifest.mode !== "logical" && !cognitiveMode && !liveMode)
+      || manifest.taskGeneratorId !== (liveMode ? LAB_LIVE_TASK_SOURCE_ID : LAB_TASK_GENERATOR_ID)
     ) {
       throw new Error("Manifest implementation identity does not match this logical engine");
     }
-    if (cognitiveMode !== (options.cognition !== undefined)) {
+    // A live epoch is steered by recorded answers exactly like a cohort, so it
+    // requires a cognition port too; an unsteered live agent idles through
+    // `LiveIdlePolicy` rather than falling back to a computed answer.
+    if ((cognitiveMode || liveMode) !== (options.cognition !== undefined)) {
       throw new Error("A cognitive manifest requires a cognition port, and a logical manifest forbids one");
     }
     if (options.cognition !== undefined && options.cognition.id !== manifest.cognitionId) {
@@ -175,8 +197,33 @@ export class LogicalUniverse {
     this.#policyRng = rootRng.fork("policy");
     this.#pressureRng = rootRng.fork("pressure");
     this.#resolutionRng = rootRng.fork("resolution");
-    this.#world = initialWorldState(manifest);
+    const genesisFrom = liveMode ? config.live?.genesisFrom : undefined;
+    if ((genesisFrom !== undefined) !== (options.genesisState !== undefined)) {
+      throw new Error("An inherited live epoch requires exactly the genesis state its genesisFrom pins");
+    }
+    if (genesisFrom !== undefined && options.genesisState !== undefined) {
+      if (hashValue(options.genesisState) !== genesisFrom.genesisStateHash) {
+        throw new Error("Inherited genesis state does not match live.genesisFrom.genesisStateHash");
+      }
+      if (options.genesisState.tick !== genesisFrom.tick || options.genesisState.runId !== genesisFrom.runId) {
+        throw new Error("Inherited genesis state does not belong to the pinned parent epoch");
+      }
+    }
+    this.#world = initialWorldState(manifest, options.genesisState);
+    this.#genesisTick = this.#world.tick;
     this.#initialAgentTotals = multiplyResources(config.initialResources, config.agents);
+    if (genesisFrom !== undefined) {
+      // One continuous realization across the universe's life: the child
+      // resumes the parent's deterministic streams instead of restarting them.
+      this.#taskStream.restore(genesisFrom.runtime.taskStream);
+      if (genesisFrom.runtime.policy !== null) {
+        if (this.#policy.restore === undefined) {
+          throw new Error("The live fallback policy does not support deterministic continuation");
+        }
+        this.#policy.restore(genesisFrom.runtime.policy, this.#policyRng);
+      }
+      this.#nextTick = genesisFrom.tick + 1;
+    }
     if (options.resumeFrom !== undefined) this.#restore(options.resumeFrom);
     // Independently reconstructed by the caller (genesis.ts) from a replay of
     // the event stream, never read back from the checkpoint itself: the
@@ -255,6 +302,26 @@ export class LogicalUniverse {
   async #ensureInitialized(): Promise<void> {
     if (this.#initialized) return;
     if (this.recorder.lastSeq !== 0) throw new Error("LogicalUniverse v1 requires an empty event recorder");
+
+    const genesisFrom = this.manifest.mode === "live" ? this.config.live?.genesisFrom : undefined;
+    if (genesisFrom !== undefined) {
+      // An inherited epoch has no genesis population: its agents, links and
+      // open tasks are the parent's, and its first event states which parent
+      // and which inherited state it continues (every value pinned in
+      // `config.live.genesisFrom`, so the claim is verifiable).
+      await this.#commit({
+        tick: this.#genesisTick,
+        phase: "genesis",
+        type: "run.started",
+        data: toJsonObject({
+          treasury: this.#world.treasury,
+          inherited: inheritedGenesisOf(genesisFrom),
+        }),
+      });
+      this.#initialTotal = totalResources(this.#world);
+      this.#initialized = true;
+      return;
+    }
 
     await this.#commit({
       tick: 0,
@@ -349,6 +416,10 @@ export class LogicalUniverse {
         await this.#onMetrics?.(structuredClone(metrics));
       }
 
+      // Upkeep of the final tick: nothing with a hidden oracle may cross into
+      // the next epoch, because oracles live only in memory.
+      await this.#expireAtEpochBoundary(tick);
+
       await this.#commit({
         tick,
         phase: "upkeep",
@@ -406,12 +477,28 @@ export class LogicalUniverse {
     }
   }
 
+  /**
+   * The last upkeep of a live epoch expires every calibration task still open,
+   * so no hidden oracle has to survive the boundary. External tasks (phase
+   * L3b) have no oracle and are deliberately left to cross.
+   */
+  async #expireAtEpochBoundary(tick: number): Promise<void> {
+    for (const task of epochBoundaryExpiries(this.manifest, this.config, tick, this.#world)) {
+      await this.#commit({
+        tick,
+        phase: "upkeep",
+        type: "task.expired",
+        data: { taskId: task, reason: "epoch_boundary" },
+      });
+    }
+  }
+
   async #generateTasks(tick: number): Promise<void> {
     const backlog = Object.values(this.#world.tasks)
       .filter((task) => task.status !== "completed" && task.status !== "expired").length;
     const capacity = Math.max(0, this.config.taskStream.maxBacklog - backlog);
     const scaled = safePpmMultiply(this.config.taskStream.tasksPerTick, this.#world.physics.taskLoadPpm);
-    const count = Math.min(capacity, scaled);
+    const count = calibrationTaskCount(this.manifest, this.config, tick, Math.min(capacity, scaled));
     for (const generated of this.#taskStream.generate(tick, count)) {
       this.#evaluator.registerOracle(generated.task.id, generated.expected);
       await this.#commit({

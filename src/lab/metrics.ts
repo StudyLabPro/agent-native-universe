@@ -44,12 +44,18 @@ export function computeMetrics(state: WorldState, initialTotals?: ResourceVector
     .sort((left, right) => left - right);
 
   const graph = graphMetrics(activeAgents.map((agent) => agent.id), activeLinks.map((link) => [link.left, link.right]));
-  const tasksCompleted = tasks.filter((task) => task.status === "completed").length;
+  // A bounded live world archives settled records out of the maps, so its
+  // lifetime totals live in `state.counters` instead of in the map lengths.
+  // Absent counters (every logical and cognitive state) keep the historical
+  // length-based arithmetic byte-for-byte.
+  const counters = state.counters;
+  const tasksCreated = counters?.tasksCreated ?? tasks.length;
+  const tasksCompleted = counters?.tasksCompleted ?? tasks.filter((task) => task.status === "completed").length;
   const qualityTotal = submissions.reduce((sum, submission) => sum + BigInt(submission.qualityPpm), 0n);
   const meanQualityPpm = submissions.length === 0
     ? 0
     : safeBigIntToNumber(qualityTotal / BigInt(submissions.length), "mean quality");
-  const acceptedTasks = acceptedTaskIds.size;
+  const acceptedTasks = counters?.acceptedTasks ?? acceptedTaskIds.size;
   const previous = state.metrics.at(-1);
   const previousTick = previous?.tick ?? -1;
   const createdSincePrevious = activeLinks.filter((link) => (
@@ -62,9 +68,9 @@ export function computeMetrics(state: WorldState, initialTotals?: ResourceVector
   return {
     schemaVersion: LAB_SCHEMA_VERSION,
     tick: state.tick,
-    tasksCreated: tasks.length,
+    tasksCreated,
     tasksCompleted,
-    taskSuccessRatePpm: ppmRatio(acceptedTaskIds.size, tasks.length),
+    taskSuccessRatePpm: ppmRatio(acceptedTasks, tasksCreated),
     meanQualityPpm,
     p50LatencyTicks: percentileNearestRank(acceptedLatencies, 50),
     p95LatencyTicks: percentileNearestRank(acceptedLatencies, 95),

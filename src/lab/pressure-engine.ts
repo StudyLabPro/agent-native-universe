@@ -20,11 +20,17 @@ const PRESSURE_TYPES = [
 export class PressureEngine {
   readonly #pressures: readonly PressureSpec[];
   readonly #applied = new Set<number>();
+  readonly #empty: boolean;
 
   constructor(pressures: readonly PressureSpec[]) {
-    if (pressures.length !== PRESSURE_TYPES.length) {
+    // Either the complete logical schedule, or none at all: a live universe
+    // takes its physics from recorded operator input rather than from a
+    // configured schedule (`validateGenesisConfig` permits the empty list only
+    // for `genesis-live`), and a partial logical schedule stays an error.
+    if (pressures.length !== PRESSURE_TYPES.length && pressures.length !== 0) {
       throw new Error(`PressureEngine requires exactly ${PRESSURE_TYPES.length} logical pressures`);
     }
+    this.#empty = pressures.length === 0;
     const counts = new Map<string, number>();
     for (const pressure of pressures) {
       nonNegativeSafeInteger(pressure.tick, `${pressure.type}.tick`);
@@ -36,7 +42,9 @@ export class PressureEngine {
       counts.set(pressure.type, (counts.get(pressure.type) ?? 0) + 1);
     }
     for (const type of PRESSURE_TYPES) {
-      if (counts.get(type) !== 1) throw new Error(`PressureEngine requires exactly one ${type} pressure`);
+      if (!this.#empty && counts.get(type) !== 1) {
+        throw new Error(`PressureEngine requires exactly one ${type} pressure`);
+      }
     }
     this.#pressures = pressures.map((pressure) => structuredClone(pressure));
   }

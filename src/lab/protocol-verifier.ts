@@ -2,6 +2,11 @@ import type { JsonObject, JsonValue } from "../core/types.js";
 import { createGenesisAgents } from "./agent-factory.js";
 import { compareCodeUnits, hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
+import {
+  calibrationTaskCount,
+  epochBoundaryExpiries,
+  inheritedGenesisOf,
+} from "./epoch-rules.js";
 import { equalJson, type PendingOracle } from "./evaluator.js";
 import { deterministicId } from "./ids.js";
 import { createRunManifest, LAB_POLICY_ID } from "./manifest.js";
@@ -23,6 +28,7 @@ import {
   PPM,
   type CheckpointRuntimeState,
   type GenesisConfig,
+  type LiveGenesisFrom,
   type LabEvent,
   type LabEventType,
   type PrimitiveActionType,
@@ -75,6 +81,17 @@ const EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>
   "run.completed": ["completion"],
 });
 
+/**
+ * Live epochs add exactly one phase to the frozen table: the final upkeep of
+ * an epoch expires the calibration work that would otherwise cross the
+ * boundary. The logical table itself is unchanged, so a bounded run is
+ * verified by exactly the phases it always was.
+ */
+const LIVE_EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>> = Object.freeze({
+  ...EVENT_PHASES,
+  "task.expired": ["task_generation", "upkeep"],
+});
+
 interface ExpectedPressureEvent {
   type: "pressure.applied" | "agent.retired";
   data: JsonObject;
@@ -121,6 +138,35 @@ export class ProtocolVerificationError extends Error {
 }
 
 /**
+ * What a live epoch needs on top of a bounded run to be verifiable, supplied
+ * only by the Genesis-Live engine (`src/lab/live/epoch.ts`).
+ *
+ * Without it a live manifest is refused fail-closed exactly as before: the
+ * scientific projectors never build one of these, so live evidence can never
+ * be reinterpreted as logical or cognitive evidence.
+ */
+export interface LiveProjectionOptions {
+  /**
+   * The inherited genesis (`genesis.json`) of this epoch, required exactly
+   * when `config.live.genesisFrom` is present and refused otherwise. It is
+   * checked against `genesisFrom.genesisStateHash` before anything is
+   * verified against it.
+   */
+  genesisState?: WorldState;
+  /**
+   * Builds a fresh live fallback policy (`LiveIdlePolicy`). Injected rather
+   * than imported: the science guard forbids the scientific instruments —
+   * which reach this file through `genesis.ts` → `replay.ts` — from reaching
+   * anything under `src/lab/live/`.
+   */
+  createFallbackPolicy: () => LogicalPolicy;
+}
+
+export interface LabProtocolVerifierOptions {
+  live?: LiveProjectionOptions;
+}
+
+/**
  * Stateful verifier for the deterministic Genesis-1 wire protocol.
  * It retains only bounded generator state and causal anchors for the current
  * tick; the WorldState projection remains the source of referential truth.
@@ -141,6 +187,9 @@ export class LabProtocolVerifier {
    */
   readonly #policy: LogicalPolicy;
   readonly #cognitive: boolean;
+  readonly #live: boolean;
+  readonly #genesisFrom: LiveGenesisFrom | undefined;
+  readonly #genesisTick: number;
   #cognitionRecords: CognitionRecord[] = [];
   readonly #policyRng: DeterministicRng;
   readonly #resolutionRng: DeterministicRng;
@@ -158,6 +207,8 @@ export class LabProtocolVerifier {
   #completed = false;
   #pressureExpected: ExpectedPressureEvent[] = [];
   #expiryExpected: string[] = [];
+  /** Live only: the final upkeep's `epoch_boundary` expiries, once regenerated. */
+  #boundaryExpiryExpected: string[] | undefined;
   #generatedExpected: GeneratedTask[] | undefined;
   #generatedIndex = 0;
   #rewards: ExpectedReward[] = [];
@@ -165,17 +216,28 @@ export class LabProtocolVerifier {
   #openPayment: PaymentAnchor | undefined;
   #policyDecisions: PolicyDecision[] | undefined;
   #policyViolations: DeferredPolicyViolation[] | undefined;
+  #inheritedTreasury: ResourceVector | undefined;
 
-  constructor(manifest: RunManifest, config: GenesisConfig) {
+  constructor(manifest: RunManifest, config: GenesisConfig, options: LabProtocolVerifierOptions = {}) {
     assertReplayConfiguration(manifest, config);
     // Fail closed rather than verify a live epoch as if it were logical: its
-    // recorded inputs (external tasks, verdicts, physics) are unknown here.
-    if (manifest.mode === "live") {
+    // recorded inputs (external tasks, verdicts, physics) are unknown here
+    // unless the caller is the live engine and hands over what a live epoch
+    // needs to be regenerated.
+    const live = manifest.mode === "live";
+    if (live && options.live === undefined) {
       throw new ProtocolVerificationError("Live manifests are not verifiable by this engine build");
+    }
+    if (!live && options.live !== undefined) {
+      throw new ProtocolVerificationError("A live projection belongs to a live manifest only");
     }
     this.manifest = structuredClone(manifest);
     this.config = structuredClone(config);
-    this.#genesisAgents = createGenesisAgents(config);
+    this.#live = live;
+    this.#genesisFrom = live ? config.live?.genesisFrom : undefined;
+    this.#genesisTick = this.#genesisFrom?.tick ?? 0;
+    // An inherited epoch has no genesis population: it continues the parent's.
+    this.#genesisAgents = this.#genesisFrom === undefined ? createGenesisAgents(config) : [];
     const rootRng = new DeterministicRng(hashValue({
       domain: "agent-native-universe/lab/logical-universe/v1",
       runId: manifest.runId,
@@ -189,21 +251,58 @@ export class LabProtocolVerifier {
     this.#resolutionRng = rootRng.fork("resolution");
     this.#initialAgentTotals = multiplyResources(config.initialResources, config.agents);
     this.#cognitive = manifest.mode === "cognitive";
-    this.#policy = this.#cognitive
-      ? new CohortPolicy(cohortOf(manifest.policyId), this.#neutral)
-      : manifest.policyId === LAB_POLICY_ID
-        ? this.#neutral
-        : createLogicalPolicyById(manifest.policyId);
+    // Live steers exactly like a cohort — recorded answers applied through the
+    // same CohortPolicy — but its unsteered agents idle instead of receiving
+    // the neutral control's computed answer.
+    this.#policy = live
+      ? new CohortPolicy(cohortOf(manifest.policyId), options.live!.createFallbackPolicy())
+      : this.#cognitive
+        ? new CohortPolicy(cohortOf(manifest.policyId), this.#neutral)
+        : manifest.policyId === LAB_POLICY_ID
+          ? this.#neutral
+          : createLogicalPolicyById(manifest.policyId);
+    if (live && this.#policy.id !== manifest.policyId) {
+      throw new ProtocolVerificationError(
+        `Live fallback policy composes to ${this.#policy.id}, not the manifest policy ${manifest.policyId}`,
+      );
+    }
+    if (this.#genesisFrom !== undefined) {
+      const genesisState = options.live?.genesisState;
+      if (genesisState === undefined) {
+        throw new ProtocolVerificationError("An inherited live epoch requires its genesis state");
+      }
+      if (hashValue(genesisState) !== this.#genesisFrom.genesisStateHash) {
+        throw new ProtocolVerificationError("Inherited genesis state does not match live.genesisFrom");
+      }
+      this.#inheritedTreasury = structuredClone(genesisState.treasury);
+      // Continue the parent's deterministic streams: the child's realization
+      // is the same one, not a new one that happens to start at this tick.
+      this.#tasks.restore(this.#genesisFrom.runtime.taskStream);
+      if (this.#genesisFrom.runtime.policy !== null) {
+        if (this.#policy.restore === undefined) {
+          throw new ProtocolVerificationError("The live fallback policy does not support deterministic continuation");
+        }
+        this.#policy.restore(this.#genesisFrom.runtime.policy, this.#policyRng);
+      }
+      this.#currentTick = this.#genesisTick;
+      this.#tickCompleted = true;
+    } else if (options.live?.genesisState !== undefined) {
+      throw new ProtocolVerificationError("Live epoch 0 has no inherited genesis state");
+    }
   }
 
   verifyNext(event: LabEvent, state: WorldState): void {
     if (this.#completed) this.#fail(event, "event follows run.completed");
     this.#assertEventPhase(event);
 
-    if (event.tick === 0 || !this.#started || this.#genesisAgentIndex < this.#genesisAgents.length) {
+    if (
+      event.tick === this.#genesisTick
+      || !this.#started
+      || this.#genesisAgentIndex < this.#genesisAgents.length
+    ) {
       if (this.#verifyGenesis(event)) return;
     }
-    if (event.tick === 0) this.#fail(event, "tick 0 is reserved for genesis");
+    if (event.tick <= this.#genesisTick) this.#fail(event, `tick ${this.#genesisTick} is reserved for genesis`);
     if (!this.#started || this.#genesisAgentIndex !== this.#genesisAgents.length) {
       this.#fail(event, "tick 1 cannot start before the complete genesis population");
     }
@@ -217,7 +316,9 @@ export class LabProtocolVerifier {
     if (event.type === "cognition.recorded") {
       // Recorded cognition is an input to the decision phase, not an outcome of
       // it: accept it here and let it steer the schedule regenerated below.
-      if (!this.#cognitive) this.#fail(event, "cognition.recorded requires a cognitive manifest");
+      if (!this.#cognitive && !this.#live) {
+        this.#fail(event, "cognition.recorded requires a cognitive manifest");
+      }
       if (this.#policyDecisions !== undefined) {
         this.#fail(event, "cognition must be recorded before the decision phase of its tick");
       }
@@ -369,11 +470,17 @@ export class LabProtocolVerifier {
   }
 
   #verifyGenesis(event: LabEvent): boolean {
-    if (event.tick !== 0 || event.phase !== "genesis") return false;
+    if (event.tick !== this.#genesisTick || event.phase !== "genesis") return false;
     if (!this.#started) {
       if (event.seq !== 1 || event.type !== "run.started") this.#fail(event, "run.started must be event 1");
       assertNoParticipants(event, this.#fail.bind(this));
-      assertExact(event.data, { treasury: this.config.treasuryResources }, event, this.#fail.bind(this), "run.started data");
+      // An inherited epoch restates the treasury it inherited and the parent
+      // it continues; both are pinned in `config.live.genesisFrom`, so the
+      // event cannot claim a parent or a grant of its own choosing.
+      const expected = this.#genesisFrom === undefined
+        ? { treasury: this.config.treasuryResources }
+        : { treasury: this.#inheritedTreasury!, inherited: inheritedGenesisOf(this.#genesisFrom) };
+      assertExact(event.data, expected, event, this.#fail.bind(this), "run.started data");
       this.#started = true;
       return true;
     }
@@ -391,7 +498,7 @@ export class LabProtocolVerifier {
   }
 
   #enterTick(event: LabEvent, state: WorldState): void {
-    if (this.#currentTick === 0) {
+    if (this.#currentTick === 0 && this.#genesisTick === 0) {
       if (event.tick !== 1) this.#fail(event, "logical ticks must start at 1");
       this.#startTick(1, state);
       return;
@@ -413,6 +520,7 @@ export class LabProtocolVerifier {
     this.#currentTick = tick;
     this.#lastPhaseRank = 0;
     this.#tickCompleted = false;
+    this.#boundaryExpiryExpected = undefined;
     this.#metricsSeen = false;
     this.#generatedExpected = undefined;
     this.#generatedIndex = 0;
@@ -453,6 +561,7 @@ export class LabProtocolVerifier {
     }
     if (rank >= PHASE_RANK.resolution) this.#ensurePolicySchedule(state);
     if (rank > PHASE_RANK.resolution) this.#finalizeResolution(event, state);
+    if (rank >= PHASE_RANK.upkeep) this.#ensureBoundaryExpiry(state);
   }
 
   #verifyPressure(event: LabEvent): void {
@@ -477,11 +586,38 @@ export class LabProtocolVerifier {
   }
 
   #verifyExpiry(event: LabEvent): void {
+    assertNoParticipants(event, this.#fail.bind(this));
+    if (event.phase === "upkeep") {
+      const expectedBoundaryId = this.#boundaryExpiryExpected?.shift();
+      if (expectedBoundaryId === undefined) this.#fail(event, "unexpected epoch-boundary task.expired event");
+      assertExact(
+        event.data,
+        { taskId: expectedBoundaryId, reason: "epoch_boundary" },
+        event,
+        this.#fail.bind(this),
+        "epoch-boundary task expiry data",
+      );
+      this.#oracles.delete(expectedBoundaryId);
+      return;
+    }
     const expectedId = this.#expiryExpected.shift();
     if (expectedId === undefined) this.#fail(event, "unexpected task.expired event");
-    assertNoParticipants(event, this.#fail.bind(this));
     assertExact(event.data, { taskId: expectedId }, event, this.#fail.bind(this), "task expiry data");
     this.#oracles.delete(expectedId);
+  }
+
+  /**
+   * The final upkeep's expiry sweep, regenerated from the state the upkeep
+   * phase begins with — the same pure rule the world applies.
+   */
+  #ensureBoundaryExpiry(state: WorldState): void {
+    if (!this.#live || this.#boundaryExpiryExpected !== undefined) return;
+    this.#boundaryExpiryExpected = epochBoundaryExpiries(
+      this.manifest,
+      this.config,
+      this.#currentTick,
+      state,
+    );
   }
 
   #ensureGenerated(state: WorldState): void {
@@ -490,7 +626,10 @@ export class LabProtocolVerifier {
       .filter((task) => task.status !== "completed" && task.status !== "expired").length;
     const capacity = Math.max(0, this.config.taskStream.maxBacklog - backlog);
     const scaled = safePpmMultiply(this.config.taskStream.tasksPerTick, state.physics.taskLoadPpm);
-    this.#generatedExpected = this.#tasks.generate(this.#currentTick, Math.min(capacity, scaled));
+    this.#generatedExpected = this.#tasks.generate(
+      this.#currentTick,
+      calibrationTaskCount(this.manifest, this.config, this.#currentTick, Math.min(capacity, scaled)),
+    );
   }
 
   #verifyGeneratedTask(event: LabEvent, state: WorldState): void {
@@ -992,6 +1131,9 @@ export class LabProtocolVerifier {
     assertExact(event.data, { tick: this.#currentTick }, event, this.#fail.bind(this), "tick.completed data");
     // Ensure task generation is finalized even when the tick has no task events.
     this.#finalizeSkippedPhases(PHASE_RANK.upkeep, event, state);
+    if (this.#boundaryExpiryExpected !== undefined && this.#boundaryExpiryExpected.length > 0) {
+      this.#fail(event, "epoch-boundary task expiry events are missing");
+    }
     this.#tickCompleted = true;
   }
 
@@ -1011,7 +1153,7 @@ export class LabProtocolVerifier {
   }
 
   #assertEventPhase(event: LabEvent): void {
-    const phases = EVENT_PHASES[event.type];
+    const phases = (this.#live ? LIVE_EVENT_PHASES : EVENT_PHASES)[event.type];
     if (phases === undefined || !phases.includes(event.phase)) {
       this.#fail(event, `${event.type} is not valid in phase ${event.phase}`);
     }

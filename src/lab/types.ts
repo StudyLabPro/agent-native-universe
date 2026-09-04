@@ -142,18 +142,72 @@ export interface LiveArchiveConfig {
 }
 
 /**
+ * How the inherited genesis state was derived from the parent's final state.
+ *
+ * `none` is the identity rule: the child inherits exactly what the parent
+ * ended with. Bounded-world compaction (phase L3c) adds further kinds here;
+ * because the rule is part of `genesisFrom` it is part of `configHash`, so a
+ * child can never silently inherit a differently-derived world.
+ */
+export type LiveCompaction = { kind: "none" };
+
+/**
  * Genesis of an inherited epoch: the parent epoch's final state, pinned by
  * hash so the child's `configHash` — and therefore its `runId` — is a pure
  * function of what the parent left on disk.
+ *
+ * `runtime` continues the parent's deterministic runtime (calibration task
+ * stream, policy, and — from phase L3b — the recorded-input cursors) instead
+ * of restarting it, so an open-ended universe has one continuous realization
+ * rather than one per epoch. It is pinned twice: by `runtimeHash` here and by
+ * the parent's own final checkpoint.
  */
 export interface LiveGenesisFrom {
   runId: string;
+  /** Engine that produced the parent epoch; a change requires `--accept-parent-engine`. */
+  engineVersion: string;
   tick: number;
   seq: number;
   eventHash: string;
   stateHash: string;
   runtimeHash: string;
   genesisStateHash: string;
+  runtime: CheckpointRuntimeState;
+  compaction: LiveCompaction;
+}
+
+/**
+ * `run.started{inherited}` payload of an epoch that continues another one.
+ * Every field is a hash or an absolute tick the verifier already holds in
+ * `config.live.genesisFrom`, so the event carries no unverifiable claim.
+ */
+export interface LiveInheritedGenesis {
+  parentRunId: string;
+  parentEventHash: string;
+  parentStateHash: string;
+  genesisStateHash: string;
+  startTick: number;
+}
+
+/**
+ * One entry of `<universe>/chain/<epoch>.json` — the epoch index of a live
+ * universe. It is an index, not a source of truth: every field is derivable
+ * by replaying the epochs themselves.
+ */
+export interface LiveChainLink {
+  schemaVersion: typeof LAB_SCHEMA_VERSION;
+  epoch: number;
+  universeId: string;
+  runId: string;
+  parentRunId?: string;
+  startTick: number;
+  ticks: number;
+  eventHash: string;
+  stateHash: string;
+  commitment: string;
+  parentCommitment?: string;
+  engineVersion: string;
+  cognitionId: string;
 }
 
 /**

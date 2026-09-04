@@ -5,6 +5,7 @@ import {
   LIVE_THINK_TIERS,
   PPM,
   isLabExperimentId,
+  type CheckpointRuntimeState,
   type GenesisConfig,
   type LiveConfig,
   type PrimitiveActionType,
@@ -150,6 +151,12 @@ export function validateGenesisConfig(config: GenesisConfig): void {
   for (const action of configuredActions) {
     if (!(PRIMITIVE_ACTIONS as readonly string[]).includes(action)) throw new Error(`Unknown action cost ${action}`);
   }
+  // A live universe takes its physics from recorded operator input
+  // (`physics/inbox.jsonl`, phase L3b), never from a config schedule, so an
+  // empty list is the honest default there. Every other experiment still
+  // carries exactly the four logical pressures.
+  const liveExperiment = config.experimentId === LAB_LIVE_EXPERIMENT_ID;
+  if (liveExperiment && config.pressures.length === 0) return assertResourceRanges(config);
   if (config.pressures.length !== PRESSURE_TYPES.size) {
     throw new Error(`pressures must contain exactly ${PRESSURE_TYPES.size} logical pressures`);
   }
@@ -169,6 +176,10 @@ export function validateGenesisConfig(config: GenesisConfig): void {
     if (!configuredPressures.has(type)) throw new Error(`Missing pressure type ${type}`);
   }
 
+  assertResourceRanges(config);
+}
+
+function assertResourceRanges(config: GenesisConfig): void {
   for (const resource of RESOURCE_KINDS) {
     const total = BigInt(config.initialResources[resource]) * BigInt(config.agents)
       + BigInt(config.treasuryResources[resource]);
@@ -179,6 +190,41 @@ export function validateGenesisConfig(config: GenesisConfig): void {
 }
 
 const SHA256_HEX = /^[a-f0-9]{64}$/;
+
+const GENESIS_FROM_FIELDS: readonly string[] = [
+  "runId", "engineVersion", "tick", "seq", "eventHash", "stateHash", "runtimeHash",
+  "genesisStateHash", "runtime", "compaction",
+];
+
+/**
+ * The parent's final `CheckpointRuntimeState`, carried in the config so the
+ * child continues the same deterministic streams. Only its shape is checked
+ * here; that it is the parent's own runtime is proven by `runtimeHash` and by
+ * the parent's checkpoint (`src/lab/live/epoch.ts`).
+ */
+function validateInheritedRuntime(runtime: CheckpointRuntimeState): void {
+  if (typeof runtime !== "object" || runtime === null) {
+    throw new Error("live.genesisFrom.runtime must be an object");
+  }
+  const taskStream = runtime.taskStream;
+  if (typeof taskStream !== "object" || taskStream === null) {
+    throw new Error("live.genesisFrom.runtime.taskStream must be an object");
+  }
+  nonNegativeInteger(taskStream.sequence, "live.genesisFrom.runtime.taskStream.sequence");
+  const rng = taskStream.rng;
+  if (typeof rng !== "object" || rng === null || rng.algorithm !== "xoshiro256**") {
+    throw new Error("live.genesisFrom.runtime.taskStream.rng must be a deterministic RNG checkpoint");
+  }
+  if (runtime.policy !== null && (typeof runtime.policy !== "object" || Array.isArray(runtime.policy))) {
+    throw new Error("live.genesisFrom.runtime.policy must be a policy checkpoint or null");
+  }
+  for (const key of Object.keys(runtime)) {
+    // `taskSource`/`pressureSource` cursors join this list in phase L3b.
+    if (!["taskStream", "policy"].includes(key)) {
+      throw new Error(`live.genesisFrom.runtime contains unknown field ${key}`);
+    }
+  }
+}
 
 export function validateLiveConfig(live: LiveConfig): void {
   if (typeof live !== "object" || live === null) throw new Error("live must be an object");
@@ -209,6 +255,13 @@ export function validateLiveConfig(live: LiveConfig): void {
     if (typeof from.runId !== "string" || !/^run-[a-f0-9]{32}$/.test(from.runId)) {
       throw new Error("live.genesisFrom.runId must be a run identifier");
     }
+    if (
+      typeof from.engineVersion !== "string"
+      || from.engineVersion.length === 0
+      || from.engineVersion.length > 128
+    ) {
+      throw new Error("live.genesisFrom.engineVersion must be a non-empty string of at most 128 characters");
+    }
     positiveInteger(from.tick, "live.genesisFrom.tick");
     positiveInteger(from.seq, "live.genesisFrom.seq");
     for (const field of ["eventHash", "stateHash", "runtimeHash", "genesisStateHash"] as const) {
@@ -216,8 +269,20 @@ export function validateLiveConfig(live: LiveConfig): void {
         throw new Error(`live.genesisFrom.${field} must be a lowercase SHA-256 digest`);
       }
     }
+    validateInheritedRuntime(from.runtime);
+    if (typeof from.compaction !== "object" || from.compaction === null) {
+      throw new Error("live.genesisFrom.compaction must be an object");
+    }
+    // Fail closed on a rule this build cannot apply: the inherited state would
+    // otherwise be trusted rather than re-derivable from the parent's.
+    if (from.compaction.kind !== "none") {
+      throw new Error(`Unsupported live.genesisFrom.compaction.kind ${String(from.compaction.kind)}`);
+    }
+    for (const key of Object.keys(from.compaction)) {
+      if (key !== "kind") throw new Error(`live.genesisFrom.compaction contains unknown field ${key}`);
+    }
     for (const key of Object.keys(from)) {
-      if (!["runId", "tick", "seq", "eventHash", "stateHash", "runtimeHash", "genesisStateHash"].includes(key)) {
+      if (!GENESIS_FROM_FIELDS.includes(key)) {
         throw new Error(`live.genesisFrom contains unknown field ${key}`);
       }
     }

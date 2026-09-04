@@ -1,0 +1,205 @@
+{
+  "schemaVersion": 1,
+  "experimentId": "genesis-live",
+  "seed": "genesis-live-u0001",
+  "ticks": 500,
+  "agents": 32,
+  "metricEvery": 10,
+  "checkpointEvery": 25,
+  "initialResources": {
+    "bandwidthBytes": 1000000,
+    "computeMs": 100000,
+    "credits": 1000,
+    "llmTokens": 200000,
+    "storageBytes": 1000000
+  },
+  "treasuryResources": {
+    "bandwidthBytes": 9984000000,
+    "computeMs": 96800000,
+    "credits": 168000,
+    "llmTokens": 168000000,
+    "storageBytes": 9984000000
+  },
+  "acceptedTaskReward": {
+    "bandwidthBytes": 0,
+    "computeMs": 0,
+    "credits": 5,
+    "llmTokens": 5000,
+    "storageBytes": 0
+  },
+  "costs": {
+    "claimTask": {
+      "bandwidthBytes": 64,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "clone": {
+      "bandwidthBytes": 0,
+      "computeMs": 750,
+      "credits": 750,
+      "llmTokens": 0,
+      "storageBytes": 4096
+    },
+    "connect": {
+      "bandwidthBytes": 128,
+      "computeMs": 2,
+      "credits": 3,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "disconnect": {
+      "bandwidthBytes": 64,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "execute": {
+      "bandwidthBytes": 0,
+      "computeMs": 12,
+      "credits": 3,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "merge": {
+      "bandwidthBytes": 128,
+      "computeMs": 500,
+      "credits": 500,
+      "llmTokens": 0,
+      "storageBytes": 2048
+    },
+    "observe": {
+      "bandwidthBytes": 64,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "publishCapability": {
+      "bandwidthBytes": 256,
+      "computeMs": 20,
+      "credits": 8,
+      "llmTokens": 0,
+      "storageBytes": 1024
+    },
+    "reason": {
+      "bandwidthBytes": 0,
+      "computeMs": 4,
+      "credits": 2,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "reserve": {
+      "bandwidthBytes": 0,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "retrieve": {
+      "bandwidthBytes": 0,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "send": {
+      "bandwidthBytes": 256,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "spawn": {
+      "bandwidthBytes": 0,
+      "computeMs": 1000,
+      "credits": 1000,
+      "llmTokens": 0,
+      "storageBytes": 4096
+    },
+    "store": {
+      "bandwidthBytes": 0,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 256
+    },
+    "submit": {
+      "bandwidthBytes": 256,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "trade": {
+      "bandwidthBytes": 128,
+      "computeMs": 2,
+      "credits": 2,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "transfer": {
+      "bandwidthBytes": 64,
+      "computeMs": 1,
+      "credits": 1,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "useCapability": {
+      "bandwidthBytes": 128,
+      "computeMs": 8,
+      "credits": 3,
+      "llmTokens": 0,
+      "storageBytes": 0
+    },
+    "verify": {
+      "bandwidthBytes": 64,
+      "computeMs": 6,
+      "credits": 2,
+      "llmTokens": 0,
+      "storageBytes": 0
+    }
+  },
+  "taskStream": {
+    "deadlineTicks": 60,
+    "families": [
+      "arithmetic",
+      "json_transform",
+      "memory_recall",
+      "correlation",
+      "verification",
+      "multi_step",
+      "concurrency",
+      "state_recovery"
+    ],
+    "maxBacklog": 256,
+    "tasksPerTick": 8
+  },
+  "pressures": [],
+  "live": {
+    "archive": {
+      "messageTicks": 100,
+      "submissionTicks": 200,
+      "taskTicks": 100
+    },
+    "epochTicks": 500,
+    "exhaustion": {
+      "graceTicks": 20,
+      "minThinkTokens": 1500
+    },
+    "fsyncEveryTick": true,
+    "tiers": {
+      "deliberate": {
+        "pricePpm": 8000000
+      },
+      "fast": {
+        "pricePpm": 1000000
+      },
+      "standard": {
+        "pricePpm": 3000000
+      }
+    }
+  }
+}

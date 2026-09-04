@@ -414,7 +414,14 @@ export class CohortPolicy implements LogicalPolicy {
    * so no second checkpoint format or resume path is needed for either.
    */
   constructor(cohort: CohortId, fallback: LogicalPolicy) {
-    this.id = `cohort-${cohort.toLowerCase()}-${fallback.id}`;
+    // Composition is idempotent. A fallback whose own identity is already the
+    // cohort-qualified literal a manifest requires — `LiveIdlePolicy`, whose
+    // id IS `cohort-c-live-idle-v1` (`LAB_LIVE_POLICY_ID`) — keeps it;
+    // re-prefixing would yield `cohort-c-cohort-c-…`, which no manifest can
+    // accept. Every scientific fallback (`neutral-backpressure-v1`, the three
+    // baselines) is unprefixed and is composed exactly as before.
+    const prefix = `cohort-${cohort.toLowerCase()}-`;
+    this.id = fallback.id.startsWith(prefix) ? fallback.id : `${prefix}${fallback.id}`;
     this.#fallback = fallback;
   }
 
