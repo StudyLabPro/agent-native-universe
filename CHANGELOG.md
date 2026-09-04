@@ -502,6 +502,52 @@ epoch chain — not by any test written against either repository alone.
   boundary; future major type upgrades must move the runtime, image, and CI
   contracts together.
 
+### Genesis-Live — phase L5a (MWS provisioning: infrastructure as code, not executed)
+
+- Authored the complete infrastructure-as-code for provisioning the permanent
+  live instance's MWS cloud footprint: `deploy/mws/provision.sh` (service
+  accounts and keys, empty Secret Manager containers, VPC network/subnet/
+  external address/firewall rules, the boot and evidence disks, the VM, the
+  image registry — in that order), `deploy/mws/cloud-init.yaml`, the
+  `anu-secrets` oneshot unit that reads three named secrets into a tmpfs at
+  container start, the daily `disk-backup` timer with 14-copy pruning, a
+  `restore-drill.sh` that exercises a real restore against a disposable
+  scratch VM, the `caddy/Caddyfile` reverse proxy, `scripts/live/build-push.sh`,
+  and the two Lab-side systemd templates (`anu-live-mirror.{service,timer}`,
+  `anu-live-tunnel@.service`) that this host will install once the VM exists.
+  None of it has been run: this phase's own transition condition requires the
+  owner to confirm the resource list and personally perform the secrets and
+  IAM role-binding steps first (the CLI has no role-binding command at all —
+  `mws iam role` is read-only). `provision.sh` and `restore-drill.sh` enforce
+  this in code, not only in prose: both refuse to proceed past their
+  confirmation banner without an explicit flag or an interactive `y`, and
+  neither reaches a mutating `mws` call before that gate.
+- The design's own reference commands needed three corrections, each found by
+  checking the real CLI and, in one case, by real (failed) API calls made
+  before this phase started: `mws <group> <resource> create --idempotency-key`
+  rejects a human-readable slug — MWS requires the value to parse as an actual
+  UUID, so every idempotency key here is a deterministic UUIDv5 derived from a
+  fixed namespace and the resource's own name. Firewall rule priorities from
+  the architecture document (100/105/110/65000) are outside the API's real
+  valid range `[1000-64535]`; the four rules keep their relative order at
+  1000/1005/1010/64535. `mws compute vm create` has no `--validate-only` flag
+  at all, unlike network/subnet/firewall-rule create, which do — the VM is
+  created directly, with the discrepancy documented in place rather than
+  silently worked around.
+- `anu lab replay --allow-incomplete-boundary`, referenced by the design for
+  the restore drill, does not exist on the real CLI (`REPLAY_OPTIONS` in
+  `src/lab/runner.ts` allows only `--data-dir`, `--experiment`, `--run-id`,
+  `--until-tick`, `--universe-id`). The underlying tolerance exists as a
+  library method (`ReplayEngine.replayRecoverableFile`,
+  `src/lab/replay.ts`) but is not wired to the CLI; `restore-drill.sh` calls
+  the real flags and documents the gap instead of inventing one.
+- `KEYS.md` records the key registry from the design's §7.3 (name, location,
+  expiry, rotation) and `RUNBOOK.md` records the IAM role-binding checklist,
+  the restore-drill narrative, key rotation, and what deactivating the
+  provider key actually does to a running universe (the L3c supervisor pauses
+  it at the next tick boundary via `--outage-ticks`, the same mechanism a
+  `SIGTERM` uses).
+
 ## [1.0.0] - 2026-08-19
 
 The first stable release establishes ANU as an executable agent-native runtime
