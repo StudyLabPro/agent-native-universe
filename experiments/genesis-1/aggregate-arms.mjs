@@ -59,6 +59,18 @@ for (const comparisonPath of process.argv.slice(2)) {
   })();
   const dataRoot = join(dirname(comparisonPath), "..", "..");
   for (const arm of arms) {
+    // Science isolation: only genesis-1 evidence may enter a readout. The
+    // Genesis-Live canary runs under mode "cognitive" as well, so the filter
+    // is on the experiment identity, never on the mode.
+    const manifest = JSON.parse(readFileSync(
+      join(dataRoot, arm.universeId, arm.runId, "manifest.json"),
+      "utf8",
+    ));
+    if (manifest.experimentId !== "genesis-1") {
+      throw new Error(
+        `${arm.universeId}/${arm.runId}: experiment ${manifest.experimentId} is not scientific evidence and cannot be aggregated`,
+      );
+    }
     const { expired, retired, w5 } = await scanEvents(
       join(dataRoot, arm.universeId, arm.runId, "events.jsonl"),
     );

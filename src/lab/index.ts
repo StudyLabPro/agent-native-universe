@@ -34,3 +34,4 @@ export * from "./genesis.js";
 export * from "./population.js";
 export * from "./observer.js";
 export * from "./gateway.js";
+export * from "./live/identity.js";

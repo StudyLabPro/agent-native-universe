@@ -168,6 +168,11 @@ export class LabProtocolVerifier {
 
   constructor(manifest: RunManifest, config: GenesisConfig) {
     assertReplayConfiguration(manifest, config);
+    // Fail closed rather than verify a live epoch as if it were logical: its
+    // recorded inputs (external tasks, verdicts, physics) are unknown here.
+    if (manifest.mode === "live") {
+      throw new ProtocolVerificationError("Live manifests are not verifiable by this engine build");
+    }
     this.manifest = structuredClone(manifest);
     this.config = structuredClone(config);
     this.#genesisAgents = createGenesisAgents(config);

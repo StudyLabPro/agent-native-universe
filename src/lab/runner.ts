@@ -35,12 +35,42 @@ import {
   runPopulation,
 } from "./population.js";
 import { ReplayEngine } from "./replay.js";
+import { LIVE_UNIVERSE_ID, assertCanaryUniverseId } from "./live/identity.js";
 import type { LogicalPolicy } from "./policy-schedule.js";
-import type { GenesisConfig, RunSummary } from "./types.js";
+import {
+  LAB_EXPERIMENT_IDS,
+  LAB_LIVE_CANARY_EXPERIMENT_ID,
+  LAB_LIVE_EXPERIMENT_ID,
+  LAB_SCIENCE_EXPERIMENT_ID,
+  isLabExperimentId,
+  type GenesisConfig,
+  type LabExperimentId,
+  type RunSummary,
+} from "./types.js";
 
 const DEFAULT_DATA_DIR = "runs";
-const DEFAULT_EXPERIMENT_ID = "genesis-1";
+const DEFAULT_EXPERIMENT_ID = LAB_SCIENCE_EXPERIMENT_ID;
 const DEFAULT_UNIVERSE_ID = "U0001";
+const DEFAULT_CANARY_UNIVERSE_ID = "U0901";
+
+/**
+ * Per-command experiment allowlist (design §4.A). The scientific instruments
+ * (`population`, `baselines`) accept only the scientific identity; the
+ * `genesis-1` command additionally accepts the engineering canary, but only
+ * on the cognitive cohort path (`--cohort B|C`, arm A); `live` accepts only
+ * `genesis-live`; the evidence readers accept every registered identity.
+ */
+const COMMAND_EXPERIMENTS: Readonly<Record<string, readonly LabExperimentId[]>> = Object.freeze({
+  run: [LAB_SCIENCE_EXPERIMENT_ID],
+  population: [LAB_SCIENCE_EXPERIMENT_ID],
+  baselines: [LAB_SCIENCE_EXPERIMENT_ID],
+  "genesis-1": [LAB_SCIENCE_EXPERIMENT_ID, LAB_LIVE_CANARY_EXPERIMENT_ID],
+  live: [LAB_LIVE_EXPERIMENT_ID],
+  replay: LAB_EXPERIMENT_IDS,
+  attest: LAB_EXPERIMENT_IDS,
+  "verify-attestation": LAB_EXPERIMENT_IDS,
+  serve: LAB_EXPERIMENT_IDS,
+});
 const DEFAULT_OBSERVER_HOST = "0.0.0.0";
 const DEFAULT_OBSERVER_PORT = 3_000;
 const MAX_PATH_BYTES = 4_096;
@@ -110,6 +140,13 @@ const VERIFY_ATTESTATION_OPTIONS = new Set([
   "expected",
 ]);
 const SERVE_OPTIONS = new Set(["auth-token-file", "data-dir", "host", "port"]);
+const LIVE_OPTIONS = new Set([
+  "config",
+  "data-dir",
+  "epoch-ticks",
+  "experiment",
+  "universe-id",
+]);
 const GATEWAY_OPTIONS = new Set([
   "audit", "api-key-env", "api-key-file", "auth-token-file", "host", "max-audit-bytes",
   "max-in-flight", "max-requests", "max-response-bytes", "max-total-tokens", "models", "port",
@@ -144,6 +181,7 @@ const HELP = {
     "genesis-1": "run one logical Genesis-1 universe",
     baselines: "run the §33 control arms on one seed and compare them",
     population: "run a bounded population of independent universes",
+    live: "run the Genesis-Live universe as a chain of attested epochs (not implemented in this build)",
     replay: "replay one universe from its append-only evidence",
     attest: "create or recover a deterministic final evidence attestation",
     "verify-attestation": "verify evidence and an externally published commitment",
@@ -206,6 +244,9 @@ export async function runLabCli(
       case "baselines":
         await executeBaselines(argv.slice(1), io);
         return 0;
+      case "live":
+        await executeLive(argv.slice(1), io);
+        return 0;
       case "replay":
         await executeReplay(argv.slice(1), io);
         return 0;
@@ -253,7 +294,7 @@ async function executePopulation(
     return;
   }
 
-  const config = await configuredGenesis(options.values);
+  const config = await configuredGenesis(options.values, invokedCommand);
   const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
   const universes = optionInteger(
     options.values,
@@ -309,12 +350,36 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
   }
 
   const arm = parseBaselineArm(options.values.get("arm"));
-  const config = applyBaselineArm(await configuredGenesis(options.values), arm);
+  const config = applyBaselineArm(await configuredGenesis(options.values, "genesis-1"), arm);
   const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
-  const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
+  const canary = config.experimentId === LAB_LIVE_CANARY_EXPERIMENT_ID;
+  const universeId = optionUniverseId(
+    options.values,
+    "universe-id",
+    canary ? DEFAULT_CANARY_UNIVERSE_ID : DEFAULT_UNIVERSE_ID,
+  );
+  // The canary is the cognitive cohort path under its own identity: it needs
+  // a model (--cohort B|C), it is never a logical arm, and its universes are
+  // numbered from U0901 so they can never be mistaken for a population member.
+  const cohortOption = options.values.get("cohort");
+  if (canary) {
+    if (cohortOption === undefined || cohortOption.toUpperCase() === "A") {
+      throw new CliUsageError(
+        `--experiment ${LAB_LIVE_CANARY_EXPERIMENT_ID} requires --cohort B or C; an engineering canary is never a logical arm`,
+      );
+    }
+    if (arm !== "A") {
+      throw new CliUsageError(`--experiment ${LAB_LIVE_CANARY_EXPERIMENT_ID} runs arm A only; control arms stay scientific`);
+    }
+    try {
+      assertCanaryUniverseId(universeId);
+    } catch (error) {
+      throw new CliUsageError(safeErrorMessage(error));
+    }
+  }
   const shutdown = installRunAbortController();
   try {
-    const cognition = await createCohortCognition(options.values.get("cohort"));
+    const cognition = await createCohortCognition(cohortOption);
     if (cognition !== undefined && arm !== "A") {
       throw new CliUsageError("--cohort applies to arm A only; a control arm that thinks with a model is not a control");
     }
@@ -424,7 +489,7 @@ async function executeBaselines(argv: readonly string[], io: LabCliIo): Promise<
     return;
   }
 
-  const config = await configuredGenesis(options.values);
+  const config = await configuredGenesis(options.values, "baselines");
   // Pin one task realization for the whole comparison: every arm faces
   // byte-identical tasks and oracles, so metric gaps are attributable to the
   // architecture rather than to each arm drawing its own task luck.
@@ -636,6 +701,53 @@ function positiveEnv(name: string, fallback: number): number {
   return value;
 }
 
+/**
+ * `anu lab live` — the Genesis-Live supervisor (design §4.H, phase L3). The
+ * command is registered in phase L0 so that its experiment allowlist is
+ * enforced from the first build that knows the identity; the supervisor
+ * itself is not part of this build and the command fails closed.
+ */
+async function executeLive(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, LIVE_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "live",
+      status: "ok",
+      usage: `anu lab live [--data-dir PATH] [--experiment ${LAB_LIVE_EXPERIMENT_ID}] [--universe-id ${LIVE_UNIVERSE_ID}] [--config PATH] [--epoch-ticks N]`,
+      notes: [
+        `Only experiment ${LAB_LIVE_EXPERIMENT_ID} may run live; the scientific track and the canary are refused.`,
+        "The live supervisor is not implemented in this build; the command exists so that its allowlist is enforced.",
+      ],
+    });
+    return;
+  }
+
+  const requested = options.values.get("experiment") ?? LAB_LIVE_EXPERIMENT_ID;
+  assertExperimentAllowed("live", requested);
+  const configPath = options.values.get("config");
+  if (configPath !== undefined) {
+    const config = await configuredGenesis(options.values, "live");
+    assertExperimentAllowed("live", config.experimentId);
+  }
+  optionUniverseId(options.values, "universe-id", LIVE_UNIVERSE_ID);
+  optionalInteger(options.values, "epoch-ticks", 1, MAX_TICKS);
+  throw new CliUsageError("anu lab live is not implemented in this build");
+}
+
+function assertExperimentAllowed(command: string, experimentId: string): void {
+  if (!isLabExperimentId(experimentId)) {
+    throw new CliUsageError(
+      `Unsupported experiment: ${experimentId}; registered experiments are ${LAB_EXPERIMENT_IDS.join(", ")}`,
+    );
+  }
+  const allowed = COMMAND_EXPERIMENTS[command];
+  if (allowed === undefined || !allowed.includes(experimentId)) {
+    throw new CliUsageError(
+      `Experiment ${experimentId} is not allowed for ${command}; allowed: ${(allowed ?? []).join(", ")}`,
+    );
+  }
+}
+
 async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<void> {
   const options = parseOptions(argv, REPLAY_OPTIONS);
   if (options.help) {
@@ -786,7 +898,10 @@ async function readSecretFile(path: string, label: string): Promise<string> {
   }
 }
 
-async function configuredGenesis(options: ReadonlyMap<string, string>): Promise<GenesisConfig> {
+async function configuredGenesis(
+  options: ReadonlyMap<string, string>,
+  command: string,
+): Promise<GenesisConfig> {
   const configPath = options.get("config");
   if (configPath !== undefined) await validateConfigPath(safePath(configPath, "config"));
   const config = await loadGenesisConfig(
@@ -794,11 +909,24 @@ async function configuredGenesis(options: ReadonlyMap<string, string>): Promise<
   );
 
   const requestedExperiment = options.get("experiment");
-  if (requestedExperiment !== undefined && requestedExperiment !== config.experimentId) {
-    throw new CliUsageError(
-      `--experiment ${requestedExperiment} does not match config experiment ${config.experimentId}`,
-    );
+  if (requestedExperiment !== undefined) {
+    assertExperimentAllowed(command, requestedExperiment);
+    if (requestedExperiment !== config.experimentId) {
+      // The canary borrows the genesis-1 physics under its own identity, so
+      // the built-in (or any genesis-1) config may be relabelled for it. Every
+      // other mismatch stays a refusal: an identity is never guessed.
+      const canaryRelabel = command === "genesis-1"
+        && config.experimentId === LAB_SCIENCE_EXPERIMENT_ID
+        && requestedExperiment === LAB_LIVE_CANARY_EXPERIMENT_ID;
+      if (!canaryRelabel) {
+        throw new CliUsageError(
+          `--experiment ${requestedExperiment} does not match config experiment ${config.experimentId}`,
+        );
+      }
+      config.experimentId = requestedExperiment;
+    }
   }
+  assertExperimentAllowed(command, config.experimentId);
 
   const agents = optionalInteger(options, "agents", 1, 10_000);
   const ticks = optionalInteger(options, "ticks", 1, MAX_TICKS);
@@ -912,10 +1040,13 @@ async function validateConfigPath(path: string): Promise<void> {
   }
 }
 
+/** Evidence readers accept every registered identity; an unregistered one is refused. */
 function optionExperiment(options: ReadonlyMap<string, string>): string {
   const experiment = options.get("experiment") ?? DEFAULT_EXPERIMENT_ID;
-  if (experiment !== DEFAULT_EXPERIMENT_ID) {
-    throw new CliUsageError(`Unsupported experiment: ${experiment}`);
+  if (!isLabExperimentId(experiment)) {
+    throw new CliUsageError(
+      `Unsupported experiment: ${experiment}; registered experiments are ${LAB_EXPERIMENT_IDS.join(", ")}`,
+    );
   }
   return experiment;
 }

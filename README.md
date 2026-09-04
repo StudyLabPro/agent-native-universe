@@ -234,6 +234,18 @@ node dist/lab/runner.js population \
 For a 2 GB runner limit, `--parallel 2` is a starting engineering estimate,
 not a completed live benchmark of 32 universes with 64 agents × 10,000 ticks.
 
+The lab registers exactly three experiment identities: `genesis-1` (the
+scientific track), `genesis-live` (the open-ended Genesis-Live universe,
+`mode: "live"`, engine `genesis-live-v1.0.0`) and `genesis-live-canary` (the
+cognitive cohort path under its own name, universes `U0901+`). The scientific
+instruments (`population`, `baselines`, the Pareto readout) accept only
+`genesis-1`; the scientific engines refuse live evidence fail-closed; and
+`npm run check:live-isolation` regenerates the five §33 logical runs against
+`experiments/genesis-1/expected/` on every pull request so that Genesis-Live
+can never change a scientific hash unnoticed. See
+[Genesis-Live](docs/GENESIS_LIVE.md) for the identities, the epoch model, the
+recorded-input rules and the honesty contract.
+
 See [Universe Lab](docs/UNIVERSE_LAB.md) for the scientific boundary, evidence
 model, commands, and current logical-v1.1 limitations. See
 [Lab deployment](docs/LAB_DEPLOYMENT.md) for the hardened Docker/Traefik stand.
@@ -287,7 +299,20 @@ import {
   CognitiveScheduler,
   ContinuousMetaAgentController,
 } from "agent-native-universe/autonomous";
+
+import {
+  LAB_EXPERIMENT_IDS,
+  LAB_LIVE_ENGINE_VERSION,
+  createLiveEpochManifest,
+} from "agent-native-universe/lab";
 ```
+
+`PersistentResourceEconomy`, `MeteredCognitiveLoop` and `CognitiveScheduler`
+(`src/v2/persistent-market.ts`, `src/v2/cognitive-loop.ts`) are **quarantined**:
+they remain exported and tested, but they are not a recommended path, and the
+Genesis-Live code under `src/lab/live/` is forbidden by CI from importing
+`src/v2/*`, `src/runtime/*` or `src/core/*` runtime code. The reasoning and the
+pending owner decision are in [Roadmap amendments](docs/ROADMAP_AMENDMENTS.md).
 
 ## Runtime laws, not prompt requests
 
@@ -326,6 +351,8 @@ docs/           architecture and operating semantics
 - [Network BFT](docs/NETWORK_BFT.md)
 - [Autonomous encrypted mesh](docs/AUTONOMOUS_MESH.md)
 - [ANU Observer](docs/OBSERVER.md)
+- [Genesis-Live](docs/GENESIS_LIVE.md)
+- [Roadmap amendments](docs/ROADMAP_AMENDMENTS.md)
 - [Security policy](SECURITY.md)
 - [Changelog](CHANGELOG.md)
 

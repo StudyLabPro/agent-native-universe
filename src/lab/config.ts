@@ -1,8 +1,12 @@
 import { readFile } from "node:fs/promises";
 import {
+  LAB_LIVE_EXPERIMENT_ID,
   LAB_SCHEMA_VERSION,
+  LIVE_THINK_TIERS,
   PPM,
+  isLabExperimentId,
   type GenesisConfig,
+  type LiveConfig,
   type PrimitiveActionType,
   type ResourceVector,
   type TaskFamily,
@@ -104,7 +108,15 @@ export async function loadGenesisConfig(path?: string): Promise<GenesisConfig> {
 
 export function validateGenesisConfig(config: GenesisConfig): void {
   if (config.schemaVersion !== LAB_SCHEMA_VERSION) throw new Error(`Unsupported lab schema ${config.schemaVersion}`);
-  if (config.experimentId !== "genesis-1") throw new Error(`Unsupported experiment ${config.experimentId}`);
+  if (!isLabExperimentId(config.experimentId)) throw new Error(`Unsupported experiment ${config.experimentId}`);
+  // Live physics exist exactly for genesis-live. A scientific or canary config
+  // carrying them would put live parameters into a genesis-1 configHash.
+  if (config.experimentId === LAB_LIVE_EXPERIMENT_ID) {
+    if (config.live === undefined) throw new Error(`Experiment ${LAB_LIVE_EXPERIMENT_ID} requires a live section`);
+    validateLiveConfig(config.live);
+  } else if (config.live !== undefined) {
+    throw new Error(`Experiment ${config.experimentId} must not carry a live section`);
+  }
   if (!config.seed.trim()) throw new Error("Genesis seed must not be empty");
   positiveInteger(config.ticks, "ticks");
   positiveInteger(config.agents, "agents");
@@ -162,6 +174,57 @@ export function validateGenesisConfig(config: GenesisConfig): void {
       + BigInt(config.treasuryResources[resource]);
     if (total > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error(`total ${resource} exceeds the safe-integer range`);
+    }
+  }
+}
+
+const SHA256_HEX = /^[a-f0-9]{64}$/;
+
+export function validateLiveConfig(live: LiveConfig): void {
+  if (typeof live !== "object" || live === null) throw new Error("live must be an object");
+  positiveInteger(live.epochTicks, "live.epochTicks");
+  if (typeof live.tiers !== "object" || live.tiers === null) throw new Error("live.tiers must be an object");
+  for (const tier of LIVE_THINK_TIERS) {
+    const physics = live.tiers[tier];
+    if (typeof physics !== "object" || physics === null) throw new Error(`Missing live tier ${tier}`);
+    positiveInteger(physics.pricePpm, `live.tiers.${tier}.pricePpm`);
+    for (const key of Object.keys(physics)) {
+      if (key !== "pricePpm") throw new Error(`live.tiers.${tier} contains unknown field ${key}`);
+    }
+  }
+  for (const tier of Object.keys(live.tiers)) {
+    if (!(LIVE_THINK_TIERS as readonly string[]).includes(tier)) throw new Error(`Unknown live tier ${tier}`);
+  }
+  if (typeof live.exhaustion !== "object" || live.exhaustion === null) throw new Error("live.exhaustion must be an object");
+  nonNegativeInteger(live.exhaustion.minThinkTokens, "live.exhaustion.minThinkTokens");
+  positiveInteger(live.exhaustion.graceTicks, "live.exhaustion.graceTicks");
+  if (typeof live.archive !== "object" || live.archive === null) throw new Error("live.archive must be an object");
+  positiveInteger(live.archive.taskTicks, "live.archive.taskTicks");
+  positiveInteger(live.archive.messageTicks, "live.archive.messageTicks");
+  positiveInteger(live.archive.submissionTicks, "live.archive.submissionTicks");
+  if (typeof live.fsyncEveryTick !== "boolean") throw new Error("live.fsyncEveryTick must be a boolean");
+  if (live.genesisFrom !== undefined) {
+    const from = live.genesisFrom;
+    if (typeof from !== "object" || from === null) throw new Error("live.genesisFrom must be an object");
+    if (typeof from.runId !== "string" || !/^run-[a-f0-9]{32}$/.test(from.runId)) {
+      throw new Error("live.genesisFrom.runId must be a run identifier");
+    }
+    positiveInteger(from.tick, "live.genesisFrom.tick");
+    positiveInteger(from.seq, "live.genesisFrom.seq");
+    for (const field of ["eventHash", "stateHash", "runtimeHash", "genesisStateHash"] as const) {
+      if (typeof from[field] !== "string" || !SHA256_HEX.test(from[field])) {
+        throw new Error(`live.genesisFrom.${field} must be a lowercase SHA-256 digest`);
+      }
+    }
+    for (const key of Object.keys(from)) {
+      if (!["runId", "tick", "seq", "eventHash", "stateHash", "runtimeHash", "genesisStateHash"].includes(key)) {
+        throw new Error(`live.genesisFrom contains unknown field ${key}`);
+      }
+    }
+  }
+  for (const key of Object.keys(live)) {
+    if (!["epochTicks", "tiers", "exhaustion", "archive", "fsyncEveryTick", "genesisFrom"].includes(key)) {
+      throw new Error(`live contains unknown field ${key}`);
     }
   }
 }

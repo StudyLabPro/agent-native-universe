@@ -4,6 +4,44 @@ import type { ParetoAnalysis } from "./pareto.js";
 export const LAB_SCHEMA_VERSION = 1 as const;
 export const PPM = 1_000_000;
 
+/**
+ * Every experiment identity the lab may write evidence under. The list is the
+ * authority for `GenesisConfig.experimentId`, for the per-command allowlist of
+ * the CLI and for the evidence directory `<dataRoot>/<experimentId>/`.
+ *
+ * - `genesis-1`: the deterministic scientific track (logical arms, cognitive
+ *   cohorts, populations, baselines). Only this identity is science.
+ * - `genesis-live`: the open-ended Genesis-Live universe (`mode: "live"`,
+ *   engine `genesis-live-v1.0.0`). Never an arm, never a baseline.
+ * - `genesis-live-canary`: the engineering First Light canary — the genesis-1
+ *   cohort path (`--cohort B|C`) run under its own identity so that its
+ *   evidence can never be aggregated with the scientific track.
+ */
+export const LAB_EXPERIMENT_IDS = Object.freeze([
+  "genesis-1",
+  "genesis-live",
+  "genesis-live-canary",
+] as const);
+export type LabExperimentId = (typeof LAB_EXPERIMENT_IDS)[number];
+/** The only experiment identity whose evidence is scientific. */
+export const LAB_SCIENCE_EXPERIMENT_ID: LabExperimentId = "genesis-1";
+export const LAB_LIVE_EXPERIMENT_ID: LabExperimentId = "genesis-live";
+export const LAB_LIVE_CANARY_EXPERIMENT_ID: LabExperimentId = "genesis-live-canary";
+
+export function isLabExperimentId(value: unknown): value is LabExperimentId {
+  return typeof value === "string" && (LAB_EXPERIMENT_IDS as readonly string[]).includes(value);
+}
+
+/**
+ * `logical` runs regenerate their own decision stream from the seed.
+ * `cognitive` runs cannot: a model answered, so replay reads the recorded
+ * answers back instead of re-deriving them.
+ * `live` runs are Genesis-Live epochs: every non-seed input (model answers,
+ * external tasks, verdicts, operator physics) enters the chain as a recorded
+ * input. Only the `genesis-live` experiment may use this mode.
+ */
+export type LabRunMode = "logical" | "cognitive" | "live";
+
 export type PrimitiveActionType =
   | "observe"
   | "reason"
@@ -50,6 +88,15 @@ export type TaskFamily =
   | "concurrency"
   | "state_recovery";
 
+/**
+ * Live-only task family for tasks that enter the world from a recorded
+ * external source. It is deliberately NOT a `TaskFamily`: the frozen list of
+ * eight families in `config.ts`/`metrics.ts` is part of the scientific
+ * measurement (specialization is computed over exactly those eight), and the
+ * literal must never appear in a non-live world state.
+ */
+export type LiveTaskFamily = TaskFamily | "external";
+
 export type TaskStatus = "available" | "claimed" | "submitted" | "completed" | "expired";
 
 export interface TaskStreamConfig {
@@ -72,9 +119,63 @@ export type PressureSpec =
   | { tick: number; type: "retire_agent_fraction"; fractionPpm: number }
   | { tick: number; type: "task_load_multiplier"; multiplierPpm: number };
 
+export type LiveThinkTier = "fast" | "standard" | "deliberate";
+export const LIVE_THINK_TIERS = Object.freeze(["fast", "standard", "deliberate"] as const);
+
+/** World price of one thinking tier: `llmTokens` charged per metered token, in ppm. */
+export interface LiveTierPhysics {
+  pricePpm: number;
+}
+
+export interface LiveExhaustionConfig {
+  /** An agent below this `llmTokens` balance can no longer think. */
+  minThinkTokens: number;
+  /** Consecutive ticks of starvation (without a claimed task) before retirement. */
+  graceTicks: number;
+}
+
+/** Archive windows, in ticks, after which settled records leave the live state. */
+export interface LiveArchiveConfig {
+  taskTicks: number;
+  messageTicks: number;
+  submissionTicks: number;
+}
+
+/**
+ * Genesis of an inherited epoch: the parent epoch's final state, pinned by
+ * hash so the child's `configHash` — and therefore its `runId` — is a pure
+ * function of what the parent left on disk.
+ */
+export interface LiveGenesisFrom {
+  runId: string;
+  tick: number;
+  seq: number;
+  eventHash: string;
+  stateHash: string;
+  runtimeHash: string;
+  genesisStateHash: string;
+}
+
+/**
+ * Genesis-Live physics. Present exactly when `experimentId` is `genesis-live`;
+ * it is part of the config and therefore of `configHash` and `runId`.
+ * Model names are never here: the model layer is the cognition port's
+ * identity (`cognitionId`), and the control plane only sets prices.
+ */
+export interface LiveConfig {
+  /** Ticks per epoch; `ticks` of epoch k equals `genesisFrom.tick + epochTicks`. */
+  epochTicks: number;
+  tiers: Record<LiveThinkTier, LiveTierPhysics>;
+  exhaustion: LiveExhaustionConfig;
+  archive: LiveArchiveConfig;
+  /** Fsync the event log at every `tick.completed` (only tick boundaries are durable). */
+  fsyncEveryTick: boolean;
+  genesisFrom?: LiveGenesisFrom;
+}
+
 export interface GenesisConfig {
   schemaVersion: typeof LAB_SCHEMA_VERSION;
-  experimentId: "genesis-1";
+  experimentId: LabExperimentId;
   seed: string;
   ticks: number;
   agents: number;
@@ -86,18 +187,16 @@ export interface GenesisConfig {
   costs: Record<PrimitiveActionType, ResourceVector>;
   taskStream: TaskStreamConfig;
   pressures: PressureSpec[];
+  /** Genesis-Live physics; validated and permitted only for `genesis-live`. */
+  live?: LiveConfig;
 }
 
 export interface RunManifest {
   schemaVersion: typeof LAB_SCHEMA_VERSION;
   experimentId: string;
   engineVersion: string;
-  /**
-   * `logical` runs regenerate their own decision stream from the seed.
-   * `cognitive` runs cannot: a model answered, so replay reads the recorded
-   * answers back instead of re-deriving them.
-   */
-  mode: "logical" | "cognitive";
+  /** See {@link LabRunMode}. */
+  mode: LabRunMode;
   policyId: string;
   taskGeneratorId: string;
   /**
@@ -261,6 +360,25 @@ export interface WorldState {
   resourceSpent: ResourceVector;
   metrics: MetricsSnapshot[];
   completed: boolean;
+  /**
+   * stateHash discipline (Genesis-Live): `stateHash = hashValue(state)` and
+   * checkpoints are verified against it, so any field present in a non-live
+   * state would silently change every scientific hash without an engine bump.
+   * The two fields below are therefore optional and are set ONLY by the live
+   * genesis of a `mode: "live"` manifest; `initialWorldState` of a logical or
+   * cognitive manifest never emits them, and the CI guard proves it.
+   */
+  mode?: "live";
+  counters?: LiveWorldCounters;
+}
+
+/** Bounded-world counters kept only in live states (see `WorldState.mode`). */
+export interface LiveWorldCounters {
+  tasksCreated: number;
+  tasksCompleted: number;
+  submissions: number;
+  acceptedTasks: number;
+  externalTasks: number;
 }
 
 export interface TaskObservation {

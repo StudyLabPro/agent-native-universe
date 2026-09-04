@@ -5,6 +5,40 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Genesis-Live — phase L0 (identity and science isolation)
+
+- Registered the complete experiment registry `LAB_EXPERIMENT_IDS`
+  (`genesis-1`, `genesis-live`, `genesis-live-canary`) and the Genesis-Live
+  identity: `mode: "live"`, engine `genesis-live-v1.0.0`, policy literal
+  `cohort-c-live-idle-v1` (accepted only in live mode), task source
+  `live-task-source-v1`, `GenesisConfig.live` physics validated only for
+  `genesis-live`. Experiment and mode imply each other; the canary is the
+  cognitive cohort path under its own name and is never a logical arm.
+- Every projector of this build (`assertLabManifestImplementation`,
+  `ReplayEngine`, `LabProtocolVerifier`, `LogicalUniverse`) refuses a live
+  manifest fail-closed; the live engine arrives in a later phase.
+- Per-command experiment allowlist in `anu lab`: `population`/`run`/`baselines`
+  accept only `genesis-1`; `genesis-1` additionally accepts
+  `genesis-live-canary` with `--cohort B|C`, arm A and universes `U0901+`;
+  the new `live` command accepts only `genesis-live` and fails closed as
+  "not implemented in this build"; evidence readers accept every registered
+  id. `runPopulation` and `aggregate-arms.mjs` refuse non-scientific evidence.
+- `stateHash` discipline: `WorldState.mode?`/`counters?` are optional and
+  absent in non-live states; `external` is a live-only literal outside the
+  frozen task families. Logical genesis is byte-identical to the committed
+  canonical fixtures.
+- Added `experiments/genesis-1/expected/U000{1..5}.json` (the §33 arms on the
+  default seed, 600- and 200-tick readouts, verified against the original
+  evidence) and the science guard `npm run check:live-isolation`
+  (`.github/scripts/check-live-isolation.mjs`: import graph, canonical
+  fixtures, task families, live-manifest refusal, CLI allowlist, deterministic
+  regeneration of the five runs). It runs in the PR gate and in `npm run check`.
+- Documented Genesis-Live (`docs/GENESIS_LIVE.md`), the roadmap amendments
+  (`docs/ROADMAP_AMENDMENTS.md`: P0 quarantine instead of deletion for the v2
+  cognitive loop and persistent market), and fixed `docs/NETWORK_BFT.md`,
+  which described a class, a certificate file and a catch-up protocol that do
+  not exist.
+
 ### Controlled LLM egress
 
 - Added a dependency-free OpenAI-compatible gateway and `anu lab gateway` CLI

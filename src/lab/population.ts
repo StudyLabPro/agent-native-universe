@@ -29,6 +29,7 @@ import {
 } from "./manifest.js";
 import {
   LAB_SCHEMA_VERSION,
+  LAB_SCIENCE_EXPERIMENT_ID,
   type GenesisConfig,
   type PopulationSummary,
   type RunSummary,
@@ -93,6 +94,14 @@ export class PopulationRunPausedError extends Error {
  */
 export async function runPopulation(options: PopulationRunOptions): Promise<PopulationSummary> {
   validateGenesisConfig(options.config);
+  // Populations are a scientific instrument. Genesis-Live and its canary have
+  // their own identities precisely so that they never become a universe of
+  // the population and never enter a Pareto readout.
+  if (options.config.experimentId !== LAB_SCIENCE_EXPERIMENT_ID) {
+    throw new Error(
+      `Population runs are reserved for experiment ${LAB_SCIENCE_EXPERIMENT_ID}; got ${options.config.experimentId}`,
+    );
+  }
   assertPositiveBoundedInteger(options.universes, MAX_POPULATION_UNIVERSES, "universes");
   if (!options.runsRoot) throw new TypeError("Population runs root must not be empty");
 

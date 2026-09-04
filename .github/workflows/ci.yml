@@ -70,6 +70,10 @@ jobs:
         if: ${{ steps.scope.outputs.runtime == 'true' }}
         run: npm test
 
+      - name: Guard the scientific track against Genesis-Live
+        if: ${{ steps.scope.outputs.runtime == 'true' }}
+        run: npm run check:live-isolation
+
       - name: Record the path-aware decision
         if: ${{ steps.scope.outputs.runtime != 'true' && steps.scope.outputs.container != 'true' }}
         run: echo "Runtime and container validation are not required for this path set."
