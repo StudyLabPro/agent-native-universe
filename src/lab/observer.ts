@@ -1678,7 +1678,23 @@ async function projectRunState(
   let checkpointSeq: number;
   let lastEventHash: string;
   if (latestCheckpointTick === null) {
-    state = initialWorldState(manifest);
+    // A live epoch inherited from a parent starts from the parent's final
+    // state, written verbatim to genesis.json by the engine itself
+    // (EvidenceStore.writeGenesisState) before this run's first event. A
+    // scientific or first-ever-epoch run carries no such file.
+    const rawGenesisState = await readOptionalJsonArtifact(record.directory, "genesis.json", root);
+    let genesisState: WorldState | undefined;
+    if (rawGenesisState !== null) {
+      if (
+        rawGenesisState.schemaVersion !== LAB_SCHEMA_VERSION
+        || rawGenesisState.runId !== manifest.runId
+        || rawGenesisState.universeId !== manifest.universeId
+      ) {
+        throw new ObserverHttpError(422, "invalid_artifact");
+      }
+      genesisState = rawGenesisState as unknown as WorldState;
+    }
+    state = initialWorldState(manifest, genesisState);
     checkpointSeq = 0;
     lastEventHash = initialEventHash(manifest);
   } else {

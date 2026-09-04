@@ -203,6 +203,73 @@ test("observer state and head routes fail closed on missing runs and oversized c
   assert.deepEqual(await responseTooLarge.json(), { error: "state_too_large" });
 });
 
+test("observer projects an inherited epoch's genesis state before its first checkpoint exists", async (t) => {
+  // A live epoch chained from a parent starts from the parent's final state,
+  // which the engine writes verbatim to genesis.json (EvidenceStore.
+  // writeGenesisState) before the run's first event. Between that moment and
+  // the run's first periodic checkpoint, projectRunState's only source for
+  // the starting state is this file — a regression here previously called
+  // initialWorldState(manifest) with no genesis state at all, silently
+  // discarding every inherited agent for the whole width of that window.
+  const dataDir = await mkdtemp(join(tmpdir(), "anu-observer-live-inherited-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+
+  const runDirectory = join(dataDir, "genesis-live", "U0001", "epoch-1-inherited-run");
+  await mkdir(runDirectory, { recursive: true });
+  await writeJson(join(runDirectory, "manifest.json"), {
+    schemaVersion: 1,
+    experimentId: "genesis-live",
+    engineVersion: "genesis-live-v1.0.0",
+    mode: "live",
+    policyId: "cohort-c-live-idle-v1",
+    taskGeneratorId: "live-task-source-v1",
+    runId: "epoch-1-inherited-run",
+    universeId: "U0001",
+    seed: "genesis-live-u0001",
+    configHash: "0".repeat(64),
+  });
+  const genesisState = {
+    schemaVersion: 1,
+    runId: "epoch-1-inherited-run",
+    universeId: "U0001",
+    configHash: "0".repeat(64),
+    seed: "genesis-live-u0001",
+    tick: 12,
+    started: true,
+    completed: true,
+    mode: "live",
+    counters: { externalTasks: 0 },
+    agents: {
+      N0001: { id: "N0001", active: true, generation: 0, actionCounts: {}, taskCounts: {} },
+    },
+    links: {},
+    tasks: {},
+    submissions: {},
+    submissionOrder: [],
+    verifications: {},
+    messages: {},
+    capabilities: {},
+    capabilityInvocations: {},
+    physics: { gravityPpm: 0, frictionPpm: 0, noisePpm: 0 },
+    treasury: { bandwidthBytes: 0, computeMs: 0, credits: 0, llmTokens: 0, storageBytes: 0 },
+    resourceSpent: { bandwidthBytes: 0, computeMs: 0, credits: 0, llmTokens: 0, storageBytes: 0 },
+    metrics: [],
+  };
+  await writeJson(join(runDirectory, "genesis.json"), genesisState);
+  await writeFile(join(runDirectory, "events.jsonl"), "", "utf8");
+
+  const baseUrl = await startFixture(t, dataDir);
+  const response = await fetch(`${baseUrl}/api/runs/epoch-1-inherited-run/state`);
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.tick, 12);
+  assert.equal(body.seq, 0);
+  // The point of the fix: the inherited agent survives into the projection.
+  assert.deepEqual(Object.keys(body.state.agents), ["N0001"]);
+  assert.equal(body.state.agents.N0001.active, true);
+  assert.equal(body.state.tick, 12);
+});
+
 test("observer live head, /api/runs/:id/head and /api/runs/:id/state require Bearer auth when configured", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "anu-observer-live-auth-"));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
