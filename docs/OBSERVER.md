@@ -58,15 +58,64 @@ All routes are GET only and reject request bodies.
 | /api | No | Machine-readable service and link contract |
 | /healthz | No | Process liveness |
 | /readyz | No | Evidence-volume readiness |
+| /api/live | Conditional | Universe head for the live experiment (`genesis-live`/`U0001`) |
 | /api/runs | Conditional | Bounded run catalogue |
 | /api/runs/:runId | Conditional | Manifest, summary, and attestation |
 | /api/runs/:runId/metrics | Conditional | Bounded validated metric history |
 | /api/runs/:runId/events?after=N&limit=N | Conditional | Cursor-paginated redacted events |
+| /api/runs/:runId/head | Conditional | Stat-based head: last seq/tick, event bytes, latest checkpoint tick, completed |
+| /api/runs/:runId/state | Conditional | WorldState projected from the latest checkpoint plus the event tail |
 
 Metric history is limited to 8 MiB per Observer response. Oversized history is
 rejected with 413 artifact_too_large; the underlying evidence verifier retains
 its separately documented 64 MiB validation boundary. Event pages allow at most
 1,000 records and 4 MiB of response data.
+
+### Live universe head (`/api/live`)
+
+`/api/live` reports the head of the single live universe (`genesis-live`
+experiment, universe `U0001`) as
+`{experimentId, universeId, currentRunId, epoch, head:{lastSeq,lastTick},
+boundary, cognitionHealth:{window,consulted,unavailable,starved}, chain}`.
+`chain` is read from the universe's `chain/*.json` index (one entry per
+completed epoch: `{epoch, runId, commitment, engineVersion, anchoredAt}`), with
+`anchoredAt` merged in from `anchors/<epoch>.json` when that anchor has been
+recorded. `cognitionHealth` tallies `cognition.recorded` events by
+`data.provider` (`unavailable`/`starved` vs. every other value, counted as
+`consulted`) over the trailing 50 ticks of the head run.
+
+Neither `chain/` nor `anchors/` need exist yet — the live engine that writes
+them is a later phase. Every field on this route degrades to `null`, `false`,
+or zero instead of failing: an unstarted universe, a run mid-epoch-boundary
+(the current epoch has a `summary.json` but is not yet in `chain/`), or an
+unreadable head run all produce a well-formed, empty-ish response rather than
+an error. Run discovery (here and everywhere else) skips the reserved live
+directory names `chain`, `anchors`, `tasks`, `verdicts`, and `physics` so a
+growing epoch index never counts against the catalogue's scan bounds and is
+never mistaken for a run.
+
+### Run head and state (`/api/runs/:runId/head`, `/api/runs/:runId/state`)
+
+`/head` is stat-based: `lastSeq`/`lastTick` come from the final line of
+`events.jsonl` (a bounded tail read, not a full scan), `eventsBytes` from a
+single `stat`, `latestCheckpointTick` from the `checkpoints/` directory's
+filenames (no checkpoint file is opened), and `completed` from whether
+`summary.json` exists.
+
+`/state` projects a `WorldState` from the latest checkpoint (or, absent one,
+from genesis) plus every event after it, applied with the same reducer
+(`applyWorldEventMutable`) evidence and replay use. The checkpoint read is
+capped at 8 MiB (413 artifact_too_large beyond that); the final redacted
+response is capped at 4 MiB, matching `/events` (413 state_too_large beyond
+that). The response is otherwise redacted exactly like every other route.
+
+### Conditional requests
+
+`/api/runs/:runId/events`, `/head`, and `/state` return an `ETag` derived from
+the run's `events.jsonl` identity (device, inode, size, and both timestamps —
+never its content). A matching `If-None-Match` short-circuits to `304` before
+any scan or projection work. The ETag is intentionally shared across all three
+routes for one run: if the event log has not changed, none of them have.
 
 ## Response security
 
