@@ -1,0 +1,99 @@
+#cloud-config
+# deploy/mws/cloud-init.yaml — первичная настройка VM anu-live-1 (фаза L5a,
+# docs/GENESIS_LIVE.md §7.2). Передаётся через
+# `mws compute vm create --os-metadata-attributes @deploy/mws/cloud-init.yaml`
+# (см. provision.sh — точный формат этого флага для MWS не подтверждён
+# реальным запуском, см. TODO в provision.sh и §8 GENESIS_LIVE.md).
+#
+# Что этот файл делает:
+#   1. Заводит системного пользователя uid 1000 (`anu`), под которым бегает
+#      контейнерный движок, читает секреты из tmpfs и владеет evidence-диском.
+#   2. Устанавливает Docker Engine + docker compose plugin.
+#   3. Форматирует и монтирует диск anu-live-evidence-01 в /var/lib/anu-live
+#      (ext4, noatime, uid 1000 — ровно то, что проверяет критерий
+#      завершения L5a: `mws compute vm list -f json` показывает READY
+#      с data-диском на /var/lib/anu-live).
+#   4. Включает (но не наполняет реальным содержимым) anu-secrets.service —
+#      его отдельно копирует владелец вручную вместе с authorized key
+#      профиля `mws` (см. TODO ниже и deploy/mws/anu-secrets.service).
+#
+# Что этот файл НЕ делает — и не должен делать:
+#   - Не устанавливает приватный ключ профиля `mws`. Это ручной шаг
+#     владельца (§7.3): файл 0600, владелец root, путь
+#     /root/.config/mws/profile/anu-live.yaml (или иное имя профиля по
+#     выбору владельца) — устанавливается ПОСЛЕ того, как
+#     `mws iam authorized-key create` вернул приватную часть ключа
+#     (provision.sh её никуда не сохраняет и не логирует).
+#   - Не содержит значений секретов — anu-secrets.service их читает из
+#     Secret Manager при каждом запуске, а не при cloud-init.
+
+users:
+  - name: anu
+    uid: "1000"
+    system: false
+    shell: /usr/sbin/nologin
+    lock_passwd: true
+    groups: [docker]
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - e2fsprogs
+
+write_files:
+  # TODO (владелец, ручной шаг): скопировать сюда приватную часть
+  # authorized key SA anu-live, возвращённую
+  # `mws iam authorized-key create .../authorizedKeys/vm-anu-live-1` —
+  # ПОСЛЕ создания ключа (provision.sh, раздел IAM), НЕ через cloud-init.
+  # Ожидаемый путь и права: /root/.config/mws/profile/default.yaml,
+  # владелец root, режим 0600. Проверка после установки:
+  # `mws iam service-account get iam/projects/project-vxgxs2/serviceAccounts/anu-live`
+  # с этой VM должен отработать без ошибок авторизации.
+  - path: /etc/anu-live/PLACEHOLDER-mws-profile-installed-by-owner.txt
+    permissions: "0644"
+    content: |
+      Профиль `mws` на этой VM устанавливает владелец вручную (§7.3).
+      Этот файл — просто маркер места в дереве конфигурации; секретов не содержит.
+
+runcmd:
+  # --- Docker Engine + compose plugin (официальный репозиторий Docker) ---
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  - >-
+    echo
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc]
+    https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable"
+    > /etc/apt/sources.list.d/docker.list
+  - apt-get update -y
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - systemctl enable --now docker
+
+  # --- Evidence-диск: форматирование и монтирование в /var/lib/anu-live ---
+  # Устройство подключено как secondary storage-disk (deviceName: evidence,
+  # см. provision.sh) — реальный путь устройства (/dev/vdb, /dev/sdb, ...)
+  # подтверждается на самой VM (`lsblk`) при первом реальном запуске;
+  # используем /dev/disk/by-id, если MWS его публикует, иначе фиксируем
+  # путь здесь по факту первого запуска (см. §8 GENESIS_LIVE.md).
+  - test -b /dev/disk/by-id/virtio-anu-live-evidence-01 && EVIDENCE_DEV=/dev/disk/by-id/virtio-anu-live-evidence-01 || EVIDENCE_DEV=/dev/vdb
+  - blkid "$EVIDENCE_DEV" || mkfs.ext4 -L anu-live-evidence "$EVIDENCE_DEV"
+  - install -d -m 0755 -o 1000 -g 1000 /var/lib/anu-live
+  - >-
+    grep -q anu-live-evidence /etc/fstab ||
+    echo "LABEL=anu-live-evidence /var/lib/anu-live ext4 defaults,noatime 0 2" >> /etc/fstab
+  - mount /var/lib/anu-live
+  - chown 1000:1000 /var/lib/anu-live
+
+  # --- tmpfs для секретов (anu-secrets.service монтирует поверх /run/anu) ---
+  - install -d -m 0700 -o root -g root /run/anu
+
+  # --- anu-secrets.service включается, но НЕ запускается здесь: ему нужен
+  #     установленный владельцем профиль `mws` (см. TODO выше). Юнит и
+  #     скрипт копируются владельцем вместе с профилем; `enable` без
+  #     `start` не создаёт риска ошибочного старта до готовности профиля.
+  - systemctl daemon-reload
+  - systemctl enable anu-secrets.service || true

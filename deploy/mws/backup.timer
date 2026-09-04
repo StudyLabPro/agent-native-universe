@@ -1,0 +1,13 @@
+[Unit]
+Description=Ежедневный триггер backup.service (эквивалент cron 0 3 * * *)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+# Если VM была выключена в момент 03:00, отработать пропущенный запуск при
+# следующей загрузке — иначе полный простой VM в течение суток тихо оставил
+# бы день без резервной копии.
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

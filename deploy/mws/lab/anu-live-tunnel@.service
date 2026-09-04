@@ -1,0 +1,33 @@
+[Unit]
+# ПРИМЕЧАНИЕ: заготовка для копирования в /etc/systemd/system/ НА ЭТОМ
+# ХОСТЕ (185.233.3.14 — Lab) после того, как L5b поднимет VM anu-live-1 и
+# станет известен её адрес. Структура (Type=simple, Restart=always,
+# StartLimitIntervalSec=0) сознательно скопирована с уже работающего на
+# этом хосте /etc/systemd/system/prod-tunnel@.service — тот же принцип:
+# обрыв туннеля при простое или перезапуске удалённой стороны — штатный
+# режим, а не признак поломки.
+Description=Read-only SSH-tunnel from the lab to the live VM anu-live-1 (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Один env-файл на инстанс — /etc/anu-live-tunnel/%i.env (0600, не в git),
+# создаёт владелец. Пример для инстанса "loki" (systemctl start
+# anu-live-tunnel@loki):
+#   ANU_LIVE_TUNNEL_HOST=<адрес VM anu-live-1 — заполняется по факту L5b>
+#   ANU_LIVE_TUNNEL_USER=<пользователь SSH на VM>
+#   ANU_LIVE_TUNNEL_REMOTE_PORT=3100
+#   ANU_LIVE_TUNNEL_LOCAL_PORT=13100
+EnvironmentFile=/etc/anu-live-tunnel/%i.env
+ExecStart=/usr/bin/ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -L ${ANU_LIVE_TUNNEL_LOCAL_PORT}:127.0.0.1:${ANU_LIVE_TUNNEL_REMOTE_PORT} \
+  ${ANU_LIVE_TUNNEL_USER}@${ANU_LIVE_TUNNEL_HOST}
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

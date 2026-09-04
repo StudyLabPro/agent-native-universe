@@ -1,0 +1,12 @@
+[Unit]
+Description=Ежедневный disk-backup evidence-диска anu-live-evidence-01 + прополка старше 14 копий
+Documentation=file:///opt/anu-live/RUNBOOK.md
+After=network-online.target anu-secrets.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/anu-live/backup.sh
+# Резервное копирование — фоновая, неблокирующая задача по отношению к
+# самому движку: провал backup.sh не должен и не может остановить
+# anu-live.service (это разные, независимо запускаемые юниты).

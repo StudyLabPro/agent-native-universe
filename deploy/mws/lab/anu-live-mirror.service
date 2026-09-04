@@ -1,0 +1,29 @@
+[Unit]
+# ПРИМЕЧАНИЕ: этот юнит живёт в репозитории только как заготовка. Он
+# рассчитан на копирование в /etc/systemd/system/ НА ЭТОМ ХОСТЕ (185.233.3.14
+# — Lab) после того, как фаза L5b поднимет реальную VM anu-live-1 и станет
+# известен её адрес. До этого момента файл не устанавливается и не
+# включается — см. deploy/mws/RUNBOOK.md.
+Description=Синхронизация chain/ живой вселенной anu-live-1 на Lab (второй якорь, docs/GENESIS_LIVE.md §7.2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Переменные ниже создаёт владелец на этом хосте в /etc/anu-live-mirror.env
+# (0600, не в git) ПОСЛЕ того, как VM anu-live-1 реально существует:
+#   ANU_LIVE_MIRROR_HOST=<внутренний или внешний адрес VM anu-live-1 — заполняется по факту L5b>
+#   ANU_LIVE_MIRROR_USER=<пользователь SSH на VM>
+#   ANU_LIVE_MIRROR_REMOTE_PATH=<путь к genesis-live/U0001/chain/ на VM,
+#       ожидаемо /var/lib/anu-live/genesis-live/U0001/chain/ — сверить по факту>
+#   ANU_LIVE_MIRROR_LOCAL_PATH=<локальное зеркало, по умолчанию /root/anu-live-mirror/chain/>
+EnvironmentFile=/etc/anu-live-mirror.env
+# Намеренно БЕЗ --delete: chain/ — плотный, только-добавляющий индекс
+# эпох (см. src/lab/artifacts.ts, LiveChainIndex) — единственная причина
+# исчезновения файла локально была бы сбоем синхронизации, а не реальным
+# состоянием источника. Второй якорь не должен уметь стирать уже
+# подтверждённые локальные копии из-за сетевого сбоя на удалённой стороне.
+ExecStart=/usr/bin/rsync -az \
+  -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
+  "${ANU_LIVE_MIRROR_USER}@${ANU_LIVE_MIRROR_HOST}:${ANU_LIVE_MIRROR_REMOTE_PATH}" \
+  "${ANU_LIVE_MIRROR_LOCAL_PATH}"
