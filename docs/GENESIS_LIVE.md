@@ -181,9 +181,11 @@ implements a link protocol of its own.
   model.
 - The scientific engine versions (`genesis-logical-v1.1.0`,
   `genesis-cognitive-v1.2.0`) are bumped only by the scientific track. The
-  single planned exception was the L2 sound-resume change, delivered with the
-  owner's confirmation: it bumped `LAB_COGNITIVE_ENGINE_VERSION` from
-  `genesis-cognitive-v1.1.0` and marks earlier cognitive evidence LEGACY.
+  single planned exception was the L2 sound-resume change: it bumped
+  `LAB_COGNITIVE_ENGINE_VERSION` from `genesis-cognitive-v1.1.0` and marks
+  earlier cognitive evidence LEGACY, delivered with the owner's explicit
+  confirmation — recorded, with the date and exactly what was asked and
+  answered, in `docs/ROADMAP_AMENDMENTS.md`'s Decision log (2026-09-04, A5).
 
 ## 7. Canary — First Light (phase C1)
 
@@ -206,5 +208,10 @@ IAM role bindings applied by hand, ACME path for the Observer edge.
 
 | Phase | State |
 |---|---|
-| L0 identity, isolation contract, roadmap amendment, expected fixtures | delivered (this document, `docs/ROADMAP_AMENDMENTS.md`, the science guard) |
-| L1a provider/gateway hardening · L1b live cognition port · L2 sound resume · C1 canary · L3 live engine · L4 Observer live surface · L5 infrastructure · L6 site · L7 link inheritance · L8 background extensions · L9 permanent CI gate | pending; dependencies and criteria in the design |
+| L0 identity, isolation contract, roadmap amendment, expected fixtures | delivered (this document, `docs/ROADMAP_AMENDMENTS.md`, the science guard — `ed1c30e`) |
+| L1a provider/gateway hardening (circuit breaker, LLM cognition budgets, gateway persistence) | delivered (`9f58c29`) |
+| L2 sound cohort/neutral resume, oracle rebuild, fsync option, lease recovery | delivered (`ac789cb`) |
+| L1b live cognition port, `LiveIdlePolicy`, observation budget | delivered (`5f1097b`) |
+| L4 Observer live surface — `/api/live`, run head/state, ETag/304 | delivered (`fb0c1bc`, merged `aa677f3`) |
+| L9 permanent CI gate — hardened science-isolation guard | delivered (`3a6ab0a`, merged `3ad5dd1`) |
+| C1 canary · L3 live engine · L5 infrastructure · L6 site · L7 link inheritance · L8 background extensions | pending; dependencies and criteria in the design |

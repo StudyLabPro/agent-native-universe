@@ -75,18 +75,38 @@ Genesis-Live never bumps `LAB_SCHEMA_VERSION`, `LAB_ENGINE_VERSION` or
 `LAB_COGNITIVE_ENGINE_VERSION`. The one planned exception was phase L2 (sound
 resume for cohort runs), which bumped `LAB_COGNITIVE_ENGINE_VERSION` from
 `genesis-cognitive-v1.1.0` to `genesis-cognitive-v1.2.0` and marks earlier
-cognitive evidence LEGACY, with the owner's confirmation. `LAB_ENGINE_VERSION`
-and `experiments/genesis-1/expected/*` are unaffected — the bump touches only
+cognitive evidence LEGACY, with the owner's explicit confirmation (Decision
+log below, 2026-09-04). `LAB_ENGINE_VERSION` and
+`experiments/genesis-1/expected/*` are unaffected — the bump touches only
 cognitive-mode evidence. P3–P5 (two-layer link primitive, verifier seam,
 protocol in the lab) are executed by the scientific track; Live inherits the
 resulting engine at an epoch boundary via a recorded `--accept-parent-engine`.
+
+## Decision log
+
+Owner confirmations recorded here are explicit decisions made by the project
+owner in conversation, not an agent's own judgment call. Each entry names the
+date, exactly what was asked, and exactly what was confirmed, so the "owner
+confirmed" language elsewhere in this file and in `docs/GENESIS_LIVE.md` is
+traceable to something concrete instead of being self-certifying.
+
+- **2026-09-04 — A1 and A5 accepted together.** The owner was asked, in these
+  words: "Поправка дорожной карты ANU: ... Дизайн предлагает ... бамп
+  `LAB_COGNITIVE_ENGINE_VERSION` → v1.2.0 в L2 ради честного resume
+  когнитивных прогонов (логический движок и научные данные не меняются)" —
+  i.e. whether to accept both (a) the P0 amendment A1 (quarantine, not
+  deletion, for `src/v2/cognitive-loop.ts` and `src/v2/persistent-market.ts`)
+  and (b) the L2 `LAB_COGNITIVE_ENGINE_VERSION` bump described in A5. The
+  owner answered "Принять обе (Recommended)" — both accepted, together, in
+  that exchange. Nothing beyond these two items was confirmed by this
+  exchange.
 
 ## Status
 
 | Amendment | Needs owner | Reversible | State |
 |---|---|---|---|
-| A1 quarantine | yes | yes | proposed; code-side guard delivered in L0 |
+| A1 quarantine | yes | yes | accepted 2026-09-04 (Decision log); code-side guard delivered in L0 |
 | A2 deletions stand | yes (on the P0 PR) | no | unchanged |
 | A3 doc drift | no | yes | delivered in L0 |
 | A4 ablation clause | yes | yes | proposed; code-side guards delivered in L0 |
-| A5 version bumps | yes (L2 bump) | yes | delivered in L2 |
+| A5 version bumps | yes (L2 bump) | yes | L2 bump accepted 2026-09-04 (Decision log); delivered in L2 |

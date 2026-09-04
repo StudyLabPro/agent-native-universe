@@ -10,7 +10,7 @@ import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
-import { LlmGateway } from "../dist/lab/index.js";
+import { LlmGateway, canonicalJson, sha256Hex } from "../dist/lab/index.js";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -512,4 +512,147 @@ test("a cognitive CLI run binds the gateway upstream identity into its manifest"
     manifest.cognitionId,
     new RegExp(`^cognition-llm-b-v1:model-a@${identity.id}:apt1:mt64:cb65536$`),
   );
+});
+
+// The two functions below parse CLI environment variables before any cohort
+// consultation happens (createCohortCognition, runner.ts): positiveEnv for
+// ANU_LLM_TIMEOUT_MS and parseRequestOverridesEnv for ANU_LLM_REQUEST_OVERRIDES.
+// Both fail before touching the network, so a dummy, unreachable
+// ANU_LLM_BASE_URL is enough to exercise the parsing itself.
+
+test("ANU_LLM_TIMEOUT_MS rejects a non-positive-integer value (positiveEnv parsing)", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-lab-timeout-env-"));
+  t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
+  for (const invalid of ["0", "-5", "abc", "1.5", ""]) {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "dist/lab/runner.js", "genesis-1", "--cohort", "B",
+        "--data-dir", fixtureRoot, "--agents", "1", "--ticks", "1",
+        "--metric-every", "1", "--checkpoint-every", "1", "--seed", "timeout-env-test",
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        env: {
+          ...process.env,
+          ANU_LLM_BASE_URL: "http://127.0.0.1:1/v1",
+          ANU_LLM_MODEL: "model-a",
+          ANU_LLM_TIMEOUT_MS: invalid,
+        },
+      },
+    );
+    assert.equal(result.status, 1, `ANU_LLM_TIMEOUT_MS=${JSON.stringify(invalid)}: ${result.stdout}${result.stderr}`);
+    assert.equal(result.stdout, "");
+    const error = parseSingleJson(result.stderr);
+    assert.equal(error.error.code, "command_failed");
+    assert.match(error.error.message, /^ANU_LLM_TIMEOUT_MS must be a positive integer$/);
+  }
+});
+
+test("ANU_LLM_REQUEST_OVERRIDES rejects malformed values (parseRequestOverridesEnv parsing)", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-lab-overrides-env-"));
+  t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
+  const cases = [
+    { value: "{not json", pattern: /^ANU_LLM_REQUEST_OVERRIDES must be a JSON object$/ },
+    { value: "[]", pattern: /^ANU_LLM_REQUEST_OVERRIDES: LLM request overrides must be a JSON object$/ },
+    {
+      value: JSON.stringify({ padding: "x".repeat(4_200) }),
+      pattern: /^ANU_LLM_REQUEST_OVERRIDES must not exceed 4096 bytes$/,
+    },
+    {
+      value: JSON.stringify({ model: "sneaky" }),
+      pattern: /^ANU_LLM_REQUEST_OVERRIDES: LLM request overrides may not set model$/,
+    },
+  ];
+  for (const { value, pattern } of cases) {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "dist/lab/runner.js", "genesis-1", "--cohort", "B",
+        "--data-dir", fixtureRoot, "--agents", "1", "--ticks", "1",
+        "--metric-every", "1", "--checkpoint-every", "1", "--seed", "overrides-env-test",
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        maxBuffer: 16 * 1024 * 1024,
+        env: {
+          ...process.env,
+          ANU_LLM_BASE_URL: "http://127.0.0.1:1/v1",
+          ANU_LLM_MODEL: "model-a",
+          ANU_LLM_REQUEST_OVERRIDES: value,
+        },
+      },
+    );
+    assert.equal(result.status, 1, `ANU_LLM_REQUEST_OVERRIDES=${value}: ${result.stdout}${result.stderr}`);
+    assert.equal(result.stdout, "");
+    const error = parseSingleJson(result.stderr);
+    assert.equal(error.error.code, "command_failed");
+    assert.match(error.error.message, pattern);
+  }
+});
+
+test("ANU_LLM_REQUEST_OVERRIDES parses a valid object and folds its hash into the cognitionId", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-lab-overrides-valid-"));
+  t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
+  const upstream = createServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain the bounded request; prompt content is intentionally not retained.
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      id: "overrides-env-test",
+      choices: [{ message: { role: "assistant", content: JSON.stringify({ actions: [{ type: "observe" }] }) } }],
+      usage: { prompt_tokens: 4, completion_tokens: 4, total_tokens: 8 },
+    }));
+  });
+  await new Promise((resolvePromise) => upstream.listen(0, "127.0.0.1", resolvePromise));
+  const upstreamPort = upstream.address().port;
+  t.after(async () => new Promise((resolvePromise) => upstream.close(resolvePromise)));
+
+  // The expected id suffix is computed independently of the CLI, the same
+  // way LlmCognition computes it (cognition.ts): proving the env var was
+  // actually parsed into the value used, not merely accepted.
+  const requestOverrides = { reasoning_effort: "low" };
+  const expectedSuffix = sha256Hex(canonicalJson(requestOverrides)).slice(0, 8);
+
+  const child = spawn(
+    process.execPath,
+    [
+      "dist/lab/runner.js", "genesis-1", "--cohort", "B",
+      "--data-dir", fixtureRoot, "--agents", "1", "--ticks", "1",
+      "--metric-every", "1", "--checkpoint-every", "1", "--seed", "overrides-valid-test",
+    ],
+    {
+      cwd: repositoryRoot,
+      env: {
+        ...process.env,
+        ANU_LLM_BASE_URL: `http://127.0.0.1:${upstreamPort}/v1`,
+        ANU_LLM_MODEL: "model-a",
+        ANU_LLM_AGENTS_PER_TICK: "1",
+        ANU_LLM_CONCURRENCY: "1",
+        ANU_LLM_MAX_TOKENS: "64",
+        ANU_LLM_TIMEOUT_MS: "5000",
+        ANU_LLM_REQUEST_OVERRIDES: JSON.stringify(requestOverrides),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const [exitCode, signal] = await once(child, "exit");
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(signal, null);
+  const summary = parseSingleJson(stdout).summary;
+  const manifest = JSON.parse(await readFile(
+    join(fixtureRoot, "genesis-1", "U0001", summary.runId, "manifest.json"),
+    "utf8",
+  ));
+  assert.match(manifest.cognitionId, new RegExp(`:ro${expectedSuffix}$`));
 });

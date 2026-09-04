@@ -75,10 +75,19 @@ jobs:
       # PR Gate rather than a job of its own. It reuses the dist/ that the test
       # universe just built (rebuilding only when src/ is newer) and
       # regenerates the five §33 arms at the 600-tick default, comparing every
-      # hash with experiments/genesis-1/expected/ — CI never reads runs/.
+      # hash with experiments/genesis-1/expected/ — CI never reads runs/. The
+      # 200-tick readout is regenerated separately by
+      # test/lab-live-identity.test.mjs (part of "Execute the complete test
+      # universe" above), but that coverage lives inside a test file; this
+      # second, explicit invocation makes both fixture sets visibly enforced
+      # by the workflow itself rather than by a reader finding the test.
       - name: Guard the scientific track against Genesis-Live (live-isolation)
         if: ${{ steps.scope.outputs.runtime == 'true' }}
         run: npm run check:live-isolation
+
+      - name: Guard the scientific track against Genesis-Live (live-isolation, 200-tick fixtures)
+        if: ${{ steps.scope.outputs.runtime == 'true' }}
+        run: node .github/scripts/check-live-isolation.mjs --ticks 200
 
       - name: Record the path-aware decision
         if: ${{ steps.scope.outputs.runtime != 'true' && steps.scope.outputs.container != 'true' }}

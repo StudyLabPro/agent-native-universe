@@ -123,7 +123,11 @@ beyond) needs the opposite properties, so both are opt-in:
   atomically (temp file + `fsync` + rename) and is keyed to the gateway's
   identity (`gatewayId`, derived from the upstream URL); pointing a
   differently-configured gateway at someone else's state file is refused
-  rather than silently adopted.
+  rather than silently adopted. The in-memory counters update before that
+  write completes, so a crash inside that narrow window under-counts the most
+  recent response by up to one request's tokens on restart (never
+  double-counts) — an accepted, bounded margin for a file that is operational
+  metering, never evidence.
 - **`--metering-failure-mode latch|exit`** (default `latch`): decides what
   happens when audit or metering can no longer be trusted (audit write
   failure, unmetered or invalid usage, an oversized response). `latch` keeps

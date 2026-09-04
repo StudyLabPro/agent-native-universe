@@ -16,7 +16,7 @@ There is no feature-branch push CI and no post-merge duplicate validation.
 
 ## Science guard (`live-isolation`)
 
-Genesis-Live is a fourth identity of the one lab engine, so the PR Gate carries a second contract next to the test universe: the scientific track (`genesis-1`) must be byte-identical before and after any change. The step `Guard the scientific track against Genesis-Live (live-isolation)` runs `npm run check:live-isolation` (`.github/scripts/check-live-isolation.mjs`) after the test universe on every ready pull request that touches runtime paths. It is a step of the single `PR Gate` job rather than a job of its own because the policy allows exactly one runner job; it is fail-closed and reports one `ok`/`FAIL` line per check.
+Genesis-Live is a fourth identity of the one lab engine, so the PR Gate carries a second contract next to the test universe: the scientific track (`genesis-1`) must be byte-identical before and after any change. The step `Guard the scientific track against Genesis-Live (live-isolation)` runs `npm run check:live-isolation` (`.github/scripts/check-live-isolation.mjs`) after the test universe on every ready pull request that touches runtime paths, regenerating and hash-comparing the five §33 arms at the 600-tick default. A second step, `Guard the scientific track against Genesis-Live (live-isolation, 200-tick fixtures)`, immediately follows it and runs the same script with `--ticks 200`, so both fixture sets in `experiments/genesis-1/expected/*.json` are regenerated and enforced by name in the workflow, not only validated for shape by `checkFixtureIdentity`. (The 200-tick readout is also regenerated inside `test/lab-live-identity.test.mjs`, which runs as part of `npm test` in the step above; the dedicated step exists so the enforcement is visible in the workflow itself rather than only inside a test file.) Both are steps of the single `PR Gate` job rather than jobs of their own because the policy allows exactly one runner job; each is fail-closed and reports one `ok`/`FAIL` line per check. The second invocation reuses the same `dist/` (already built and unchanged since the first), so it only pays for the checks themselves — regeneration at 200 ticks takes roughly a quarter of the 600-tick cost.
 
 What it proves, in order:
 
@@ -29,7 +29,7 @@ What it proves, in order:
 
 A regeneration mismatch is a scientific regression. The fixtures change only when an engine version bump is the documented intent, in the same change as the bump and its `CHANGELOG.md` entry — never to make the gate pass.
 
-Options: `--ticks 600|200` selects the readout (the PR Gate and `npm run check` use 600; `npm test` runs the gate with `--ticks 200`), `--parallel N` bounds the concurrently regenerated arms, `--skip-regeneration` runs only the static and refusal checks, `--build` forces a rebuild and `--no-build` refuses a stale one. Exit codes: 0 isolated, 1 a check failed, 2 usage or build error.
+Options: `--ticks 600|200` selects the readout (`npm run check:live-isolation` and `npm run check` default to 600; the PR Gate additionally runs an explicit `--ticks 200` step, and `npm test` independently regenerates the 200-tick readout from inside `test/lab-live-identity.test.mjs`), `--parallel N` bounds the concurrently regenerated arms, `--skip-regeneration` runs only the static and refusal checks, `--build` forces a rebuild and `--no-build` refuses a stale one. Exit codes: 0 isolated, 1 a check failed, 2 usage or build error.
 
 ## Heavy validation
 
