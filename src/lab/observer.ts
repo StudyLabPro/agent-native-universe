@@ -9,16 +9,26 @@ import {
   type ServerResponse,
 } from "node:http";
 import { join, relative, resolve, sep } from "node:path";
-import { canonicalJson, compareCodeUnits } from "./canonical.js";
+import { canonicalJson, compareCodeUnits, hashValue } from "./canonical.js";
 import { validateRunEvidenceAttestation } from "./evidence-attestation-schema.js";
 import { openRegularFileNoFollow } from "./event-stream.js";
-import { MAX_LAB_EVENT_BYTES } from "./events.js";
+import { MAX_LAB_EVENT_BYTES, validateLabEvent } from "./events.js";
+import { LIVE_UNIVERSE_ID } from "./live/identity.js";
 import {
   OBSERVER_UI_ASSETS,
   OBSERVER_UI_HTML,
   type ObserverUiAsset,
 } from "./observer-ui.js";
-import type { RunEvidenceAttestation } from "./types.js";
+import { applyWorldEventMutable, initialWorldState } from "./reducer.js";
+import {
+  LAB_LIVE_EXPERIMENT_ID,
+  LAB_SCHEMA_VERSION,
+  type LabEvent,
+  type LabRunMode,
+  type RunEvidenceAttestation,
+  type RunManifest,
+  type WorldState,
+} from "./types.js";
 import { ANU_VERSION } from "../version.js";
 
 const DEFAULT_HOST = "127.0.0.1";
@@ -41,6 +51,14 @@ const EVENT_PROBE_CHUNK_BYTES = 65_536;
 const EVENT_INDEX_TAIL_ANCHOR_BYTES = 65_536;
 const MIN_AUTH_TOKEN_BYTES = 32;
 const MAX_AUTH_TOKEN_BYTES = 4_096;
+/** Checkpoint artifacts project a whole WorldState; larger than metrics/manifest but still bounded. */
+const MAX_STATE_CHECKPOINT_BYTES = 8_388_608;
+/** Projected /state responses share the /events response cap: both surface at most one tick's worth of evidence. */
+const MAX_STATE_RESPONSE_BYTES = MAX_EVENT_RESPONSE_BYTES;
+/** cognitionHealth is computed over this many trailing ticks of the live head's run. */
+const LIVE_COGNITION_HEALTH_WINDOW_TICKS = 50;
+/** Directory names reserved by the live universe layout; never a run's own directory. */
+const LIVE_RESERVED_DIRECTORY_NAMES = new Set(["chain", "anchors", "tasks", "verdicts", "physics"]);
 
 const RUN_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const REDACTED = "[REDACTED]";
@@ -429,7 +447,13 @@ async function handleRequest(
     const root = await resolveDataRootOr503(configuredDataDir);
     const record = await findRun(root, runId);
     if (record === undefined) throw new ObserverHttpError(404, "run_not_found");
+    const etag = await peekEventFileEtag(record.directory, root);
+    if (etag !== undefined && matchesIfNoneMatch(request, etag)) {
+      send304(response, etag);
+      return;
+    }
     const page = await readEventPage(record, root, eventIndexes, after, limit);
+    if (etag !== undefined) response.setHeader("ETag", etag);
     sendJson(response, 200, {
       runId,
       after,
@@ -438,6 +462,56 @@ async function handleRequest(
       nextAfter: page.nextAfter,
       hasMore: page.hasMore,
     });
+    return;
+  }
+
+  const headMatch = /^\/api\/runs\/([^/]+)\/head$/.exec(url.pathname);
+  if (headMatch !== null) {
+    if (!authorizeEvidenceRequest(request, response, authHeaderDigest)) return;
+    ensureNoQuery(url);
+    const runId = decodeRunId(headMatch[1]);
+    const root = await resolveDataRootOr503(configuredDataDir);
+    const record = await findRun(root, runId);
+    if (record === undefined) throw new ObserverHttpError(404, "run_not_found");
+    const etag = await peekEventFileEtag(record.directory, root);
+    if (etag !== undefined && matchesIfNoneMatch(request, etag)) {
+      send304(response, etag);
+      return;
+    }
+    const head = await readRunHead(record, root);
+    if (etag !== undefined) response.setHeader("ETag", etag);
+    sendJson(response, 200, { runId, ...head });
+    return;
+  }
+
+  const stateMatch = /^\/api\/runs\/([^/]+)\/state$/.exec(url.pathname);
+  if (stateMatch !== null) {
+    if (!authorizeEvidenceRequest(request, response, authHeaderDigest)) return;
+    ensureNoQuery(url);
+    const runId = decodeRunId(stateMatch[1]);
+    const root = await resolveDataRootOr503(configuredDataDir);
+    const record = await findRun(root, runId);
+    if (record === undefined) throw new ObserverHttpError(404, "run_not_found");
+    const etag = await peekEventFileEtag(record.directory, root);
+    if (etag !== undefined && matchesIfNoneMatch(request, etag)) {
+      send304(response, etag);
+      return;
+    }
+    const projection = await projectRunState(record, root, eventIndexes);
+    const body = { runId, tick: projection.tick, seq: projection.seq, state: projection.state };
+    const size = Buffer.byteLength(JSON.stringify(redactEvidence(body)), "utf8");
+    if (size > MAX_STATE_RESPONSE_BYTES) throw new ObserverHttpError(413, "state_too_large");
+    if (etag !== undefined) response.setHeader("ETag", etag);
+    sendJson(response, 200, body);
+    return;
+  }
+
+  if (url.pathname === "/api/live") {
+    if (!authorizeEvidenceRequest(request, response, authHeaderDigest)) return;
+    ensureNoQuery(url);
+    const root = await resolveDataRootOr503(configuredDataDir);
+    const live = await readLiveHead(root, eventIndexes);
+    sendJson(response, 200, live);
     return;
   }
 
@@ -640,6 +714,7 @@ async function discoverRuns(root: string): Promise<RunDiscovery> {
         || entry.isSymbolicLink()
         || entry.name.startsWith(".")
         || entry.name === "populations"
+        || LIVE_RESERVED_DIRECTORY_NAMES.has(entry.name)
         || (manifestEntry !== undefined && entry.name === "checkpoints")
       ) continue;
       const child = join(current.directory, entry.name);
@@ -1252,6 +1327,590 @@ async function readFileWindow(file: FileHandle, position: number, length: number
     offset += result.bytesRead;
   }
   return buffer.subarray(0, offset);
+}
+
+/** Deterministic ETag over an event log's identity; never over its content. */
+function eventFileEtag(identity: EventFileIdentity): string {
+  const digest = hashValue({
+    domain: "agent-native-universe/lab/observer-etag/v1",
+    device: identity.device.toString(),
+    inode: identity.inode.toString(),
+    size: identity.size.toString(),
+    mtimeNs: identity.mtimeNs.toString(),
+    ctimeNs: identity.ctimeNs.toString(),
+  });
+  return `"${digest}"`;
+}
+
+/** Stat-only identity peek so a matching If-None-Match can short-circuit before any scan. */
+async function peekEventFileEtag(directory: string, root: string): Promise<string | undefined> {
+  let file;
+  try {
+    file = await openSafeArtifact(directory, "events.jsonl", root);
+  } catch (error) {
+    if (isMissingFile(error)) return undefined;
+    throw error;
+  }
+  try {
+    return eventFileEtag(await eventFileIdentity(file));
+  } finally {
+    await file.close();
+  }
+}
+
+function matchesIfNoneMatch(request: IncomingMessage, etag: string): boolean {
+  const values = request.headersDistinct["if-none-match"];
+  if (values === undefined) return false;
+  for (const value of values) {
+    for (const candidate of value.split(",")) {
+      const trimmed = candidate.trim();
+      if (trimmed === "*" || trimmed === etag) return true;
+    }
+  }
+  return false;
+}
+
+function send304(response: ServerResponse, etag: string): void {
+  response.statusCode = 304;
+  response.setHeader("ETag", etag);
+  response.setHeader("Cache-Control", "no-store");
+  response.setHeader("Content-Security-Policy", "default-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+  response.setHeader("Referrer-Policy", "no-referrer");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("X-Frame-Options", "DENY");
+  response.end();
+}
+
+/** Read just the final JSONL line without scanning the rest of the file. */
+async function readLastEventRecord(
+  file: FileHandle,
+  fileSize: number,
+): Promise<{ seq: number; tick: number } | null> {
+  if (fileSize === 0) return null;
+  const terminator = await readFileWindow(file, fileSize - 1, 1);
+  if (terminator.length !== 1 || terminator[0] !== 0x0a) {
+    throw new ObserverHttpError(422, "invalid_event_log");
+  }
+  const windowLength = Math.min(fileSize, MAX_LAB_EVENT_BYTES + 2);
+  const windowStart = fileSize - windowLength;
+  const chunk = await readFileWindow(file, windowStart, windowLength);
+  if (chunk.length !== windowLength) throw new ObserverHttpError(422, "invalid_event_log");
+  const finalNewline = windowLength - 1;
+  const priorNewline = chunk.lastIndexOf(0x0a, finalNewline - 1);
+  if (priorNewline < 0 && windowStart > 0) {
+    throw new ObserverHttpError(413, "event_line_too_large");
+  }
+  const lineStart = priorNewline >= 0 ? priorNewline + 1 : 0;
+  const rawLine = chunk.subarray(lineStart, finalNewline);
+  if (rawLine.length === 0 || !isUtf8(rawLine) || rawLine.at(-1) === 0x0d) {
+    throw new ObserverHttpError(422, "invalid_event_log");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawLine.toString("utf8")) as unknown;
+  } catch {
+    throw new ObserverHttpError(422, "invalid_event_log");
+  }
+  if (
+    !isJsonObject(parsed)
+    || !Number.isSafeInteger(parsed.seq) || (parsed.seq as number) <= 0
+    || !Number.isSafeInteger(parsed.tick) || (parsed.tick as number) < 0
+  ) {
+    throw new ObserverHttpError(422, "invalid_event_log");
+  }
+  return { seq: parsed.seq as number, tick: parsed.tick as number };
+}
+
+/** Latest checkpoint tick from filenames alone; never opens a checkpoint file. */
+async function findLatestCheckpointTick(directory: string, root: string): Promise<number | null> {
+  const candidate = resolve(directory, "checkpoints");
+  if (!isWithin(directory, candidate)) return null;
+  let canonical: string;
+  try {
+    canonical = await realpath(candidate);
+  } catch (error) {
+    if (isMissingFile(error)) return null;
+    throw error;
+  }
+  if (!isWithin(root, canonical) || !isWithin(directory, canonical)) return null;
+  let entries;
+  try {
+    entries = await readdir(canonical, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingFile(error)) return null;
+    throw error;
+  }
+  let latest: number | null = null;
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.isSymbolicLink()) continue;
+    const match = /^(0|[1-9][0-9]*)\.json$/.exec(entry.name);
+    if (match === null) continue;
+    const tick = Number(match[1]);
+    if (Number.isSafeInteger(tick) && (latest === null || tick > latest)) latest = tick;
+  }
+  return latest;
+}
+
+interface RunHead {
+  lastSeq: number | null;
+  lastTick: number | null;
+  eventsBytes: number;
+  latestCheckpointTick: number | null;
+  completed: boolean;
+}
+
+async function readRunHead(record: RunRecord, root: string): Promise<RunHead> {
+  const latestCheckpointTick = await findLatestCheckpointTick(record.directory, root);
+  const completed = (await readOptionalJsonArtifact(record.directory, "summary.json", root)) !== null;
+
+  let file;
+  try {
+    file = await openSafeArtifact(record.directory, "events.jsonl", root);
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+    return { lastSeq: null, lastTick: null, eventsBytes: 0, latestCheckpointTick, completed };
+  }
+  try {
+    const identity = await eventFileIdentity(file);
+    const eventsBytes = Number(identity.size);
+    const last = await readLastEventRecord(file, eventsBytes);
+    return {
+      lastSeq: last === null ? null : last.seq,
+      lastTick: last === null ? null : last.tick,
+      eventsBytes,
+      latestCheckpointTick,
+      completed,
+    };
+  } finally {
+    await file.close();
+  }
+}
+
+/**
+ * Cast a discovered manifest into the typed RunManifest the reducer needs.
+ *
+ * Independent of EvidenceStore/assertLabManifestImplementation on purpose:
+ * the Observer is read-only and must keep serving mode:"live" heads even
+ * before an engine registers support for them (the live surface arrives in
+ * L4; the live engine itself lands in L3).
+ */
+function parseRunManifestForProjection(raw: Record<string, unknown>): RunManifest {
+  if (
+    raw.schemaVersion !== LAB_SCHEMA_VERSION
+    || typeof raw.experimentId !== "string"
+    || typeof raw.engineVersion !== "string"
+    || (raw.mode !== "logical" && raw.mode !== "cognitive" && raw.mode !== "live")
+    || typeof raw.policyId !== "string"
+    || typeof raw.taskGeneratorId !== "string"
+    || typeof raw.runId !== "string"
+    || typeof raw.universeId !== "string"
+    || typeof raw.seed !== "string"
+    || typeof raw.configHash !== "string"
+    || (raw.cognitionId !== undefined && typeof raw.cognitionId !== "string")
+  ) {
+    throw new ObserverHttpError(422, "invalid_artifact");
+  }
+  const mode: LabRunMode = raw.mode;
+  return {
+    schemaVersion: raw.schemaVersion,
+    experimentId: raw.experimentId,
+    engineVersion: raw.engineVersion,
+    mode,
+    policyId: raw.policyId,
+    taskGeneratorId: raw.taskGeneratorId,
+    ...(raw.cognitionId === undefined ? {} : { cognitionId: raw.cognitionId }),
+    runId: raw.runId,
+    universeId: raw.universeId,
+    seed: raw.seed,
+    configHash: raw.configHash,
+  };
+}
+
+/**
+ * Forward-scan events strictly after `after`, calling `onEvent` for each one
+ * in order. Shares the paginated /events reader's seek index and safety
+ * bounds, but applies no response-size cap: callers fold events into their
+ * own bounded accumulator (a WorldState projection, a health tally).
+ */
+async function scanEventsAfter(
+  record: RunRecord,
+  root: string,
+  eventIndexes: EventIndexCache,
+  after: number,
+  onEvent: (parsed: Record<string, unknown>, seq: number, tick: number) => void,
+): Promise<{ lastSeq: number; lastTick: number }> {
+  const indexKey = join(record.directory, "events.jsonl");
+  let file;
+  try {
+    file = await openSafeArtifact(record.directory, "events.jsonl", root);
+  } catch (error) {
+    if (isMissingFile(error)) {
+      eventIndexes.invalidate(indexKey);
+      return { lastSeq: after, lastTick: 0 };
+    }
+    throw error;
+  }
+
+  let index: EventIndexEntry | undefined;
+  let initialIdentity: EventFileIdentity | undefined;
+  let scannedBytes: number;
+  let lastSeq = after;
+  let lastTick = 0;
+  let pending: Buffer = Buffer.alloc(0);
+  let pendingOffset: number;
+  let expectedSeq: number;
+
+  const consumeLine = (rawLine: Buffer, offset: number, endOffset: number): void => {
+    if (!isUtf8(rawLine) || rawLine.at(-1) === 0x0d) {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    const line = rawLine.toString("utf8");
+    if (line.length === 0) throw new ObserverHttpError(422, "invalid_event_log");
+    if (Buffer.byteLength(line, "utf8") > MAX_LAB_EVENT_BYTES) {
+      throw new ObserverHttpError(413, "event_line_too_large");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    if (
+      !isJsonObject(parsed)
+      || !Number.isSafeInteger(parsed.seq)
+      || (parsed.seq as number) !== expectedSeq
+      || !Number.isSafeInteger(parsed.tick)
+      || (parsed.tick as number) < 0
+    ) {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    const seq = parsed.seq as number;
+    const tick = parsed.tick as number;
+    expectedSeq = seq + 1;
+    if (index === undefined) throw new ObserverHttpError(500, "internal_error");
+    rememberEventCheckpoint(index, { endOffset, offset, seq });
+    if (seq <= after) return;
+    onEvent(parsed, seq, tick);
+    lastSeq = seq;
+    lastTick = tick;
+  };
+
+  try {
+    initialIdentity = await eventFileIdentity(file);
+    const fileSize = Number(initialIdentity.size);
+    const terminatorBytes = await validateEventLogTerminator(file, fileSize);
+    const lease = await eventIndexes.acquire(indexKey, initialIdentity, file);
+    index = lease.entry;
+    const seek = await findEventScanStart(file, fileSize, after, index);
+    scannedBytes = terminatorBytes + lease.bytesRead + seek.bytesRead;
+    if (scannedBytes > MAX_EVENT_SCAN_BYTES) {
+      throw new ObserverHttpError(413, "event_scan_limit_exceeded");
+    }
+    pendingOffset = seek.startOffset;
+    expectedSeq = seek.expectedFirstSeq;
+
+    let readOffset = seek.startOffset;
+    while (readOffset < fileSize) {
+      const chunk = await readFileWindow(
+        file,
+        readOffset,
+        Math.min(EVENT_PROBE_CHUNK_BYTES, fileSize - readOffset),
+      );
+      if (chunk.length === 0) break;
+      readOffset += chunk.length;
+      scannedBytes += chunk.length;
+      if (scannedBytes > MAX_EVENT_SCAN_BYTES) {
+        throw new ObserverHttpError(413, "event_scan_limit_exceeded");
+      }
+      pending = Buffer.concat([pending, chunk], pending.length + chunk.length);
+
+      let newline = pending.indexOf(0x0a);
+      while (newline >= 0) {
+        const line = pending.subarray(0, newline);
+        const lineOffset = pendingOffset;
+        const lineEndOffset = lineOffset + newline + 1;
+        pending = pending.subarray(newline + 1);
+        pendingOffset = lineEndOffset;
+        consumeLine(line, lineOffset, lineEndOffset);
+        newline = pending.indexOf(0x0a);
+      }
+      if (pending.length > MAX_LAB_EVENT_BYTES + 1) {
+        throw new ObserverHttpError(413, "event_line_too_large");
+      }
+    }
+    if (pending.length > 0) throw new ObserverHttpError(422, "invalid_event_log");
+
+    const finalIdentity = await eventFileIdentity(file);
+    if (!sameEventFileIdentity(initialIdentity, finalIdentity)) {
+      eventIndexes.invalidate(indexKey, index);
+    } else {
+      await eventIndexes.retainStable(indexKey, index, finalIdentity, file);
+    }
+  } catch (error) {
+    eventIndexes.invalidate(indexKey, index);
+    throw error;
+  } finally {
+    await file.close();
+  }
+
+  return { lastSeq, lastTick };
+}
+
+/** Project a run's WorldState from its latest checkpoint (or genesis) plus the event tail. */
+async function projectRunState(
+  record: RunRecord,
+  root: string,
+  eventIndexes: EventIndexCache,
+): Promise<{ tick: number; seq: number; state: WorldState }> {
+  const manifest = parseRunManifestForProjection(record.manifest);
+  const latestCheckpointTick = await findLatestCheckpointTick(record.directory, root);
+
+  let state: WorldState;
+  let checkpointSeq: number;
+  if (latestCheckpointTick === null) {
+    state = initialWorldState(manifest);
+    checkpointSeq = 0;
+  } else {
+    const checkpointText = await readBoundedFile(
+      record.directory,
+      `checkpoints/${latestCheckpointTick}.json`,
+      root,
+      MAX_STATE_CHECKPOINT_BYTES,
+    );
+    let parsedCheckpoint: unknown;
+    try {
+      parsedCheckpoint = JSON.parse(checkpointText) as unknown;
+    } catch {
+      throw new ObserverHttpError(422, "invalid_artifact");
+    }
+    if (
+      !isJsonObject(parsedCheckpoint)
+      || parsedCheckpoint.schemaVersion !== LAB_SCHEMA_VERSION
+      || parsedCheckpoint.runId !== manifest.runId
+      || parsedCheckpoint.universeId !== manifest.universeId
+      || !Number.isSafeInteger(parsedCheckpoint.tick)
+      || !Number.isSafeInteger(parsedCheckpoint.seq)
+      || !isJsonObject(parsedCheckpoint.state)
+    ) {
+      throw new ObserverHttpError(422, "invalid_artifact");
+    }
+    state = parsedCheckpoint.state as unknown as WorldState;
+    checkpointSeq = parsedCheckpoint.seq as number;
+  }
+
+  try {
+    const tail = await scanEventsAfter(record, root, eventIndexes, checkpointSeq, (parsed) => {
+      validateLabEvent(parsed);
+      applyWorldEventMutable(state, parsed);
+    });
+    return {
+      tick: state.tick,
+      seq: tail.lastSeq > checkpointSeq ? tail.lastSeq : checkpointSeq,
+      state,
+    };
+  } catch (error) {
+    if (error instanceof ObserverHttpError) throw error;
+    throw new ObserverHttpError(422, "invalid_event_log");
+  }
+}
+
+/** Resolve one reserved live-universe subdirectory (chain, anchors, …), never following a symlink. */
+async function resolveLiveSubdirectory(universeRoot: string, root: string, name: string): Promise<string | null> {
+  const candidate = resolve(universeRoot, name);
+  if (!isWithin(universeRoot, candidate)) return null;
+  let canonical: string;
+  try {
+    canonical = await realpath(candidate);
+  } catch (error) {
+    if (isMissingFile(error)) return null;
+    throw error;
+  }
+  if (!isWithin(root, canonical) || !isWithin(universeRoot, canonical)) return null;
+  return canonical;
+}
+
+interface LiveChainEntry {
+  epoch: number;
+  runId: string;
+  commitment: string;
+  engineVersion: string;
+  anchoredAt: string | number | boolean | null;
+}
+
+/**
+ * Read the live universe's epoch index. `chain/` and `anchors/` are written
+ * only by phase L3/L5; both may be entirely absent today, in which case this
+ * returns an empty chain rather than failing the live head.
+ */
+async function readChainEntries(universeRoot: string, root: string): Promise<LiveChainEntry[]> {
+  const chainDir = await resolveLiveSubdirectory(universeRoot, root, "chain");
+  if (chainDir === null) return [];
+  let entries;
+  try {
+    entries = await readdir(chainDir, { withFileTypes: true });
+  } catch (error) {
+    if (isMissingFile(error)) return [];
+    throw error;
+  }
+  const numbered: Array<{ epoch: number; name: string }> = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || entry.isSymbolicLink()) continue;
+    const match = /^(0|[1-9][0-9]*)\.json$/.exec(entry.name);
+    if (match === null) continue;
+    const epoch = Number(match[1]);
+    if (Number.isSafeInteger(epoch)) numbered.push({ epoch, name: entry.name });
+  }
+  numbered.sort((left, right) => left.epoch - right.epoch);
+
+  const anchorsDir = await resolveLiveSubdirectory(universeRoot, root, "anchors");
+  const chain: LiveChainEntry[] = [];
+  for (const item of numbered) {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = await readJsonArtifact(chainDir, item.name, root);
+    } catch {
+      continue; // A damaged chain entry does not take down the whole live head.
+    }
+    if (
+      !Number.isSafeInteger(parsed.epoch) || (parsed.epoch as number) !== item.epoch
+      || typeof parsed.runId !== "string"
+      || typeof parsed.commitment !== "string"
+      || typeof parsed.engineVersion !== "string"
+    ) continue;
+
+    let anchoredAt: string | number | boolean | null = null;
+    if (anchorsDir !== null) {
+      try {
+        const anchor = await readJsonArtifact(anchorsDir, item.name, root);
+        const value = anchor.anchoredAt;
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+          anchoredAt = value;
+        }
+      } catch {
+        // No recorded anchor yet for this epoch; anchoredAt stays null.
+      }
+    }
+    chain.push({
+      epoch: parsed.epoch as number,
+      runId: parsed.runId,
+      commitment: parsed.commitment,
+      engineVersion: parsed.engineVersion,
+      anchoredAt,
+    });
+  }
+  return chain;
+}
+
+interface LiveCognitionHealth {
+  window: number;
+  consulted: number;
+  unavailable: number;
+  starved: number;
+}
+
+/** Tally cognition.recorded providers over the trailing LIVE_COGNITION_HEALTH_WINDOW_TICKS ticks. */
+async function computeCognitionHealth(
+  record: RunRecord,
+  root: string,
+  eventIndexes: EventIndexCache,
+  headTick: number,
+): Promise<LiveCognitionHealth> {
+  let consulted = 0;
+  let unavailable = 0;
+  let starved = 0;
+  const floorTick = Math.max(0, headTick - LIVE_COGNITION_HEALTH_WINDOW_TICKS + 1);
+  await scanEventsAfter(record, root, eventIndexes, 0, (parsed, _seq, tick) => {
+    if (parsed.type !== "cognition.recorded" || tick < floorTick) return;
+    const data = parsed.data;
+    const provider = isJsonObject(data) ? data.provider : undefined;
+    if (provider === "unavailable") unavailable += 1;
+    else if (provider === "starved") starved += 1;
+    else consulted += 1;
+  });
+  return { window: LIVE_COGNITION_HEALTH_WINDOW_TICKS, consulted, unavailable, starved };
+}
+
+/**
+ * Universe head for the single live universe (`genesis-live`/`U0001`).
+ *
+ * Never throws for missing evidence: an unstarted universe, a mid-boundary
+ * transition, or an unreadable head run all degrade to null/zeroed fields
+ * instead of failing the route, so a dashboard can always render something.
+ */
+async function readLiveHead(root: string, eventIndexes: EventIndexCache): Promise<Record<string, unknown>> {
+  const universeRoot = join(root, LAB_LIVE_EXPERIMENT_ID, LIVE_UNIVERSE_ID);
+  const chain = await readChainEntries(universeRoot, root);
+
+  let liveRecords: RunRecord[] = [];
+  try {
+    const discovery = await discoverRuns(universeRoot);
+    if (!discovery.truncated && !discovery.ambiguous) {
+      liveRecords = discovery.records.filter(
+        (candidate) => candidate.manifest.experimentId === LAB_LIVE_EXPERIMENT_ID
+          && candidate.manifest.universeId === LIVE_UNIVERSE_ID,
+      );
+    }
+  } catch (error) {
+    if (!isMissingFile(error)) throw error;
+  }
+
+  const chainedRunIds = new Set(chain.map((entry) => entry.runId));
+  const unchained = liveRecords.filter((candidate) => !chainedRunIds.has(candidate.runId));
+  let currentRunId: string | null = null;
+  let boundary = false;
+  if (unchained.length >= 1) {
+    unchained.sort((left, right) => compareCodeUnits(right.runId, left.runId));
+    const current = unchained[0];
+    currentRunId = current?.runId ?? null;
+    if (current !== undefined) {
+      boundary = (await readOptionalJsonArtifact(current.directory, "summary.json", root)) !== null;
+    }
+  } else if (chain.length > 0) {
+    boundary = true;
+  }
+
+  const headRunId = currentRunId ?? (chain.length > 0 ? (chain[chain.length - 1]?.runId ?? null) : null);
+  const headRecord = headRunId === null
+    ? undefined
+    : liveRecords.find((candidate) => candidate.runId === headRunId);
+
+  let lastSeq: number | null = null;
+  let lastTick: number | null = null;
+  let cognitionHealth: LiveCognitionHealth = {
+    window: LIVE_COGNITION_HEALTH_WINDOW_TICKS,
+    consulted: 0,
+    unavailable: 0,
+    starved: 0,
+  };
+  if (headRecord !== undefined) {
+    try {
+      const head = await readRunHead(headRecord, root);
+      lastSeq = head.lastSeq;
+      lastTick = head.lastTick;
+    } catch {
+      // Evidence for the head run is unreadable; surface null instead of failing the whole endpoint.
+    }
+    try {
+      cognitionHealth = await computeCognitionHealth(headRecord, root, eventIndexes, lastTick ?? 0);
+    } catch {
+      // Best-effort: an unreadable or oversized tail degrades to a zeroed health window.
+    }
+  }
+
+  const epoch = currentRunId !== null ? chain.length : (chain.length > 0 ? chain.length - 1 : null);
+
+  return {
+    experimentId: LAB_LIVE_EXPERIMENT_ID,
+    universeId: LIVE_UNIVERSE_ID,
+    currentRunId,
+    epoch,
+    head: { lastSeq, lastTick },
+    boundary,
+    cognitionHealth,
+    chain,
+  };
 }
 
 function parseEventQuery(url: URL): { after: number; limit: number } {
