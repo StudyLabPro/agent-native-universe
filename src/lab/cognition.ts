@@ -25,12 +25,12 @@
  */
 
 import { canonicalJson, sha256Hex } from "./canonical.js";
-import type { NeutralPolicy } from "./neutral-policy.js";
 import type { NeutralPolicyRandomSource } from "./neutral-policy.js";
 import type { LogicalPolicy } from "./policy-schedule.js";
 import type { JsonObject, JsonValue } from "../core/types.js";
 import type {
   LabAgentState,
+  LiveThinkTier,
   NeutralPolicyCheckpoint,
   Observation,
   ResourceKind,
@@ -86,6 +86,21 @@ export interface CognitionRecord {
    * port's content byte budget. The actions were parsed from the full answer.
    */
   truncated?: boolean;
+  /**
+   * Genesis-Live only (phase L1b): the thinking tier this consultation was
+   * actually charged at. Absent for every science-track record (cohorts A/B
+   * and the canary never set it), so its presence alone distinguishes live
+   * evidence at the record level without a manifest lookup.
+   */
+  tier?: LiveThinkTier;
+  /**
+   * Genesis-Live only: the tier the agent asked for on its NEXT consultation,
+   * parsed from the answer. `expectedTier` (`live/live-cognition.ts`) turns
+   * this — read back from the agent's previous record — into the tier it is
+   * actually charged for, downgrading or starving it when its `llmTokens`
+   * balance cannot cover the request.
+   */
+  nextTier?: LiveThinkTier;
 }
 
 export interface CognitionPort {
@@ -385,10 +400,20 @@ export class RecordedCognition implements CognitionPort {
  */
 export class CohortPolicy implements LogicalPolicy {
   readonly id: string;
-  readonly #fallback: NeutralPolicy;
+  readonly #fallback: LogicalPolicy;
   #current = new Map<string, WorldAction[]>();
 
-  constructor(cohort: CohortId, fallback: NeutralPolicy) {
+  /**
+   * The fallback is `LogicalPolicy`, not the concrete `NeutralPolicy` class:
+   * the scientific track always passes a `NeutralPolicy` (an unsteered cohort
+   * agent gets the reproducible control's answer), but Genesis-Live (phase
+   * L1b) passes `LiveIdlePolicy` instead — an unsteered live agent does
+   * nothing, on purpose (design invariant 2: no code-solved answer may stand
+   * in for a live agent's own thinking). Both satisfy `LogicalPolicy` and
+   * both checkpoint through the exact same `NeutralPolicyCheckpoint` shape,
+   * so no second checkpoint format or resume path is needed for either.
+   */
+  constructor(cohort: CohortId, fallback: LogicalPolicy) {
     this.id = `cohort-${cohort.toLowerCase()}-${fallback.id}`;
     this.#fallback = fallback;
   }
@@ -421,10 +446,16 @@ export class CohortPolicy implements LogicalPolicy {
    * fallback would.
    */
   checkpoint(): NeutralPolicyCheckpoint {
+    if (this.#fallback.checkpoint === undefined) {
+      throw new Error(`Cohort policy fallback ${this.#fallback.id} does not support deterministic resume`);
+    }
     return this.#fallback.checkpoint();
   }
 
   restore(checkpoint: NeutralPolicyCheckpoint, root: NeutralPolicyRandomSource): void {
+    if (this.#fallback.restore === undefined) {
+      throw new Error(`Cohort policy fallback ${this.#fallback.id} does not support deterministic resume`);
+    }
     this.#fallback.restore(checkpoint, root);
   }
 }

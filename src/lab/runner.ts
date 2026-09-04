@@ -27,6 +27,11 @@ import { LlmRouter, OpenAICompatibleProvider, assertRequestOverrides } from "../
 import type { JsonObject } from "../core/types.js";
 import { LlmCognition, type CognitionPort } from "./cognition.js";
 import { GenesisRunPausedError, runGenesis } from "./genesis.js";
+import {
+  LiveCognition,
+  assertLiveTiersSpec,
+  type LiveTiersSpec,
+} from "./live/live-cognition.js";
 import { LLM_GATEWAY_FATAL_EXIT_CODE, LlmGateway, type LlmGatewayMeteringFailureMode } from "./gateway.js";
 import { startObserverServer } from "./observer.js";
 import {
@@ -43,6 +48,7 @@ import {
   LAB_LIVE_CANARY_EXPERIMENT_ID,
   LAB_LIVE_EXPERIMENT_ID,
   LAB_SCIENCE_EXPERIMENT_ID,
+  LIVE_THINK_TIERS,
   isLabExperimentId,
   type GenesisConfig,
   type LabExperimentId,
@@ -639,6 +645,97 @@ async function createCohortCognition(raw: string | undefined): Promise<Cognition
     contentByteBudget: positiveEnv("ANU_LLM_CONTENT_BYTE_BUDGET", 65_536),
     ...(requestOverrides === undefined ? {} : { requestOverrides }),
   });
+}
+
+/**
+ * Builds the Genesis-Live cognition port from environment configuration
+ * (design §4.D; phase L1b). Mirrors `createCohortCognition`'s wiring pattern
+ * — same secret handling, same gateway-identity resolution — but for the
+ * live tiers rather than a single cohort model. `ANU_LIVE_TIERS` absent means
+ * this build is not configured for a live consultation loop; the caller
+ * decides what that means (phase L3's `live` command is not implemented in
+ * this build regardless, so this function exists to be called from there,
+ * not from anywhere reachable today).
+ *
+ * One `LlmRouter` carries all three tiers' providers, each tagged with its
+ * own `tier:<name>` capability so `LiveCognition` can require exactly one of
+ * them per consultation (see `live-cognition.ts`'s module doc) — the "one
+ * LlmRouter, three deployments" wiring the design calls for, without letting
+ * an unhealthy tier's circuit silently reroute a consultation to a different
+ * model.
+ */
+export async function createLiveCognition(): Promise<LiveCognition | undefined> {
+  const raw = process.env.ANU_LIVE_TIERS;
+  if (raw === undefined) return undefined;
+  const tiers = parseLiveTiersEnv(raw);
+
+  const apiKeyFile = process.env.ANU_LLM_API_KEY_FILE;
+  if (apiKeyFile !== undefined && process.env.ANU_LLM_API_KEY !== undefined) {
+    throw new Error("Set only one of ANU_LLM_API_KEY and ANU_LLM_API_KEY_FILE");
+  }
+  const apiKey = apiKeyFile === undefined
+    ? process.env.ANU_LLM_API_KEY
+    : await readSecretFile(safePath(apiKeyFile, "ANU_LLM_API_KEY_FILE"), "LLM API key");
+  const baseUrl = process.env.ANU_LLM_BASE_URL;
+  if (!baseUrl) throw new Error("Live cognition requires ANU_LLM_BASE_URL");
+
+  const router = new LlmRouter();
+  for (const tier of LIVE_THINK_TIERS) {
+    const config = tiers[tier];
+    router.register(new OpenAICompatibleProvider({
+      baseUrl,
+      defaultModel: config.model,
+      ...(apiKey === undefined ? {} : { apiKey }),
+      timeoutMs: config.timeoutMs,
+      cooldownMs: positiveEnv("ANU_LLM_COOLDOWN_MS", 30_000),
+      id: `live-${tier}`,
+      capabilities: ["chat", "json", `tier:${tier}`],
+    }));
+  }
+
+  // The three tiers share one gateway; each model's identity resolution also
+  // confirms the gateway allows that specific model.
+  let gatewayIdentity: string | undefined;
+  for (const tier of LIVE_THINK_TIERS) {
+    const identity = await resolveCognitionTreatmentIdentity(baseUrl, tiers[tier].model);
+    if (gatewayIdentity === undefined) gatewayIdentity = identity;
+    else if (gatewayIdentity !== identity) {
+      throw new Error("Live cognition tiers resolved to different gateway identities");
+    }
+  }
+
+  return new LiveCognition({
+    completion: router,
+    tiers,
+    gatewayIdentity: gatewayIdentity!,
+    contentByteBudget: positiveEnv("ANU_LLM_CONTENT_BYTE_BUDGET", 65_536),
+  });
+}
+
+/**
+ * `ANU_LIVE_TIERS` is a JSON object `{fast,standard,deliberate}`, each with
+ * `model`, `maxTokens`, `timeoutMs`, `concurrency`, `pricePpm` and an
+ * optional `requestOverrides` (the same `ANU_LLM_REQUEST_OVERRIDES` shape,
+ * per tier — e.g. `{"reasoning_effort":"low"}` for `gpt-oss-120b`). Validated
+ * by `assertLiveTiersSpec` in `live-cognition.ts`, the same function the port
+ * itself validates its `tiers` option with, so the CLI and the port can never
+ * disagree about what is acceptable.
+ */
+function parseLiveTiersEnv(raw: string): LiveTiersSpec {
+  if (Buffer.byteLength(raw, "utf8") > 16_384) {
+    throw new Error("ANU_LIVE_TIERS must not exceed 16384 bytes");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("ANU_LIVE_TIERS must be a JSON object");
+  }
+  try {
+    return assertLiveTiersSpec(parsed);
+  } catch (error) {
+    throw new Error(`ANU_LIVE_TIERS: ${safeErrorMessage(error)}`);
+  }
 }
 
 /**

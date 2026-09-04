@@ -36,3 +36,5 @@ export * from "./population.js";
 export * from "./observer.js";
 export * from "./gateway.js";
 export * from "./live/identity.js";
+export * from "./live/live-cognition.js";
+export * from "./live/live-idle-policy.js";
