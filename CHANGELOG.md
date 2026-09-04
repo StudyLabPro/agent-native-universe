@@ -399,6 +399,38 @@ follows [Semantic Versioning](https://semver.org/).
   is actually chosen, each verified, and each then re-signed with a tampered
   outcome and refused.
 
+### Observer state projection, found by a real deployment
+
+Both defects below were found by StudyLabPro's own local drill against a real
+running live universe — a real site bridging to a real Observer over a real
+epoch chain — not by any test written against either repository alone.
+
+- `GET /api/runs/:id/state` never returned `eventHash` or `stateHash`, so the
+  site's bootstrap trust model (re-hash the checkpoint against the observer's
+  own claim, chain-verify everything after it) had nothing to check against
+  and refused every state response outright. `projectRunState` now tracks the
+  checkpoint's own `eventHash` (or `initialEventHash(manifest)` when there is
+  no checkpoint yet), advances it to the last replayed tail event's hash, and
+  returns a fresh `hashValue(state)` alongside it.
+- The same "no checkpoint yet" branch called `initialWorldState(manifest)`
+  with no genesis state at all. A first-ever or scientific run correctly
+  starts empty either way, but a live epoch chained from a parent does not —
+  its true starting state is the parent's final one, written verbatim to
+  `genesis.json` by `EvidenceStore.writeGenesisState` before the run's first
+  event. The gap silently returned an empty world for the whole width of one
+  `checkpointEvery` window at the start of every epoch after the first, which
+  a short-epoch drill configuration made large enough to observe directly:
+  a real four-agent population disappeared from the site every time a new
+  epoch began. `projectRunState` now reads `genesis.json` when present and
+  passes it to `initialWorldState`'s existing `genesisState` parameter —
+  nothing new was invented, the function already supported this.
+- `test/lab-observer-live.test.mjs` gained real-shaped coverage for both: the
+  checkpoint-plus-tail test now asserts `eventHash`/`stateHash` independently
+  (recomputed from the replayed events and `hashValue`, not just present as
+  strings), and a new test constructs an inherited epoch's `genesis.json` by
+  hand and confirms its agents survive into the projection before any
+  checkpoint exists.
+
 ### Controlled LLM egress
 
 - Added a dependency-free OpenAI-compatible gateway and `anu lab gateway` CLI

@@ -424,4 +424,5 @@ IAM role bindings applied by hand, ACME path for the Observer edge.
 | L3a live engine — epoch chain, inherited genesis, idempotent boundary, live projection | delivered (§2.1) |
 | L3b live engine — recorded task sources, verdicts, economy, recorded physics | delivered (§2.1) |
 | L3c live engine — archival and compaction, supervisor, `anu lab live` | delivered (§2.1) |
+| L6g local drill — a real site bridged to a real Observer over a real multi-epoch chained live universe, on this host, with a real provider | run once; found and fixed four defects across both repositories that no isolated test had reached (protocol-verifier action coverage, `/state` eventHash/stateHash, inherited-epoch genesis, and StudyLabPro's `cognitionHealth` shape check) — see the CHANGELOG entries at `1384df0`, `60b24ba`, `eab3f50` and StudyLabPro `898c009` |
 | C1 canary · L5 infrastructure · L6 site · L7 link inheritance · L8 background extensions | pending; dependencies and criteria in the design |
