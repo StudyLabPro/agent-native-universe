@@ -510,6 +510,6 @@ test("a cognitive CLI run binds the gateway upstream identity into its manifest"
   ));
   assert.match(
     manifest.cognitionId,
-    new RegExp(`^cognition-llm-b-v1:model-a@${identity.id}:apt1:mt64$`),
+    new RegExp(`^cognition-llm-b-v1:model-a@${identity.id}:apt1:mt64:cb65536$`),
   );
 });

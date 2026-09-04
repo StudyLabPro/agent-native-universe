@@ -23,10 +23,11 @@ import {
   attestRunEvidence,
   verifyRunEvidenceAttestation,
 } from "./evidence-attestation.js";
-import { LlmRouter, OpenAICompatibleProvider } from "../v1/economy-llm.js";
+import { LlmRouter, OpenAICompatibleProvider, assertRequestOverrides } from "../v1/economy-llm.js";
+import type { JsonObject } from "../core/types.js";
 import { LlmCognition, type CognitionPort } from "./cognition.js";
 import { GenesisRunPausedError, runGenesis } from "./genesis.js";
-import { LlmGateway } from "./gateway.js";
+import { LLM_GATEWAY_FATAL_EXIT_CODE, LlmGateway, type LlmGatewayMeteringFailureMode } from "./gateway.js";
 import { startObserverServer } from "./observer.js";
 import {
   MAX_POPULATION_PARALLELISM,
@@ -148,9 +149,10 @@ const LIVE_OPTIONS = new Set([
   "universe-id",
 ]);
 const GATEWAY_OPTIONS = new Set([
-  "audit", "api-key-env", "api-key-file", "auth-token-file", "host", "max-audit-bytes",
-  "max-in-flight", "max-requests", "max-response-bytes", "max-total-tokens", "models", "port",
-  "rate-per-minute", "timeout-ms", "upstream",
+  "audit", "audit-rotate", "api-key-env", "api-key-file", "auth-token-file", "budget-window-ms", "host",
+  "max-audit-bytes", "max-in-flight", "max-requests", "max-requests-per-window", "max-response-bytes",
+  "max-tokens-per-window", "max-total-tokens", "metering-failure-mode", "models", "port",
+  "rate-per-minute", "state-file", "timeout-ms", "upstream",
 ]);
 
 interface JsonSink {
@@ -605,17 +607,22 @@ async function createCohortCognition(raw: string | undefined): Promise<Cognition
   if (!baseUrl || !model) {
     throw new Error(`Cohort ${cohort} requires ANU_LLM_BASE_URL and ANU_LLM_MODEL`);
   }
+  // One timeout governs the consultation end to end: the provider's own
+  // timeout matches the port's so neither can silently shorten the other.
+  const timeoutMs = positiveEnv("ANU_LLM_TIMEOUT_MS", 120_000);
   const router = new LlmRouter();
   router.register(new OpenAICompatibleProvider({
     baseUrl,
     defaultModel: model,
     ...(apiKey === undefined ? {} : { apiKey }),
-    timeoutMs: 180_000,
+    timeoutMs,
+    cooldownMs: positiveEnv("ANU_LLM_COOLDOWN_MS", 30_000),
   }));
   // A direct provider is identified by its endpoint host. A gateway deployment
   // supplies ANU_LLM_IDENTITY_URL so the manifest binds the gateway's hash of
   // the real upstream rather than the gateway service name.
   const treatmentIdentity = await resolveCognitionTreatmentIdentity(baseUrl, model);
+  const requestOverrides = parseRequestOverridesEnv(process.env.ANU_LLM_REQUEST_OVERRIDES);
   return new LlmCognition({
     cohort,
     completion: router,
@@ -623,7 +630,36 @@ async function createCohortCognition(raw: string | undefined): Promise<Cognition
     agentsPerTick: positiveEnv("ANU_LLM_AGENTS_PER_TICK", 4),
     concurrency: positiveEnv("ANU_LLM_CONCURRENCY", 4),
     maxTokens: positiveEnv("ANU_LLM_MAX_TOKENS", 2_048),
+    timeoutMs,
+    contentByteBudget: positiveEnv("ANU_LLM_CONTENT_BYTE_BUDGET", 65_536),
+    ...(requestOverrides === undefined ? {} : { requestOverrides }),
   });
+}
+
+/**
+ * `ANU_LLM_REQUEST_OVERRIDES` is a JSON object merged into every completion
+ * request (e.g. `{"reasoning_effort":"low"}`). It is hashed into the cognition
+ * id by the port, so it can never change what a model contributes without
+ * changing the run identity.
+ */
+function parseRequestOverridesEnv(raw: string | undefined): JsonObject | undefined {
+  if (raw === undefined) return undefined;
+  if (Buffer.byteLength(raw, "utf8") > 4_096) {
+    throw new Error("ANU_LLM_REQUEST_OVERRIDES must not exceed 4096 bytes");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("ANU_LLM_REQUEST_OVERRIDES must be a JSON object");
+  }
+  let overrides: JsonObject;
+  try {
+    overrides = assertRequestOverrides(parsed);
+  } catch (error) {
+    throw new Error(`ANU_LLM_REQUEST_OVERRIDES: ${safeErrorMessage(error)}`);
+  }
+  return Object.keys(overrides).length === 0 ? undefined : overrides;
 }
 
 async function resolveCognitionTreatmentIdentity(baseUrl: string, model: string): Promise<string> {
@@ -1168,11 +1204,15 @@ async function executeGateway(argv: readonly string[], io: LabCliIo): Promise<vo
       usage: "anu lab gateway --upstream URL [--api-key-file PATH | --api-key-env NAME] "
         + "[--auth-token-file PATH] [--models a,b] [--max-requests N] [--max-total-tokens N] "
         + "[--rate-per-minute N] [--max-in-flight N] [--max-response-bytes N] "
-        + "[--audit PATH] [--max-audit-bytes N] [--host HOST] [--port 0..65535] [--timeout-ms N]",
+        + "[--audit PATH] [--max-audit-bytes N] [--audit-rotate N] [--state-file PATH] "
+        + "[--budget-window-ms N] [--max-tokens-per-window N] [--max-requests-per-window N] "
+        + "[--metering-failure-mode latch|exit] [--host HOST] [--port 0..65535] [--timeout-ms N]",
       notes: [
         "The provider credential is read from a no-follow file or from the environment variable named by --api-key-env, never from an argument.",
         "Only POST /v1/chat/completions is forwarded; streaming is refused; the audit log holds metadata, never message content.",
-        "--max-total-tokens is a post-response stop threshold, not a hard billing cap; set the hard financial limit at the provider.",
+        "--max-total-tokens and --max-tokens-per-window are post-response stop thresholds, not hard billing caps; set the hard financial limit at the provider.",
+        "--state-file persists the counters and the budget window across restarts; --audit-rotate keeps N rotated audit files instead of failing closed at --max-audit-bytes.",
+        `--metering-failure-mode exit answers the failing request, writes the state file and exits with code ${LLM_GATEWAY_FATAL_EXIT_CODE} so a supervisor can restart the gateway with its budgets intact.`,
       ],
     });
     return;
@@ -1208,10 +1248,42 @@ async function executeGateway(argv: readonly string[], io: LabCliIo): Promise<vo
   const maxInFlight = optionalPositiveInteger(options.values, "max-in-flight");
   const maxResponseBytes = optionalPositiveInteger(options.values, "max-response-bytes");
   const maxAuditBytes = optionalPositiveInteger(options.values, "max-audit-bytes");
+  const auditRotate = optionalPositiveInteger(options.values, "audit-rotate");
   const timeoutMs = optionalPositiveInteger(options.values, "timeout-ms");
+  const budgetWindowMs = optionalPositiveInteger(options.values, "budget-window-ms");
+  const maxTokensPerWindow = optionalPositiveInteger(options.values, "max-tokens-per-window");
+  const maxRequestsPerWindow = optionalPositiveInteger(options.values, "max-requests-per-window");
   const audit = options.values.get("audit");
+  const stateFileOption = options.values.get("state-file");
+  const stateFile = stateFileOption === undefined ? undefined : safePath(stateFileOption, "state-file");
+  const rawFailureMode = options.values.get("metering-failure-mode");
+  if (rawFailureMode !== undefined && rawFailureMode !== "latch" && rawFailureMode !== "exit") {
+    throw new CliUsageError("--metering-failure-mode must be latch or exit");
+  }
+  const meteringFailureMode: LlmGatewayMeteringFailureMode = rawFailureMode ?? "latch";
+  if (auditRotate !== undefined && audit === undefined) {
+    throw new CliUsageError("--audit-rotate requires --audit");
+  }
+  if ((maxTokensPerWindow !== undefined || maxRequestsPerWindow !== undefined) && budgetWindowMs === undefined) {
+    throw new CliUsageError("--max-tokens-per-window and --max-requests-per-window require --budget-window-ms");
+  }
 
   let gateway: LlmGateway;
+  const onFatal = (reason: string): void => {
+    // The failing request has been answered and the state file written. Hand
+    // the process to its supervisor with a code that says "retry later", not
+    // "misconfigured": a restart continues the persisted budgets.
+    writeJson(io.stderr, {
+      command: "gateway",
+      status: "fatal",
+      reason,
+      exitCode: LLM_GATEWAY_FATAL_EXIT_CODE,
+      ...gateway.stats(),
+    });
+    const forceTimer = setTimeout(() => process.exit(LLM_GATEWAY_FATAL_EXIT_CODE), 10_000);
+    forceTimer.unref();
+    void gateway.close().finally(() => process.exit(LLM_GATEWAY_FATAL_EXIT_CODE));
+  };
   try {
     gateway = new LlmGateway({
       upstreamUrl: upstream,
@@ -1224,8 +1296,15 @@ async function executeGateway(argv: readonly string[], io: LabCliIo): Promise<vo
       ...(maxInFlight === undefined ? {} : { maxInFlight }),
       ...(maxResponseBytes === undefined ? {} : { maxResponseBytes }),
       ...(maxAuditBytes === undefined ? {} : { maxAuditBytes }),
+      ...(auditRotate === undefined ? {} : { auditRotate }),
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
       ...(audit === undefined ? {} : { auditPath: safePath(audit, "audit") }),
+      ...(stateFile === undefined ? {} : { stateFile }),
+      ...(budgetWindowMs === undefined ? {} : { budgetWindowMs }),
+      ...(maxTokensPerWindow === undefined ? {} : { maxTokensPerWindow }),
+      ...(maxRequestsPerWindow === undefined ? {} : { maxRequestsPerWindow }),
+      meteringFailureMode,
+      ...(meteringFailureMode === "exit" ? { onFatal } : {}),
     });
   } catch (error) {
     throw new CliUsageError(safeErrorMessage(error));
@@ -1235,6 +1314,9 @@ async function executeGateway(argv: readonly string[], io: LabCliIo): Promise<vo
     bound = await gateway.listen(port, host);
   } catch (error) {
     if (error instanceof Error && /non-loopback bind without client Bearer/.test(error.message)) {
+      throw new CliUsageError(error.message);
+    }
+    if (error instanceof Error && /Gateway state file/.test(error.message)) {
       throw new CliUsageError(error.message);
     }
     throw error;
@@ -1255,8 +1337,16 @@ async function executeGateway(argv: readonly string[], io: LabCliIo): Promise<vo
       maxInFlight: maxInFlight ?? 4,
       maxResponseBytes: maxResponseBytes ?? 8_388_608,
       maxAuditBytes: audit === undefined ? "disabled" : maxAuditBytes ?? 67_108_864,
+      auditRotate: audit === undefined ? "disabled" : auditRotate ?? "fail-closed",
+      budgetWindowMs: budgetWindowMs ?? "disabled",
+      maxTokensPerWindow: maxTokensPerWindow ?? "unlimited",
+      maxRequestsPerWindow: maxRequestsPerWindow ?? "unlimited",
     },
     audit: audit ?? "disabled",
+    stateFile: stateFile ?? "disabled",
+    meteringFailureMode,
+    // Restored counters, so an operator can see a restart continued a budget.
+    counters: { totalTokens: gateway.stats().totalTokens, forwarded: gateway.stats().forwarded },
   });
 }
 

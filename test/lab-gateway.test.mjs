@@ -1,11 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { LlmGateway } from "../dist/lab/index.js";
+import { LLM_GATEWAY_FATAL_EXIT_CODE, LlmGateway } from "../dist/lab/index.js";
+
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const SECRET_KEY = "sk-upstream-secret-000";
 const SECRET_PROMPT = "the launch code is 0000";
@@ -46,6 +51,10 @@ async function chat(port, body, headers = {}) {
     body: JSON.stringify(body),
   });
   return { status: response.status, headers: response.headers, json: await response.json() };
+}
+
+async function waitFor(predicate) {
+  while (!predicate()) await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
 }
 
 test("the gateway forwards a completion and the client never holds the key", async (t) => {
@@ -354,4 +363,285 @@ test("audit failure stops a request before provider egress and degrades readines
   assert.equal(response.json.error, "audit_unavailable");
   assert.equal(upstream.seen.length, 0);
   assert.equal((await fetch(`http://127.0.0.1:${port}/readyz`)).status, 503);
+});
+
+/* ------------------------------------------------------------------ */
+/* Hardening: audit rotation, persisted state, sliding-window budgets, */
+/* the metering-failure-mode exit path (L1a)                          */
+/* ------------------------------------------------------------------ */
+
+test("audit rotation keeps a bounded number of rotated files instead of failing closed", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-gateway-rotate-"));
+  const auditPath = join(directory, "gateway.jsonl");
+  const upstream = await startUpstream();
+  const gateway = new LlmGateway({
+    upstreamUrl: upstream.url,
+    auditPath,
+    maxAuditBytes: 400,
+    auditRotate: 2,
+  });
+  const { port } = await gateway.listen(0);
+  t.after(async () => {
+    await gateway.close();
+    await upstream.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  for (let index = 0; index < 15; index += 1) {
+    assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  }
+
+  const active = await readFile(auditPath, "utf8");
+  assert.ok(active.length > 0, "the active audit file must still be written to");
+  const rotated1 = await readFile(`${auditPath}.1`, "utf8");
+  assert.ok(rotated1.length > 0, "the most recently rotated file must exist");
+  await assert.rejects(readFile(`${auditPath}.3`), { code: "ENOENT" }, "only auditRotate files are kept");
+
+  // A gateway that fails closed at the same size would refuse by now; this
+  // one keeps accepting requests because rotation, not refusal, is the policy.
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+});
+
+test("--state-file persists counters across listen()/close() and a restart continues the same budget", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-gateway-state-"));
+  const stateFile = join(directory, "gateway-state.json");
+  const upstream = await startUpstream();
+  t.after(async () => {
+    await upstream.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const first = new LlmGateway({ upstreamUrl: upstream.url, stateFile });
+  const opened = await first.listen(0);
+  assert.equal((await chat(opened.port, { model: "m", messages: [] })).status, 200);
+  assert.equal((await chat(opened.port, { model: "m", messages: [] })).status, 200);
+  assert.equal(first.stats().totalTokens, 80);
+  assert.equal(first.stats().forwarded, 2);
+  await first.close();
+
+  const persisted = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(persisted.schemaVersion, 1);
+  assert.equal(persisted.totalTokens, 80);
+  assert.equal(persisted.forwarded, 2);
+
+  // A fresh instance, same upstream (so the same gateway identity), loads the
+  // persisted counters in listen() — before it has served a single request.
+  const restarted = new LlmGateway({ upstreamUrl: upstream.url, stateFile });
+  const reopened = await restarted.listen(0);
+  t.after(() => restarted.close());
+  assert.equal(restarted.stats().totalTokens, 80, "counters must be restored before the first request");
+  assert.equal(restarted.stats().forwarded, 2);
+  assert.equal((await chat(reopened.port, { model: "m", messages: [] })).status, 200);
+  assert.equal(restarted.stats().totalTokens, 120, "a restart continues the same budget, it does not reset it");
+});
+
+test("a state file from a different upstream is refused rather than silently adopted", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-gateway-state-mismatch-"));
+  const stateFile = join(directory, "gateway-state.json");
+  const upstreamA = await startUpstream();
+  const upstreamB = await startUpstream();
+  t.after(async () => {
+    await upstreamA.close();
+    await upstreamB.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const gatewayA = new LlmGateway({ upstreamUrl: upstreamA.url, stateFile });
+  await gatewayA.listen(0);
+  await gatewayA.close();
+
+  const gatewayB = new LlmGateway({ upstreamUrl: upstreamB.url, stateFile });
+  await assert.rejects(gatewayB.listen(0), /belongs to another gateway configuration/);
+});
+
+test("a sliding token-per-window budget refuses at the threshold and recovers as the window slides", async (t) => {
+  const upstream = await startUpstream();
+  let clock = 0;
+  const gateway = new LlmGateway({
+    upstreamUrl: upstream.url,
+    budgetWindowMs: 60_000,
+    maxTokensPerWindow: 80,
+    now: () => clock,
+  });
+  const { port } = await gateway.listen(0);
+  t.after(async () => {
+    await gateway.close();
+    await upstream.close();
+  });
+
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  const exhausted = await chat(port, { model: "m", messages: [] });
+  assert.equal(exhausted.status, 429);
+  assert.equal(exhausted.json.error, "token_window_exhausted");
+  assert.equal(upstream.seen.length, 2, "a window refusal must never reach the provider");
+
+  // The window slides: past its length, the same request forwards again.
+  clock += 60_001;
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  assert.equal(upstream.seen.length, 3);
+});
+
+test("a sliding request-per-window budget refuses at the threshold and recovers as the window slides", async (t) => {
+  const upstream = await startUpstream();
+  let clock = 0;
+  const gateway = new LlmGateway({
+    upstreamUrl: upstream.url,
+    budgetWindowMs: 60_000,
+    maxRequestsPerWindow: 2,
+    now: () => clock,
+  });
+  const { port } = await gateway.listen(0);
+  t.after(async () => {
+    await gateway.close();
+    await upstream.close();
+  });
+
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  const exhausted = await chat(port, { model: "m", messages: [] });
+  assert.equal(exhausted.status, 429);
+  assert.equal(exhausted.json.error, "request_window_exhausted");
+
+  clock += 60_001;
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  assert.equal(upstream.seen.length, 3);
+});
+
+test("--metering-failure-mode exit persists the last metered response before reporting the fatal reason", async (t) => {
+  const upstream = await startUpstream((requestNumber) => (requestNumber === 1
+    ? {
+      id: "cmpl-1",
+      choices: [{ message: { role: "assistant", content: "ok" } }],
+      usage: { prompt_tokens: 10, completion_tokens: 30, total_tokens: 40 },
+    }
+    : {
+      id: "cmpl-2",
+      choices: [{ message: { role: "assistant", content: "not accountable" } }],
+      usage: { prompt_tokens: 10, completion_tokens: 1, total_tokens: -1 },
+    }));
+  const directory = await mkdtemp(join(tmpdir(), "anu-gateway-exit-"));
+  const stateFile = join(directory, "gateway-state.json");
+  const fatal = [];
+  const gateway = new LlmGateway({
+    upstreamUrl: upstream.url,
+    stateFile,
+    meteringFailureMode: "exit",
+    onFatal: (reason) => fatal.push(reason),
+  });
+  const { port } = await gateway.listen(0);
+  t.after(async () => {
+    await gateway.close();
+    await upstream.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 200);
+  const second = await chat(port, { model: "m", messages: [] });
+  assert.equal(second.status, 502);
+  assert.equal(second.json.error, "upstream_usage_invalid");
+
+  // onFatal fires only once the failing response has already been sent.
+  await waitFor(() => fatal.length > 0);
+  assert.deepEqual(fatal, ["metering_unavailable"]);
+  // Latched from here regardless of mode: exit hands off to the supervisor,
+  // it does not keep answering with degraded accounting in the meantime.
+  assert.equal((await chat(port, { model: "m", messages: [] })).status, 503);
+
+  const persisted = JSON.parse(await readFile(stateFile, "utf8"));
+  // forwarded counts requests sent upstream, including the one whose usage
+  // turned out to be unaccountable; totalTokens only ever grows from usage
+  // the gateway could actually trust.
+  assert.equal(persisted.totalTokens, 40, "only the successfully metered response is on record");
+  assert.equal(persisted.forwarded, 2);
+
+  await gateway.close();
+  const restarted = new LlmGateway({ upstreamUrl: upstream.url, stateFile });
+  await restarted.listen(0);
+  t.after(() => restarted.close());
+  assert.equal(restarted.stats().totalTokens, 40, "a restart continues the persisted budget, not a fresh one");
+});
+
+test("a response over --max-response-bytes takes the same fatal path as an unmetered response", async (t) => {
+  const upstream = await startUpstream(() => ({
+    id: "big",
+    choices: [{ message: { role: "assistant", content: "x".repeat(1_024) } }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  }));
+  const fatal = [];
+  const gateway = new LlmGateway({
+    upstreamUrl: upstream.url,
+    maxResponseBytes: 64,
+    meteringFailureMode: "exit",
+    onFatal: (reason) => fatal.push(reason),
+  });
+  const { port } = await gateway.listen(0);
+  t.after(async () => {
+    await gateway.close();
+    await upstream.close();
+  });
+
+  const result = await chat(port, { model: "m", messages: [] });
+  assert.equal(result.status, 502);
+  assert.equal(result.json.error, "upstream_response_too_large");
+
+  await waitFor(() => fatal.length > 0);
+  assert.deepEqual(fatal, ["metering_unavailable"]);
+});
+
+test("the gateway CLI exits with the fatal exit code and its state file survives it", async (t) => {
+  const upstream = await startUpstream(() => ({
+    id: "cli-exit",
+    choices: [{ message: { role: "assistant", content: "not accountable" } }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: -1 },
+  }));
+  const directory = await mkdtemp(join(tmpdir(), "anu-gateway-cli-exit-"));
+  const stateFile = join(directory, "gateway-state.json");
+  t.after(async () => {
+    await upstream.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const child = spawn(
+    process.execPath,
+    [
+      "dist/lab/runner.js", "gateway",
+      "--upstream", upstream.url,
+      "--state-file", stateFile,
+      "--metering-failure-mode", "exit",
+      "--port", "0",
+    ],
+    { cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stdout = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+  const listening = await new Promise((resolveListening, rejectListening) => {
+    const onData = () => {
+      for (const line of stdout.trim().split("\n").filter(Boolean)) {
+        const parsed = JSON.parse(line);
+        if (parsed.status === "listening") {
+          child.stdout.off("data", onData);
+          resolveListening(parsed);
+          return;
+        }
+      }
+    };
+    child.stdout.on("data", onData);
+    child.once("exit", (code) => rejectListening(new Error(`exited before listening: code=${code} stderr=${stderr}`)));
+  });
+
+  const response = await chat(listening.port, { model: "m", messages: [] });
+  assert.equal(response.status, 502);
+
+  const [exitCode] = await once(child, "exit");
+  assert.equal(exitCode, LLM_GATEWAY_FATAL_EXIT_CODE, stderr);
+  assert.equal(exitCode, 75);
+
+  const persisted = JSON.parse(await readFile(stateFile, "utf8"));
+  assert.equal(persisted.schemaVersion, 1);
 });

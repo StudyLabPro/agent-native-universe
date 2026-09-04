@@ -22,12 +22,16 @@ import {
   toParetoPoints,
 } from "../dist/lab/pareto.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
-import { runGenesis } from "../dist/lab/genesis.js";
+import { GenesisRunPausedError, runGenesis } from "../dist/lab/genesis.js";
 import {
   LAB_COGNITIVE_ENGINE_VERSION,
   LAB_ENGINE_VERSION,
   createRunManifest,
 } from "../dist/lab/manifest.js";
+
+async function waitFor(predicate) {
+  while (!predicate()) await new Promise((resolvePromise) => setTimeout(resolvePromise, 1));
+}
 
 /* ------------------------------------------------------------------ */
 /* Validation of model output                                          */
@@ -175,6 +179,194 @@ test("cohort A consults nothing", async () => {
 });
 
 /* ------------------------------------------------------------------ */
+/* Hardening: content budget, overrides, timeout, abort (L1a)          */
+/* ------------------------------------------------------------------ */
+
+test("an answer over the content byte budget is truncated, marked, and changes the id", async () => {
+  const bigContent = JSON.stringify({ actions: [{ type: "observe" }], padding: "x".repeat(200_000) });
+  const completion = {
+    async complete() {
+      return {
+        provider: "scripted",
+        model: "m",
+        content: bigContent,
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        latencyMs: 1,
+      };
+    },
+  };
+  const defaultBudget = new LlmCognition({ cohort: "C", model: "m@h", completion, agentsPerTick: 1 });
+  assert.match(defaultBudget.id, /:cb65536$/);
+  const [record] = await defaultBudget.propose([request]);
+  assert.equal(record.truncated, true);
+  assert.equal(Buffer.byteLength(record.content, "utf8"), 65_536);
+  // The actions were parsed from the full answer before the recorded content
+  // was truncated: truncation must not corrupt the action the model chose.
+  assert.deepEqual(record.actions, [{ type: "observe" }]);
+
+  const smallBudget = new LlmCognition({
+    cohort: "C", model: "m@h", completion, agentsPerTick: 1, contentByteBudget: 1_024,
+  });
+  assert.match(smallBudget.id, /:cb1024$/);
+  assert.notEqual(smallBudget.id, defaultBudget.id, "a different budget must never share an identity");
+  const [smallRecord] = await smallBudget.propose([request]);
+  assert.equal(smallRecord.truncated, true);
+  assert.equal(Buffer.byteLength(smallRecord.content, "utf8"), 1_024);
+
+  const shortCompletion = {
+    async complete() {
+      return {
+        provider: "scripted",
+        model: "m",
+        content: JSON.stringify({ actions: [{ type: "observe" }] }),
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        latencyMs: 1,
+      };
+    },
+  };
+  const untouched = new LlmCognition({ cohort: "C", model: "m@h", completion: shortCompletion, agentsPerTick: 1 });
+  const [shortRecord] = await untouched.propose([request]);
+  assert.equal(shortRecord.truncated, undefined, "an answer within budget must not be marked truncated");
+});
+
+test("request overrides reach the wire body and are hashed into the id", async () => {
+  let seenRequest;
+  const completion = {
+    async complete(req) {
+      seenRequest = req;
+      return {
+        provider: "scripted",
+        model: "m",
+        content: JSON.stringify({ actions: [] }),
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        latencyMs: 1,
+      };
+    },
+  };
+  const withOverrides = new LlmCognition({
+    cohort: "C",
+    model: "m@h",
+    completion,
+    agentsPerTick: 1,
+    requestOverrides: { reasoning_effort: "low" },
+  });
+  assert.match(withOverrides.id, /:ro[0-9a-f]{8}$/);
+  await withOverrides.propose([request]);
+  assert.deepEqual(seenRequest.extra, { reasoning_effort: "low" });
+
+  const differentOverrides = new LlmCognition({
+    cohort: "C",
+    model: "m@h",
+    completion,
+    agentsPerTick: 1,
+    requestOverrides: { reasoning_effort: "high" },
+  });
+  assert.notEqual(differentOverrides.id, withOverrides.id, "different overrides must never share an identity");
+
+  const noOverrides = new LlmCognition({ cohort: "C", model: "m@h", completion, agentsPerTick: 1 });
+  assert.doesNotMatch(noOverrides.id, /:ro/);
+
+  assert.throws(
+    () => new LlmCognition({
+      cohort: "C", model: "m@h", completion, agentsPerTick: 1, requestOverrides: { model: "sneaky" },
+    }),
+    /requestOverrides may not set model/,
+  );
+});
+
+test("reasoning tokens and finish reason are captured onto the record", async () => {
+  const completion = {
+    async complete() {
+      return {
+        provider: "scripted",
+        model: "m",
+        content: JSON.stringify({ actions: [] }),
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+        latencyMs: 1,
+        reasoningTokens: 42,
+        finishReason: "stop",
+      };
+    },
+  };
+  const cognition = new LlmCognition({ cohort: "C", model: "m@h", completion, agentsPerTick: 1 });
+  const [record] = await cognition.propose([request]);
+  assert.equal(record.reasoningTokens, 42);
+  assert.equal(record.finishReason, "stop");
+});
+
+test("a consultation is aborted at the port's own configured timeout", async () => {
+  const completion = {
+    async complete(_req, _policy, signal) {
+      return new Promise((_resolve, reject) => {
+        // AbortSignal.timeout()'s own internal timer is unref'd by design, so
+        // it must not be the only thing keeping the process alive: a ref'd
+        // keep-alive lets it still fire on schedule instead of the test
+        // runner deciding the event loop is empty and cancelling everything
+        // still pending. It is cleared the moment the signal actually fires.
+        const keepAlive = setInterval(() => {}, 1_000);
+        signal.addEventListener("abort", () => {
+          clearInterval(keepAlive);
+          reject(new Error("timed out upstream"));
+        }, { once: true });
+      });
+    },
+  };
+  const cognition = new LlmCognition({ cohort: "C", model: "m@h", completion, agentsPerTick: 1, timeoutMs: 20 });
+  const started = Date.now();
+  const [record] = await cognition.propose([request]);
+  assert.ok(Date.now() - started < 2_000, "the port's own timeoutMs must fire, not some larger default");
+  assert.equal(record.provider, "unavailable");
+  assert.match(record.rejected, /provider failure/);
+});
+
+test("aborting the caller's signal withdraws an in-flight consultation instead of throwing", async () => {
+  const controller = new AbortController();
+  let sawSignal;
+  const completion = {
+    async complete(_req, _policy, signal) {
+      sawSignal = signal;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("withdrawn")), { once: true });
+      });
+    },
+  };
+  const cognition = new LlmCognition({ cohort: "C", model: "m@h", completion, agentsPerTick: 1 });
+  const pending = cognition.propose([request], controller.signal);
+  await waitFor(() => sawSignal !== undefined);
+  controller.abort();
+  const [record] = await pending;
+  assert.equal(record.provider, "unavailable");
+  assert.match(record.rejected, /consultation aborted/);
+});
+
+test("a run's abort signal pauses the universe at the tick boundary after withdrawing the consultation", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-cohort-abort-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const controller = new AbortController();
+  let reached = false;
+  const completion = {
+    async complete(_req, _policy, signal) {
+      reached = true;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("withdrawn")), { once: true });
+      });
+    },
+  };
+  const config = { ...DEFAULT_GENESIS_CONFIG, ticks: 5, agents: 2, metricEvery: 1, checkpointEvery: 1 };
+  const cognition = new LlmCognition({ cohort: "C", model: "m@h", completion, agentsPerTick: 2 });
+  const runPromise = runGenesis({
+    config, runsRoot: directory, universeId: "U0003", cognition, signal: controller.signal,
+  });
+  await waitFor(() => reached);
+  controller.abort();
+  await assert.rejects(runPromise, (error) => {
+    assert.ok(error instanceof GenesisRunPausedError, `expected GenesisRunPausedError, got ${error}`);
+    assert.equal(error.tick, 1, "the tick in flight when the signal fired must still be the one that paused");
+    return true;
+  });
+});
+
+/* ------------------------------------------------------------------ */
 /* Pareto                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -287,7 +479,7 @@ test("a cognitive run takes its own engine identity and replays exactly", async 
   assert.equal(manifest.engineVersion, LAB_COGNITIVE_ENGINE_VERSION);
   assert.notEqual(manifest.engineVersion, LAB_ENGINE_VERSION);
   assert.match(manifest.policyId, /^cohort-c-/);
-  assert.match(manifest.cognitionId, /^cognition-llm-c-v1:scripted-1@test:apt2:mt2048$/);
+  assert.match(manifest.cognitionId, /^cognition-llm-c-v1:scripted-1@test:apt2:mt2048:cb65536$/);
 
   // The consulted model is part of the run identity: the same cohort against
   // a different model must get its own runId instead of silently recovering

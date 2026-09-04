@@ -245,6 +245,13 @@ export interface LlmRequest {
   maxTokens?: number;
   responseFormat?: "text" | "json";
   metadata?: JsonObject;
+  /**
+   * Provider-specific request fields merged into the wire body verbatim
+   * (e.g. `{"reasoning_effort":"low"}`). They never override `model`,
+   * `messages` or `stream`. Anything here changes what the model contributes,
+   * so callers that record evidence must hash it into their identity.
+   */
+  extra?: JsonObject;
 }
 
 export interface LlmUsage {
@@ -260,6 +267,26 @@ export interface LlmResponse {
   usage: LlmUsage;
   latencyMs: number;
   raw?: JsonValue;
+  /** `message.reasoning_content` when the provider exposes its reasoning. */
+  reasoningContent?: string;
+  /** `usage.completion_tokens_details.reasoning_tokens` when reported. */
+  reasoningTokens?: number;
+  /** `choices[0].finish_reason` when reported, e.g. `stop` or `length`. */
+  finishReason?: string;
+}
+
+/**
+ * Circuit state of a provider: `closed` serves requests; `open` refuses them
+ * until `cooldownMs` has elapsed since the last failure; `half-open` admits
+ * exactly one recovery probe, whose outcome closes or re-opens the circuit.
+ */
+export type LlmProviderCircuitState = "closed" | "open" | "half-open";
+
+export interface LlmProviderHealth {
+  healthy: boolean;
+  consecutiveFailures: number;
+  lastLatencyMs?: number;
+  state?: LlmProviderCircuitState;
 }
 
 export interface LlmProvider {
@@ -268,39 +295,115 @@ export interface LlmProvider {
   readonly estimatedInputCostPerMillion: number;
   readonly estimatedOutputCostPerMillion: number;
   complete(request: LlmRequest, signal?: AbortSignal): Promise<LlmResponse>;
-  health(): { healthy: boolean; consecutiveFailures: number; lastLatencyMs?: number };
+  health(): LlmProviderHealth;
 }
+
+export interface HttpLlmProviderConfig {
+  baseUrl: string;
+  apiKey?: string;
+  defaultModel: string;
+  timeoutMs?: number;
+  /**
+   * How long the provider stays excluded after `failureThreshold` consecutive
+   * failures before a single recovery probe is admitted. Without it a provider
+   * that failed three times in a row would be excluded for the rest of the
+   * process, because the router never calls an unhealthy provider and only a
+   * successful call resets the counter.
+   */
+  cooldownMs?: number;
+  /** Consecutive failures that open the circuit. Defaults to 3. */
+  failureThreshold?: number;
+  /** Injectable clock for the circuit. Operational only: never part of evidence. */
+  now?: () => number;
+}
+
+const DEFAULT_PROVIDER_TIMEOUT_MS = 60_000;
+const DEFAULT_PROVIDER_COOLDOWN_MS = 30_000;
+const DEFAULT_PROVIDER_FAILURE_THRESHOLD = 3;
 
 abstract class HttpLlmProvider implements LlmProvider {
   abstract readonly id: string;
   abstract readonly capabilities: ReadonlySet<string>;
   abstract readonly estimatedInputCostPerMillion: number;
   abstract readonly estimatedOutputCostPerMillion: number;
+  readonly #now: () => number;
+  readonly #cooldownMs: number;
+  readonly #failureThreshold: number;
   #failures = 0;
+  #lastFailureAt: number | undefined;
+  #probing = false;
   #lastLatencyMs?: number;
 
   constructor(
-    readonly config: { baseUrl: string; apiKey?: string; defaultModel: string; timeoutMs?: number },
+    readonly config: HttpLlmProviderConfig,
     readonly fetchImpl: typeof fetch = fetch,
-  ) {}
+  ) {
+    for (const [name, value] of Object.entries({
+      timeoutMs: config.timeoutMs,
+      cooldownMs: config.cooldownMs,
+      failureThreshold: config.failureThreshold,
+    })) {
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
+        throw new Error(`Provider ${name} must be a positive safe integer`);
+      }
+    }
+    this.#now = config.now ?? Date.now;
+    this.#cooldownMs = config.cooldownMs ?? DEFAULT_PROVIDER_COOLDOWN_MS;
+    this.#failureThreshold = config.failureThreshold ?? DEFAULT_PROVIDER_FAILURE_THRESHOLD;
+  }
 
-  health(): { healthy: boolean; consecutiveFailures: number; lastLatencyMs?: number } {
-    return { healthy: this.#failures < 3, consecutiveFailures: this.#failures, ...(this.#lastLatencyMs === undefined ? {} : { lastLatencyMs: this.#lastLatencyMs }) };
+  circuit(): LlmProviderCircuitState {
+    if (this.#failures < this.#failureThreshold) return "closed";
+    if (this.#probing) return "half-open";
+    if (this.#lastFailureAt !== undefined && this.#now() - this.#lastFailureAt >= this.#cooldownMs) return "half-open";
+    return "open";
+  }
+
+  health(): LlmProviderHealth {
+    const state = this.circuit();
+    // Half-open admits one probe at a time: while it is in flight the provider
+    // reports unhealthy so a router does not pile every waiting request on it.
+    const healthy = state === "closed" || (state === "half-open" && !this.#probing);
+    return {
+      healthy,
+      consecutiveFailures: this.#failures,
+      state,
+      ...(this.#lastLatencyMs === undefined ? {} : { lastLatencyMs: this.#lastLatencyMs }),
+    };
   }
 
   async complete(request: LlmRequest, signal?: AbortSignal): Promise<LlmResponse> {
+    const state = this.circuit();
+    if (state === "open") {
+      throw new Error(
+        `${this.id} is cooling down after ${this.#failures} consecutive failures`,
+      );
+    }
+    if (state === "half-open" && this.#probing) {
+      throw new Error(`${this.id} is half-open: a recovery probe is already in flight`);
+    }
+    const probe = state === "half-open";
+    if (probe) this.#probing = true;
     const started = Date.now();
-    const timeout = AbortSignal.timeout(this.config.timeoutMs ?? 60_000);
+    const timeout = AbortSignal.timeout(this.config.timeoutMs ?? DEFAULT_PROVIDER_TIMEOUT_MS);
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
     try {
       const response = await this.perform(request, combined);
       this.#failures = 0;
+      this.#lastFailureAt = undefined;
       this.#lastLatencyMs = Date.now() - started;
       return { ...response, latencyMs: this.#lastLatencyMs };
     } catch (error) {
-      this.#failures += 1;
       this.#lastLatencyMs = Date.now() - started;
+      // The caller withdrawing the request (shutdown) says nothing about the
+      // provider's health; a timeout or an HTTP failure does.
+      if (!signal?.aborted) {
+        this.#failures += 1;
+        this.#lastFailureAt = this.#now();
+      }
       throw error;
+    } finally {
+      if (probe) this.#probing = false;
     }
   }
 
@@ -318,34 +421,71 @@ abstract class HttpLlmProvider implements LlmProvider {
   }
 }
 
+export interface OpenAICompatibleProviderConfig {
+  baseUrl?: string;
+  apiKey?: string;
+  defaultModel: string;
+  timeoutMs?: number;
+  cooldownMs?: number;
+  failureThreshold?: number;
+  now?: () => number;
+  inputCostPerMillion?: number;
+  outputCostPerMillion?: number;
+  /**
+   * Router key. Defaults to `openai-compatible`; give each deployment its own
+   * id to register several OpenAI-compatible models in one router.
+   */
+  id?: string;
+  /** Deployment-level request fields sent with every request (see `LlmRequest.extra`). */
+  extraBody?: JsonObject;
+  /** Capabilities advertised to the router. Defaults to `chat`, `json`, `tools`. */
+  capabilities?: readonly string[];
+}
+
+/** Wire fields that request-level overrides may never replace. */
+const PROTECTED_CHAT_FIELDS: readonly string[] = ["model", "messages", "stream"];
+
 export class OpenAICompatibleProvider extends HttpLlmProvider {
-  readonly id = "openai-compatible";
-  readonly capabilities = new Set(["chat", "json", "tools"]);
+  readonly id: string;
+  readonly capabilities: ReadonlySet<string>;
   readonly estimatedInputCostPerMillion: number;
   readonly estimatedOutputCostPerMillion: number;
+  readonly #extraBody: JsonObject | undefined;
 
-  constructor(
-    config: { baseUrl?: string; apiKey?: string; defaultModel: string; timeoutMs?: number; inputCostPerMillion?: number; outputCostPerMillion?: number },
-    fetchImpl?: typeof fetch,
-  ) {
+  constructor(config: OpenAICompatibleProviderConfig, fetchImpl?: typeof fetch) {
     super({
       baseUrl: config.baseUrl ?? "https://api.openai.com/v1",
       defaultModel: config.defaultModel,
       ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
       ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+      ...(config.cooldownMs === undefined ? {} : { cooldownMs: config.cooldownMs }),
+      ...(config.failureThreshold === undefined ? {} : { failureThreshold: config.failureThreshold }),
+      ...(config.now === undefined ? {} : { now: config.now }),
     }, fetchImpl);
+    const id = config.id ?? "openai-compatible";
+    if (id.length === 0 || /\s/.test(id)) throw new Error("Provider id must be a non-empty whitespace-free string");
+    this.id = id;
+    this.capabilities = new Set(config.capabilities ?? ["chat", "json", "tools"]);
     this.estimatedInputCostPerMillion = config.inputCostPerMillion ?? 0;
     this.estimatedOutputCostPerMillion = config.outputCostPerMillion ?? 0;
+    this.#extraBody = config.extraBody === undefined ? undefined : assertRequestOverrides(config.extraBody);
   }
 
   protected async perform(request: LlmRequest, signal: AbortSignal): Promise<Omit<LlmResponse, "latencyMs">> {
     const model = request.model ?? this.config.defaultModel;
+    const extra = request.extra === undefined ? undefined : assertRequestOverrides(request.extra);
+    // Overrides are merged last, but the fields that name the deployment and
+    // the transport (`model`, `messages`, `stream`) are written after them:
+    // the gateway refuses streaming and the evidence names one model.
     const body: JsonObject = {
-      model,
-      messages: request.messages as unknown as JsonValue,
       ...(request.temperature === undefined ? {} : { temperature: request.temperature }),
       ...(request.maxTokens === undefined ? {} : { max_tokens: request.maxTokens }),
       ...(request.responseFormat === "json" ? { response_format: { type: "json_object" } } : {}),
+      ...(this.#extraBody ?? {}),
+      ...(extra ?? {}),
+      model,
+      messages: request.messages as unknown as JsonValue,
+      stream: false,
     };
     const json = await this.post("/chat/completions", body, this.config.apiKey ? { authorization: `Bearer ${this.config.apiKey}` } : {}, signal);
     const choices = json.choices as JsonValue[] | undefined;
@@ -354,14 +494,40 @@ export class OpenAICompatibleProvider extends HttpLlmProvider {
     const usage = (json.usage as JsonObject | undefined) ?? {};
     const input = Number(usage.prompt_tokens ?? 0);
     const output = Number(usage.completion_tokens ?? 0);
+    const details = usage.completion_tokens_details as JsonObject | undefined;
+    const reasoningTokens = details?.reasoning_tokens;
+    const reasoningContent = message?.reasoning_content;
+    const finishReason = first?.finish_reason;
     return {
       provider: this.id,
       model,
       content: String(message?.content ?? ""),
       usage: { inputTokens: input, outputTokens: output, totalTokens: Number(usage.total_tokens ?? input + output) },
       raw: json,
+      ...(typeof reasoningContent === "string" && reasoningContent.length > 0 ? { reasoningContent } : {}),
+      ...(typeof reasoningTokens === "number" && Number.isSafeInteger(reasoningTokens) && reasoningTokens >= 0
+        ? { reasoningTokens }
+        : {}),
+      ...(typeof finishReason === "string" && finishReason.length > 0 ? { finishReason } : {}),
     };
   }
+}
+
+/**
+ * Request overrides must be a plain JSON object that leaves the deployment
+ * and transport fields alone. Validated on every request so a caller cannot
+ * smuggle `stream:true` or a different model past the recorded identity.
+ */
+export function assertRequestOverrides(value: unknown): JsonObject {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("LLM request overrides must be a JSON object");
+  }
+  for (const key of Object.keys(value)) {
+    if (PROTECTED_CHAT_FIELDS.includes(key)) {
+      throw new Error(`LLM request overrides may not set ${key}`);
+    }
+  }
+  return value as JsonObject;
 }
 
 export class AnthropicProvider extends HttpLlmProvider {

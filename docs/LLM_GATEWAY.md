@@ -44,12 +44,21 @@ output limit. Configure a provider-side hard currency quota on the dedicated
 provider key. `--max-in-flight` and `--max-requests` bound exposure between
 accounting updates.
 
-Gateway counters are process-local in this version. Restarting the gateway
-resets them, so an experiment-wide cap must be enforced at the provider and the
-gateway must not be restarted as a way to extend a treatment. The Compose
-service therefore uses `restart: "no"`. The audit log is append-only
-operational metadata, bounded by `--max-audit-bytes`; it is neither hash-chained
-scientific evidence nor an external trust anchor.
+Gateway counters are process-local by default. Restarting the gateway resets
+them, so an experiment-wide cap must be enforced at the provider unless
+`--state-file` is configured (see below); the Compose canary profile therefore
+uses `restart: "no"` and does not set it. The audit log is append-only
+operational metadata, bounded by `--max-audit-bytes` (or rotated with
+`--audit-rotate`); it is neither hash-chained scientific evidence nor an
+external trust anchor.
+
+`--budget-window-ms` together with `--max-tokens-per-window` and/or
+`--max-requests-per-window` adds a sliding-window budget on top of the
+process-lifetime `--max-total-tokens`/`--max-requests` caps: once the window's
+accounted usage (or request count) reaches the threshold, further requests
+receive `429` until the oldest entries slide out of the window. Like
+`--max-total-tokens`, the token variant is a post-response stop threshold, not
+a hard cap — the response that crosses it is still returned and accounted.
 
 ## HTTP surface
 
@@ -84,11 +93,48 @@ node dist/lab/runner.js gateway \
   --max-total-tokens 1000000 \
   --rate-per-minute 30 \
   --max-in-flight 4 \
-  --audit ./runs/gateway.jsonl
+  --audit ./runs/gateway.jsonl \
+  --audit-rotate 5 \
+  --state-file ./runs/gateway-state.json \
+  --budget-window-ms 3600000 \
+  --max-tokens-per-window 200000 \
+  --metering-failure-mode latch
 ```
 
 `--api-key-env NAME` is available for local operation, but the Compose profile
 uses `--api-key-file`. Secret values are never accepted as CLI arguments.
+
+## Audit rotation, persisted state, and the metering-failure-mode exit path
+
+By default the gateway is deliberately fragile at two points: the audit file
+fails closed once it reaches `--max-audit-bytes`, and its counters live only
+in process memory. Both defaults keep a short-lived experimental run honest
+without any extra configuration. A long-lived deployment (the C1 canary and
+beyond) needs the opposite properties, so both are opt-in:
+
+- **`--audit-rotate N`** (requires `--audit`): once the active audit file
+  would exceed `--max-audit-bytes`, it is rotated to `<path>.1` (shifting any
+  existing `.1 … .(N-1)` up by one and dropping `.N`) and a fresh active file
+  is started, instead of the gateway refusing further requests.
+- **`--state-file PATH`**: the accounted token/request counters and the
+  sliding budget window are written to `PATH` after every metered response and
+  on `close()`, and loaded back in `listen()`. A restart therefore continues
+  the same budget instead of granting a new one. The file is written
+  atomically (temp file + `fsync` + rename) and is keyed to the gateway's
+  identity (`gatewayId`, derived from the upstream URL); pointing a
+  differently-configured gateway at someone else's state file is refused
+  rather than silently adopted.
+- **`--metering-failure-mode latch|exit`** (default `latch`): decides what
+  happens when audit or metering can no longer be trusted (audit write
+  failure, unmetered or invalid usage, an oversized response). `latch` keeps
+  the process alive answering `503` until an operator restarts it — the
+  existing behaviour. `exit` additionally persists the state file and hands
+  the process to its supervisor once the failing response has already been
+  sent, exiting with code `75` (`EX_TEMPFAIL`, exported as
+  `LLM_GATEWAY_FATAL_EXIT_CODE`): a signal to retry after a restart, not a
+  misconfiguration. Combined with `--state-file`, a supervisor can restart the
+  gateway immediately and it continues the same budget rather than resetting
+  it.
 
 ## Compose cognitive profile
 
@@ -143,12 +189,16 @@ port or joins the Traefik edge network.
   provider may still bill ambiguous work for which no usage response reached
   the gateway, so only its own hard account limit is authoritative;
 - a successful but unmetered response becomes `502`, readiness becomes `503`,
-  and subsequent completions fail closed;
+  and subsequent completions fail closed (`latch`) or the process exits with
+  code `75` after persisting the state file (`--metering-failure-mode exit`);
 - an oversized successful response also degrades metering because its usage is
-  unknowable after truncation;
+  unknowable after truncation, and takes the same `latch`/`exit` path;
+- a sliding-window budget (`--budget-window-ms`) refusal is a plain `429`, not
+  a metering degradation — the window itself remains trustworthy and slides
+  back open on its own;
 - shutdown aborts tracked upstream requests, closes client connections, drains
-  the serialized audit queue, and emits `listening → stopping → stopped` JSON
-  lifecycle records.
+  the serialized audit queue, persists the state file when one is configured,
+  and emits `listening → stopping → stopped` JSON lifecycle records.
 
 Provider failure is still captured by the cognitive universe as a recorded
 fallback event. The gateway audit is complementary operational evidence; it

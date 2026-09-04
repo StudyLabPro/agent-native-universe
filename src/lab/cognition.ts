@@ -24,6 +24,7 @@
  * distinguish.
  */
 
+import { canonicalJson, sha256Hex } from "./canonical.js";
 import type { NeutralPolicy } from "./neutral-policy.js";
 import type { NeutralPolicyRandomSource } from "./neutral-policy.js";
 import type { LogicalPolicy } from "./policy-schedule.js";
@@ -75,6 +76,15 @@ export interface CognitionRecord {
   actions: WorldAction[];
   /** Why the answer was discarded, when it was. */
   rejected?: string;
+  /** Reasoning tokens the provider reported separately from `usage`. */
+  reasoningTokens?: number;
+  /** The provider's finish reason (`stop`, `length`, …) when it reported one. */
+  finishReason?: string;
+  /**
+   * `content` is a byte-prefix of the answer: the full text exceeded the
+   * port's content byte budget. The actions were parsed from the full answer.
+   */
+  truncated?: boolean;
 }
 
 export interface CognitionPort {
@@ -84,6 +94,8 @@ export interface CognitionPort {
    * Consulted once per tick with every active agent. Returning fewer records
    * than requests is allowed: agents without a record fall back to the neutral
    * policy, so a model outage degrades the run instead of freezing it.
+   * The signal is the run's: aborting it withdraws in-flight consultations so
+   * the tick can finish and the universe can pause at its boundary.
    */
   propose(requests: readonly CognitionRequest[], signal?: AbortSignal): Promise<CognitionRecord[]>;
 }
@@ -97,6 +109,7 @@ export interface CompletionLike {
       maxTokens?: number;
       responseFormat?: "text" | "json";
       metadata?: JsonObject;
+      extra?: JsonObject;
     },
     policy?: { require?: string[]; prefer?: string[]; maxEstimatedCost?: number },
     signal?: AbortSignal,
@@ -106,6 +119,9 @@ export interface CompletionLike {
     content: string;
     usage: { inputTokens: number; outputTokens: number; totalTokens: number };
     latencyMs: number;
+    reasoningContent?: string;
+    reasoningTokens?: number;
+    finishReason?: string;
   }>;
 }
 
@@ -146,8 +162,30 @@ export interface LlmCognitionOptions {
   maxTokens?: number;
   /** Consultations issued at once. */
   concurrency?: number;
+  /** Per-consultation timeout. Pacing only; not part of the id. */
   timeoutMs?: number;
+  /**
+   * Maximum UTF-8 bytes of an answer kept verbatim in the record. Longer
+   * answers are recorded as a byte-prefix with `truncated: true`; the actions
+   * are still parsed from the full answer. Part of the id (`:cb<bytes>`):
+   * evidence with and without truncation must never share an identity.
+   */
+  contentByteBudget?: number;
+  /**
+   * Provider-specific request fields sent with every consultation, e.g.
+   * `{"reasoning_effort":"low"}`. Part of the id (`:ro<hash>`): they change
+   * what the model contributes.
+   */
+  requestOverrides?: JsonObject;
 }
+
+export const DEFAULT_COGNITION_CONTENT_BYTE_BUDGET = 65_536;
+/**
+ * Upper bound for the content budget: content and the serialized actions are
+ * each held to the budget, and together with the envelope the event must stay
+ * under `MAX_LAB_EVENT_BYTES` (262 144).
+ */
+export const MAX_COGNITION_CONTENT_BYTE_BUDGET = 122_880;
 
 export class LlmCognition implements CognitionPort {
   readonly id: string;
@@ -157,6 +195,8 @@ export class LlmCognition implements CognitionPort {
   readonly #maxTokens: number;
   readonly #concurrency: number;
   readonly #timeoutMs: number;
+  readonly #contentByteBudget: number;
+  readonly #requestOverrides: JsonObject | undefined;
 
   constructor(options: LlmCognitionOptions) {
     this.cohort = options.cohort;
@@ -165,15 +205,27 @@ export class LlmCognition implements CognitionPort {
     this.#maxTokens = requirePositive(options.maxTokens ?? 2_048, "maxTokens");
     this.#concurrency = requirePositive(options.concurrency ?? 4, "concurrency");
     this.#timeoutMs = requirePositive(options.timeoutMs ?? 120_000, "timeoutMs");
+    this.#contentByteBudget = requirePositive(
+      options.contentByteBudget ?? DEFAULT_COGNITION_CONTENT_BYTE_BUDGET,
+      "contentByteBudget",
+    );
+    if (this.#contentByteBudget > MAX_COGNITION_CONTENT_BYTE_BUDGET) {
+      throw new Error(`contentByteBudget must not exceed ${MAX_COGNITION_CONTENT_BYTE_BUDGET} bytes`);
+    }
+    this.#requestOverrides = normalizeRequestOverrides(options.requestOverrides);
     const model = typeof options.model === "string" ? options.model.trim() : "";
     if (model.length === 0 || /\s/.test(model)) {
       throw new Error("LlmCognition requires a non-empty whitespace-free model descriptor");
     }
     // Everything that changes what the model contributes belongs in the id:
-    // the deployment itself and the consultation budget. Operational knobs
+    // the deployment itself, the consultation budget, the byte budget of the
+    // recorded answer and any request overrides. Operational knobs
     // (concurrency, timeout) stay out — they change pacing, not treatment.
     this.id = `cognition-llm-${options.cohort.toLowerCase()}-v1:${model}`
-      + `:apt${this.#agentsPerTick}:mt${this.#maxTokens}`;
+      + `:apt${this.#agentsPerTick}:mt${this.#maxTokens}:cb${this.#contentByteBudget}`
+      + (this.#requestOverrides === undefined
+        ? ""
+        : `:ro${sha256Hex(canonicalJson(this.#requestOverrides)).slice(0, 8)}`);
     if (this.id.length > 128) {
       throw new Error("Cognition id exceeds 128 characters; shorten the model descriptor");
     }
@@ -208,26 +260,46 @@ export class LlmCognition implements CognitionPort {
           maxTokens: this.#maxTokens,
           temperature: 0,
           metadata: { purpose: "universe-lab-cognition", cohort: this.cohort },
+          ...(this.#requestOverrides === undefined ? {} : { extra: this.#requestOverrides }),
         },
         { require: ["chat", "json"] },
         combined,
       );
       const parsed = parseCognitiveActions(response.content, request);
+      const content = boundUtf8(response.content, this.#contentByteBudget);
+      // The actions carry whatever `result`/`payload` the model chose to put
+      // there. Bounding them is the difference between a bloated answer being
+      // recorded as unusable and the tick failing at the event size cap.
+      const actions = Buffer.byteLength(canonicalJson(parsed.actions), "utf8") <= this.#contentByteBudget
+        ? parsed
+        : { actions: [], rejected: `actions exceeded the ${this.#contentByteBudget}-byte budget` };
+      const reasoningTokens = response.reasoningTokens;
+      const finishReason = response.finishReason;
       return {
         tick: request.tick,
         agentId: request.agentId,
         cohort: this.cohort,
         provider: response.provider,
         model: response.model,
-        content: response.content,
+        content: content.text,
         usage: response.usage,
         latencyMs: response.latencyMs,
-        actions: parsed.actions,
-        ...(parsed.rejected === undefined ? {} : { rejected: parsed.rejected }),
+        actions: actions.actions,
+        ...(actions.rejected === undefined ? {} : { rejected: actions.rejected }),
+        ...(typeof reasoningTokens === "number" && Number.isSafeInteger(reasoningTokens) && reasoningTokens >= 0
+          ? { reasoningTokens }
+          : {}),
+        ...(typeof finishReason === "string" && finishReason.length > 0
+          ? { finishReason: finishReason.slice(0, 64) }
+          : {}),
+        ...(content.truncated ? { truncated: true } : {}),
       };
     } catch (error) {
       // A provider failure is evidence, not a crash: record it and let the
-      // agent fall back to the neutral policy for this tick.
+      // agent fall back to the neutral policy for this tick. A consultation
+      // withdrawn by the run's own signal (shutdown) is recorded as such.
+      const message = error instanceof Error ? error.message : String(error);
+      const reason = signal?.aborted ? `consultation aborted: ${message}` : `provider failure: ${message}`;
       return {
         tick: request.tick,
         agentId: request.agentId,
@@ -238,10 +310,40 @@ export class LlmCognition implements CognitionPort {
         usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
         latencyMs: 0,
         actions: [],
-        rejected: `provider failure: ${error instanceof Error ? error.message : String(error)}`.slice(0, 300),
+        rejected: reason.slice(0, 300),
       };
     }
   }
+}
+
+/**
+ * Cuts a string to at most `budget` UTF-8 bytes without splitting a code
+ * point, so the prefix decodes to exactly the leading characters of the text.
+ */
+export function boundUtf8(text: string, budget: number): { text: string; truncated: boolean } {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.length <= budget) return { text, truncated: false };
+  let end = budget;
+  // A continuation byte at the cut means the character that owns it started
+  // earlier: back off to its lead byte so the cut lands between characters.
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  return { text: bytes.subarray(0, end).toString("utf8"), truncated: true };
+}
+
+function normalizeRequestOverrides(value: JsonObject | undefined): JsonObject | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("requestOverrides must be a JSON object");
+  }
+  for (const key of ["model", "messages", "stream"]) {
+    if (key in value) throw new Error(`requestOverrides may not set ${key}`);
+  }
+  if (Object.keys(value).length === 0) return undefined;
+  const canonical = canonicalJson(value);
+  if (Buffer.byteLength(canonical, "utf8") > 4_096) {
+    throw new Error("requestOverrides must not exceed 4096 canonical bytes");
+  }
+  return structuredClone(value);
 }
 
 /* ------------------------------------------------------------------ */

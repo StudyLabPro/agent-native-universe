@@ -1,5 +1,5 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { appendFile, mkdir, stat } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
@@ -45,15 +45,49 @@ export interface LlmGatewayOptions {
   maxInFlight?: number;
   /** Maximum decompressed upstream response body. Defaults to 8 MiB. */
   maxResponseBytes?: number;
-  /** Maximum audit file size before the gateway fails closed. Defaults to 64 MiB. */
+  /**
+   * Maximum audit file size. Without `auditRotate` the gateway fails closed
+   * when it is reached; with it the file is rotated instead. Defaults to 64 MiB.
+   */
   maxAuditBytes?: number;
+  /**
+   * Number of rotated audit files to keep (`audit.jsonl.1` … `.N`). When the
+   * active file would exceed `maxAuditBytes` it is rotated and a fresh one is
+   * started, so a long-lived gateway never stops on its own audit size.
+   */
+  auditRotate?: number;
   /** Append-only JSONL audit file containing metadata only. */
   auditPath?: string;
+  /**
+   * JSON file holding the metering counters and the budget window. Written
+   * atomically after every metered response and loaded by `listen()`, so a
+   * restart continues the same budgets instead of granting new ones.
+   */
+  stateFile?: string;
+  /** Length of the sliding budget window. Required with either per-window cap. */
+  budgetWindowMs?: number;
+  /** Accounted `usage.total_tokens` admitted per budget window (post-response stop threshold). */
+  maxTokensPerWindow?: number;
+  /** Requests forwarded per budget window. */
+  maxRequestsPerWindow?: number;
+  /**
+   * What happens when audit or metering fails. `latch` (default) keeps the
+   * process alive answering 503 until an operator restarts it. `exit` answers
+   * the current request, persists the state file and reports the failure
+   * through `onFatal`, so a supervisor can restart the gateway with its
+   * budgets intact (the CLI exits with code 75, EX_TEMPFAIL).
+   */
+  meteringFailureMode?: LlmGatewayMeteringFailureMode;
+  /** Called once, after the failing response was sent, in `exit` mode. */
+  onFatal?: (reason: LlmGatewayFatalReason) => void;
   /** Upstream timeout per request. */
   timeoutMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
 }
+
+export type LlmGatewayMeteringFailureMode = "latch" | "exit";
+export type LlmGatewayFatalReason = "audit_unavailable" | "metering_unavailable";
 
 export interface LlmGatewayStats {
   requests: number;
@@ -70,14 +104,27 @@ export interface LlmGatewayIdentity {
   models: readonly string[] | "any";
 }
 
+/** On-disk shape of `stateFile`. Operational metering, never evidence. */
+export interface LlmGatewayPersistedState {
+  schemaVersion: 1;
+  gatewayId: string;
+  totalTokens: number;
+  forwarded: number;
+  window: Array<{ at: number; tokens: number }>;
+  updatedAt: string;
+}
+
 const MAX_REQUEST_BYTES = 1_048_576;
 const DEFAULT_MAX_RESPONSE_BYTES = 8_388_608;
 const DEFAULT_MAX_AUDIT_BYTES = 67_108_864;
 const DEFAULT_MAX_IN_FLIGHT = 4;
 const MAX_PENDING_AUDITS = 1_024;
+const MAX_STATE_FILE_BYTES = 4_194_304;
 const MIN_AUTH_TOKEN_BYTES = 32;
 const MAX_AUTH_TOKEN_BYTES = 4_096;
 const CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
+/** EX_TEMPFAIL: the CLI exit code for a gateway that stopped on a metering or audit failure. */
+export const LLM_GATEWAY_FATAL_EXIT_CODE = 75;
 
 interface GatewayDecisionLog {
   at: string;
@@ -108,11 +155,15 @@ export class LlmGateway {
   #inFlight = 0;
   #totalTokens = 0;
   #recent: number[] = [];
+  #window: Array<{ at: number; tokens: number }> = [];
   #auditReady: Promise<void> = Promise.resolve();
+  #stateReady: Promise<void> = Promise.resolve();
   #auditBytes = 0;
   #pendingAudits = 0;
   #auditFailed = false;
   #meteringFailed = false;
+  #fatalReason: LlmGatewayFatalReason | undefined;
+  #fatalNotified = false;
 
   constructor(options: LlmGatewayOptions) {
     this.#upstreamUrl = validateUpstreamUrl(options.upstreamUrl);
@@ -123,11 +174,34 @@ export class LlmGateway {
       maxInFlight: options.maxInFlight,
       maxResponseBytes: options.maxResponseBytes,
       maxAuditBytes: options.maxAuditBytes,
+      auditRotate: options.auditRotate,
+      budgetWindowMs: options.budgetWindowMs,
+      maxTokensPerWindow: options.maxTokensPerWindow,
+      maxRequestsPerWindow: options.maxRequestsPerWindow,
       timeoutMs: options.timeoutMs,
     })) {
       if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) {
         throw new Error(`Gateway ${name} must be a positive safe integer`);
       }
+    }
+    if (options.auditRotate !== undefined && options.auditPath === undefined) {
+      throw new Error("Gateway auditRotate requires auditPath");
+    }
+    if (
+      (options.maxTokensPerWindow !== undefined || options.maxRequestsPerWindow !== undefined)
+      && options.budgetWindowMs === undefined
+    ) {
+      throw new Error("Gateway per-window budgets require budgetWindowMs");
+    }
+    if (
+      options.meteringFailureMode !== undefined
+      && options.meteringFailureMode !== "latch"
+      && options.meteringFailureMode !== "exit"
+    ) {
+      throw new Error("Gateway meteringFailureMode must be latch or exit");
+    }
+    if (options.stateFile !== undefined && options.stateFile.length === 0) {
+      throw new Error("Gateway stateFile must not be empty");
     }
     if (options.apiKey !== undefined && options.apiKey.length === 0) {
       throw new Error("Gateway apiKey must not be empty");
@@ -168,8 +242,24 @@ export class LlmGateway {
       await mkdir(dirname(this.#options.auditPath), { recursive: true });
       await appendFile(this.#options.auditPath, "", { encoding: "utf8", mode: 0o600, flag: "a" });
       this.#auditBytes = (await stat(this.#options.auditPath)).size;
-      if (this.#auditBytes > (this.#options.maxAuditBytes ?? DEFAULT_MAX_AUDIT_BYTES)) {
+      if (
+        this.#options.auditRotate === undefined
+        && this.#auditBytes > (this.#options.maxAuditBytes ?? DEFAULT_MAX_AUDIT_BYTES)
+      ) {
         throw new Error("Gateway audit file already exceeds its configured size limit");
+      }
+    }
+    if (this.#options.stateFile !== undefined) {
+      // Budgets continue across restarts: a missing file is a first start, a
+      // present one is loaded fail-closed (a corrupt or foreign file refuses
+      // to listen rather than silently granting a fresh budget).
+      await mkdir(dirname(this.#options.stateFile), { recursive: true });
+      const persisted = await this.#loadState(this.#options.stateFile);
+      if (persisted !== undefined) {
+        this.#totalTokens = persisted.totalTokens;
+        this.#forwarded = persisted.forwarded;
+        this.#window = persisted.window;
+        this.#pruneWindow();
       }
     }
 
@@ -247,6 +337,10 @@ export class LlmGateway {
     }
     await Promise.allSettled([...this.#activeHandlers]);
     await this.#auditReady;
+    if (this.#options.stateFile !== undefined && !this.#meteringFailed) {
+      await this.#persistState().catch(() => undefined);
+    }
+    await this.#stateReady;
   }
 
   stats(): LlmGatewayStats {
@@ -344,6 +438,11 @@ export class LlmGateway {
         await this.#deny(response, 429, "token_stop_threshold_reached", log);
         return;
       }
+      const windowRefusal = this.#windowRefusal();
+      if (windowRefusal !== undefined) {
+        await this.#deny(response, 429, windowRefusal, log);
+        return;
+      }
       if (!this.#withinRate()) {
         await this.#deny(response, 429, "rate_limited", log);
         return;
@@ -353,6 +452,10 @@ export class LlmGateway {
       // concurrency limits cannot be raced by other callbacks on this process.
       this.#forwarded += 1;
       if (this.#options.ratePerMinute !== undefined) this.#recent.push(this.#now());
+      const windowEntry = this.#options.budgetWindowMs === undefined
+        ? undefined
+        : { at: this.#now(), tokens: 0 };
+      if (windowEntry !== undefined) this.#window.push(windowEntry);
       const started = this.#now();
       const controller = new AbortController();
       this.#activeRequests.add(controller);
@@ -387,14 +490,14 @@ export class LlmGateway {
           this.#options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
         );
         if (payload === undefined) {
-          if (upstream.ok) this.#meteringFailed = true;
+          if (upstream.ok) this.#degrade("metering_unavailable");
           await this.#forwardingFailure(response, 502, "upstream_response_too_large", log, started);
           return;
         }
 
         const usage = extractUsage(payload);
         if (upstream.ok && usage === undefined) {
-          this.#meteringFailed = true;
+          this.#degrade("metering_unavailable");
           await this.#forwardingFailure(
             response,
             502,
@@ -407,11 +510,22 @@ export class LlmGateway {
         if (usage !== undefined) {
           const nextTotal = this.#totalTokens + usage.totalTokens;
           if (!Number.isSafeInteger(nextTotal)) {
-            this.#meteringFailed = true;
+            this.#degrade("metering_unavailable");
             await this.#forwardingFailure(response, 502, "upstream_usage_invalid", log, started);
             return;
           }
           this.#totalTokens = nextTotal;
+          if (windowEntry !== undefined) windowEntry.tokens = usage.totalTokens;
+          if (this.#options.stateFile !== undefined) {
+            // The accounted usage is durable before the client sees the
+            // answer; a budget that cannot be persisted is a metering failure.
+            try {
+              await this.#persistState();
+            } catch {
+              await this.#forwardingFailure(response, 502, "metering_state_unavailable", log, started);
+              return;
+            }
+          }
         }
 
         const thresholdCrossed = usage !== undefined
@@ -436,7 +550,7 @@ export class LlmGateway {
         response.end(payload);
       } catch (error) {
         if (this.#auditFailed) throw error;
-        if (upstreamSucceeded) this.#meteringFailed = true;
+        if (upstreamSucceeded) this.#degrade("metering_unavailable");
         const timedOut = timeoutError(error);
         await this.#forwardingFailure(
           response,
@@ -471,6 +585,35 @@ export class LlmGateway {
     return this.#recent.length < limit;
   }
 
+  #pruneWindow(): void {
+    const windowMs = this.#options.budgetWindowMs;
+    if (windowMs === undefined) {
+      this.#window = [];
+      return;
+    }
+    const cutoff = this.#now() - windowMs;
+    this.#window = this.#window.filter((entry) => entry.at > cutoff);
+  }
+
+  /**
+   * Sliding-window budgets. Like `maxTotalTokens`, the token cap is a
+   * post-response stop threshold: the response that crosses it is returned
+   * and accounted, later requests are refused until the window slides.
+   */
+  #windowRefusal(): "token_window_exhausted" | "request_window_exhausted" | undefined {
+    if (this.#options.budgetWindowMs === undefined) return undefined;
+    this.#pruneWindow();
+    if (this.#options.maxRequestsPerWindow !== undefined && this.#window.length >= this.#options.maxRequestsPerWindow) {
+      return "request_window_exhausted";
+    }
+    if (this.#options.maxTokensPerWindow !== undefined) {
+      let tokens = 0;
+      for (const entry of this.#window) tokens += entry.tokens;
+      if (tokens >= this.#options.maxTokensPerWindow) return "token_window_exhausted";
+    }
+    return undefined;
+  }
+
   #nextRequestId(): string {
     this.#requests += 1;
     return `${this.#instanceId}:${this.#requests}`;
@@ -478,10 +621,79 @@ export class LlmGateway {
 
   #trackHandler(handler: Promise<void>): void {
     this.#activeHandlers.add(handler);
-    void handler.then(
-      () => this.#activeHandlers.delete(handler),
-      () => this.#activeHandlers.delete(handler),
-    );
+    const settle = (): void => {
+      this.#activeHandlers.delete(handler);
+      // The failing request has been answered by now; only then is the
+      // supervisor told, so `exit` mode never cuts a response short.
+      void this.#notifyFatal();
+    };
+    void handler.then(settle, settle);
+  }
+
+  /**
+   * Audit or metering is no longer trustworthy. `latch` keeps refusing until
+   * an operator intervenes; `exit` additionally hands the process over to its
+   * supervisor once the current response is out.
+   */
+  #degrade(reason: LlmGatewayFatalReason): void {
+    if (reason === "audit_unavailable") this.#auditFailed = true;
+    else this.#meteringFailed = true;
+    if ((this.#options.meteringFailureMode ?? "latch") === "exit" && this.#fatalReason === undefined) {
+      this.#fatalReason = reason;
+    }
+  }
+
+  async #notifyFatal(): Promise<void> {
+    if (this.#fatalReason === undefined || this.#fatalNotified) return;
+    this.#fatalNotified = true;
+    const reason = this.#fatalReason;
+    // The last metered response is already on disk (persisted before it was
+    // answered); this final write only refreshes the timestamp and the window.
+    if (this.#options.stateFile !== undefined) await this.#persistState().catch(() => undefined);
+    this.#options.onFatal?.(reason);
+  }
+
+  #persistState(): Promise<void> {
+    const path = this.#options.stateFile;
+    if (path === undefined) return Promise.resolve();
+    const snapshot: LlmGatewayPersistedState = {
+      schemaVersion: 1,
+      gatewayId: this.#identity.id,
+      totalTokens: this.#totalTokens,
+      forwarded: this.#forwarded,
+      window: this.#window.map((entry) => ({ at: entry.at, tokens: entry.tokens })),
+      updatedAt: new Date(this.#now()).toISOString(),
+    };
+    const write = this.#stateReady.then(() => writeFileAtomically(path, `${JSON.stringify(snapshot)}\n`));
+    this.#stateReady = write.catch(() => {
+      this.#degrade("metering_unavailable");
+    });
+    return write;
+  }
+
+  async #loadState(path: string): Promise<LlmGatewayPersistedState | undefined> {
+    let text: string;
+    try {
+      text = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+    if (Buffer.byteLength(text, "utf8") > MAX_STATE_FILE_BYTES) {
+      throw new Error("Gateway state file is too large");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error("Gateway state file is not valid JSON");
+    }
+    const state = parsePersistedState(parsed);
+    if (state === undefined) throw new Error("Gateway state file has an invalid shape");
+    if (state.gatewayId !== this.#identity.id) {
+      throw new Error("Gateway state file belongs to another gateway configuration");
+    }
+    return state;
   }
 
   async #forwardingFailure(
@@ -518,7 +730,7 @@ export class LlmGateway {
     if (path === undefined) return;
     if (this.#auditFailed) throw new Error("Gateway audit is unavailable");
     if (this.#pendingAudits >= MAX_PENDING_AUDITS) {
-      this.#auditFailed = true;
+      this.#degrade("audit_unavailable");
       throw new Error("Gateway audit queue limit reached");
     }
 
@@ -527,13 +739,16 @@ export class LlmGateway {
     this.#pendingAudits += 1;
     const write = this.#auditReady.then(async () => {
       if (this.#auditBytes + bytes > (this.#options.maxAuditBytes ?? DEFAULT_MAX_AUDIT_BYTES)) {
-        throw new Error("Gateway audit size limit reached");
+        const keep = this.#options.auditRotate;
+        if (keep === undefined) throw new Error("Gateway audit size limit reached");
+        await rotateAuditFiles(path, keep);
+        this.#auditBytes = 0;
       }
       await appendFile(path, line, { encoding: "utf8", mode: 0o600, flag: "a" });
       this.#auditBytes += bytes;
     });
     this.#auditReady = write.catch(() => {
-      this.#auditFailed = true;
+      this.#degrade("audit_unavailable");
     });
     try {
       await write;
@@ -541,6 +756,70 @@ export class LlmGateway {
       this.#pendingAudits -= 1;
     }
   }
+}
+
+/**
+ * Shift `path.1` … `path.(keep-1)` up by one, drop `path.keep`, and move the
+ * active file to `path.1`. Runs inside the serialized audit queue, so no
+ * append can interleave with the renames.
+ */
+async function rotateAuditFiles(path: string, keep: number): Promise<void> {
+  await rm(`${path}.${keep}`, { force: true });
+  for (let index = keep - 1; index >= 1; index -= 1) {
+    try {
+      await rename(`${path}.${index}`, `${path}.${index + 1}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  await rename(path, `${path}.1`);
+}
+
+/** tmp + fsync + rename: a reader sees either the previous or the new state, never a torn one. */
+async function writeFileAtomically(path: string, content: string): Promise<void> {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  const handle = await open(temporary, "w", 0o600);
+  try {
+    await handle.writeFile(content, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await rename(temporary, path);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+function parsePersistedState(value: unknown): LlmGatewayPersistedState | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.schemaVersion !== 1) return undefined;
+  if (typeof record.gatewayId !== "string" || !/^gateway-v1-[a-f0-9]{32}$/.test(record.gatewayId)) return undefined;
+  if (!isCount(record.totalTokens) || !isCount(record.forwarded)) return undefined;
+  if (typeof record.updatedAt !== "string") return undefined;
+  if (!Array.isArray(record.window)) return undefined;
+  const window: Array<{ at: number; tokens: number }> = [];
+  for (const entry of record.window) {
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return undefined;
+    const { at, tokens } = entry as Record<string, unknown>;
+    if (!isCount(at) || !isCount(tokens)) return undefined;
+    window.push({ at, tokens });
+  }
+  return {
+    schemaVersion: 1,
+    gatewayId: record.gatewayId,
+    totalTokens: record.totalTokens,
+    forwarded: record.forwarded,
+    window,
+    updatedAt: record.updatedAt,
+  };
+}
+
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function validateUpstreamUrl(value: string): string {

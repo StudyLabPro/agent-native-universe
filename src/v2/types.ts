@@ -136,6 +136,13 @@ export interface LlmRequest {
   maxTokens?: number;
   responseFormat?: "text" | "json";
   metadata?: JsonObject;
+  /**
+   * Provider-specific request fields merged into the wire body verbatim
+   * (e.g. `{"reasoning_effort":"low"}`). They never override `model`,
+   * `messages` or `stream`. Anything here changes what the model contributes,
+   * so callers that record evidence must hash it into their identity.
+   */
+  extra?: JsonObject;
 }
 
 export interface LlmUsage {
@@ -151,6 +158,12 @@ export interface LlmResponse {
   usage: LlmUsage;
   latencyMs: number;
   raw?: JsonValue;
+  /** `message.reasoning_content` when the provider exposes its reasoning. */
+  reasoningContent?: string;
+  /** `usage.completion_tokens_details.reasoning_tokens` when reported. */
+  reasoningTokens?: number;
+  /** `choices[0].finish_reason` when reported, e.g. `stop` or `length`. */
+  finishReason?: string;
 }
 
 export interface LlmCompletionPort {

@@ -188,7 +188,10 @@ export class LogicalUniverse {
     await this.#ensureInitialized();
     if (signal?.aborted) return this.#pauseAtBoundary();
     while (this.#nextTick <= this.config.ticks) {
-      await this.#advanceTick();
+      // The signal reaches the cognition port: an abort withdraws in-flight
+      // consultations, the tick finishes with what was recorded, and the
+      // universe pauses at the boundary below instead of mid-tick.
+      await this.#advanceTick(signal);
       if (signal?.aborted) return this.#pauseAtBoundary();
     }
     if (!this.#world.completed) {
@@ -287,7 +290,7 @@ export class LogicalUniverse {
     this.#initialized = true;
   }
 
-  async #advanceTick(): Promise<void> {
+  async #advanceTick(signal?: AbortSignal): Promise<void> {
     if (this.#world.completed) throw new Error("Run is already completed");
     if (this.#nextTick > this.config.ticks) throw new Error("Configured tick limit reached");
     if (this.#tickRunning) throw new Error("A logical tick is already running");
@@ -297,7 +300,7 @@ export class LogicalUniverse {
       await this.#applyPressures(tick);
       await this.#expireTasks(tick);
       await this.#generateTasks(tick);
-      await this.#consultCognition(tick);
+      await this.#consultCognition(tick, signal);
       const decisions = await this.#decide(tick);
       const pendingEvaluation: string[] = [];
       const ordered = this.#resolutionRng.fork(tick).shuffle(decisions);
@@ -393,7 +396,7 @@ export class LogicalUniverse {
    * records what the model said independently of what the world then did with
    * it — including answers that were rejected as unusable.
    */
-  async #consultCognition(tick: number): Promise<void> {
+  async #consultCognition(tick: number, signal?: AbortSignal): Promise<void> {
     const cognition = this.#cognition;
     if (cognition === undefined) return;
     const policy = this.#policy;
@@ -422,7 +425,7 @@ export class LogicalUniverse {
 
     let records: CognitionRecord[] = [];
     try {
-      records = await cognition.propose(requests);
+      records = await cognition.propose(requests, signal);
     } catch (error) {
       // Losing the provider must not lose the tick: the population simply falls
       // back to the neutral policy, and the failure is on record below.
@@ -455,6 +458,10 @@ export class LogicalUniverse {
           latencyMs: record.latencyMs,
           actions: record.actions,
           ...(record.rejected === undefined ? {} : { rejected: record.rejected }),
+          // Schema-additive: absent from every record written before them.
+          ...(record.reasoningTokens === undefined ? {} : { reasoningTokens: record.reasoningTokens }),
+          ...(record.finishReason === undefined ? {} : { finishReason: record.finishReason }),
+          ...(record.truncated === true ? { truncated: true } : {}),
         }),
       });
     }
