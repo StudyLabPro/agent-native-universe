@@ -12,7 +12,7 @@ import { join, relative, resolve, sep } from "node:path";
 import { canonicalJson, compareCodeUnits, hashValue } from "./canonical.js";
 import { validateRunEvidenceAttestation } from "./evidence-attestation-schema.js";
 import { openRegularFileNoFollow } from "./event-stream.js";
-import { MAX_LAB_EVENT_BYTES, validateLabEvent } from "./events.js";
+import { MAX_LAB_EVENT_BYTES, initialEventHash, validateLabEvent } from "./events.js";
 import { LIVE_UNIVERSE_ID } from "./live/identity.js";
 import {
   OBSERVER_UI_ASSETS,
@@ -498,7 +498,14 @@ async function handleRequest(
       return;
     }
     const projection = await projectRunState(record, root, eventIndexes);
-    const body = { runId, tick: projection.tick, seq: projection.seq, state: projection.state };
+    const body = {
+      runId,
+      tick: projection.tick,
+      seq: projection.seq,
+      eventHash: projection.eventHash,
+      stateHash: projection.stateHash,
+      state: projection.state,
+    };
     const size = Buffer.byteLength(JSON.stringify(redactEvidence(body)), "utf8");
     if (size > MAX_STATE_RESPONSE_BYTES) throw new ObserverHttpError(413, "state_too_large");
     if (etag !== undefined) response.setHeader("ETag", etag);
@@ -1663,15 +1670,17 @@ async function projectRunState(
   record: RunRecord,
   root: string,
   eventIndexes: EventIndexCache,
-): Promise<{ tick: number; seq: number; state: WorldState }> {
+): Promise<{ tick: number; seq: number; eventHash: string; stateHash: string; state: WorldState }> {
   const manifest = parseRunManifestForProjection(record.manifest);
   const latestCheckpointTick = await findLatestCheckpointTick(record.directory, root);
 
   let state: WorldState;
   let checkpointSeq: number;
+  let lastEventHash: string;
   if (latestCheckpointTick === null) {
     state = initialWorldState(manifest);
     checkpointSeq = 0;
+    lastEventHash = initialEventHash(manifest);
   } else {
     const checkpointText = await readBoundedFile(
       record.directory,
@@ -1692,22 +1701,28 @@ async function projectRunState(
       || parsedCheckpoint.universeId !== manifest.universeId
       || !Number.isSafeInteger(parsedCheckpoint.tick)
       || !Number.isSafeInteger(parsedCheckpoint.seq)
+      || typeof parsedCheckpoint.eventHash !== "string"
+      || typeof parsedCheckpoint.stateHash !== "string"
       || !isJsonObject(parsedCheckpoint.state)
     ) {
       throw new ObserverHttpError(422, "invalid_artifact");
     }
     state = parsedCheckpoint.state as unknown as WorldState;
     checkpointSeq = parsedCheckpoint.seq as number;
+    lastEventHash = parsedCheckpoint.eventHash;
   }
 
   try {
     const tail = await scanEventsAfter(record, root, eventIndexes, checkpointSeq, (parsed) => {
       validateLabEvent(parsed);
       applyWorldEventMutable(state, parsed);
+      if (typeof parsed.hash === "string") lastEventHash = parsed.hash;
     });
     return {
       tick: state.tick,
       seq: tail.lastSeq > checkpointSeq ? tail.lastSeq : checkpointSeq,
+      eventHash: lastEventHash,
+      stateHash: hashValue(state),
       state,
     };
   } catch (error) {

@@ -4,10 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { EvidenceStore } from "../dist/lab/artifacts.js";
+import { hashValue } from "../dist/lab/canonical.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
 import { runGenesis } from "../dist/lab/genesis.js";
 import { startObserverServer } from "../dist/lab/observer.js";
 import { applyWorldEventMutable, initialWorldState } from "../dist/lab/reducer.js";
+
+const HASH_RE = /^[0-9a-f]{64}$/;
 
 const AUTH_TOKEN = "anu_observer_live_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -46,7 +49,7 @@ async function replayExpectedState(manifestPath, eventsPath) {
   for (const line of lines) {
     state = applyWorldEventMutable(state, JSON.parse(line));
   }
-  return state;
+  return { state, lastEventHash: lines.length === 0 ? null : JSON.parse(lines[lines.length - 1]).hash };
 }
 
 test("observer projects run state from a checkpoint plus tail events, matching full replay", async (t) => {
@@ -56,7 +59,10 @@ test("observer projects run state from a checkpoint plus tail events, matching f
   const config = stateProjectionConfig("observer-live-state-projection");
   const summary = await runGenesis({ config, runsRoot, universeId: "U0001" });
   const evidence = await EvidenceStore.openExisting(runsRoot, config.experimentId, "U0001", summary.runId);
-  const expectedState = await replayExpectedState(evidence.manifestPath, evidence.eventsPath);
+  const { state: expectedState, lastEventHash: expectedEventHash } = await replayExpectedState(
+    evidence.manifestPath,
+    evidence.eventsPath,
+  );
 
   // world.ts always emits a final checkpoint at run.completed, in addition to
   // the periodic ones at tick % checkpointEvery === 0. Remove it so the
@@ -90,6 +96,16 @@ test("observer projects run state from a checkpoint plus tail events, matching f
   assert.equal(projected.tick, summary.ticks);
   assert.equal(projected.seq, summary.events);
   assert.deepEqual(projected.state, expectedState);
+  // The site's bootstrap trust model re-hashes what it received against these
+  // two claims itself (it never trusts the observer's word alone): stateHash
+  // must be independently reproducible from the returned state, and eventHash
+  // must be the real chain hash of the last committed event, not a shape-only
+  // placeholder. A regression here previously shipped a /state response with
+  // neither field, which the site's own parser then refused outright.
+  assert.match(projected.eventHash, HASH_RE);
+  assert.match(projected.stateHash, HASH_RE);
+  assert.equal(projected.eventHash, expectedEventHash);
+  assert.equal(projected.stateHash, hashValue(expectedState));
   const stateEtag = stateResponse.headers.get("etag");
   assert.ok(stateEtag && stateEtag.length > 0);
   // The state route's ETag is the event log's identity, shared with /events and /head.
