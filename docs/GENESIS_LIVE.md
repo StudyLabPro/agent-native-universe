@@ -48,7 +48,7 @@ an unsupported implementation.
 |---|---|
 | `population`, `run`, `baselines` | `genesis-1` only |
 | `genesis-1` | `genesis-1`; `genesis-live-canary` only with `--cohort B\|C`, arm A, universe `U0901+` |
-| `live` | `genesis-live` only (the epoch engine arrived in L3a as a library; the command and its supervisor arrive in L3c, and it fails closed until then) |
+| `live` | `genesis-live` only (the epoch engine arrived in L3a as a library; the command and its supervisor arrived in L3c) |
 | `replay`, `attest`, `verify-attestation`, `serve` | every registered id — readers never guess |
 
 `runPopulation` refuses non-scientific configs at the library level as well, and
@@ -191,11 +191,90 @@ therefore a recorded input like the answer and the token count beside it, and
 what the verifier does check is that the debit is exactly the price of the
 tier and usage on record.
 
-Not implemented in this build, each a seam that fails closed rather than a
-silent gap: archival and compaction (`compactWorldState` refuses every kind but
-`none`), the outage and disk supervisor and the `anu lab live` command
-(phase L3c). Passing `archive` or `supervisor` to `runLiveEpoch` is refused,
-not ignored, and `anu lab live` still exits "not implemented in this build".
+**The bounded world (phase L3c).** A universe with no end must not have a state
+with no end. The upkeep of every live tick commits `submission.archived`,
+`task.archived` and `message.archived` for the records that have settled and
+aged past `config.live.archive`, and at a boundary `compactWorldState` applies
+the same windows once more to the parent's final state. Both call one rule
+(`archivableRecords` in `src/lab/epoch-rules.ts`), which the protocol verifier
+regenerates instead of trusting: an archival the rule does not name is refused,
+and a tick that left an archivable record behind is refused at its
+`tick.completed`.
+
+- The plan is ordered and safe by construction: submissions leave first, then
+  the tasks whose last submission just left, then delivered mail. The newest
+  `PUBLIC_SUBMISSION_WINDOW` submissions and the newest `PUBLIC_INBOX_WINDOW`
+  entries of each inbox are never archived while an observation is still built
+  from them, a submission leaves only once its task has settled, and a task
+  leaves only once every submission naming it leaves in the same plan — so an
+  observation can never reach a record that is no longer there. A submission
+  takes its verifications with it; archived mail leaves its recipient's inbox.
+- **Archival removes state, never evidence.** Every archived record is still in
+  the append-only log of the epoch that created it, and `verifyLiveChain`
+  replays the chain from epoch 0, so the complete history is always
+  reconstructible. The live state is a working set; the chain is the record.
+  Lifetime totals survive in the live-only `WorldState.counters`, which
+  `metrics.ts` prefers over map lengths, so `tasksCreated` keeps meaning what
+  it meant before the world was bounded. Metrics computed over the retained
+  maps — mean quality, the latency percentiles — become windowed once archival
+  starts, which is honest for an operational readout of one open-ended
+  universe and is not comparable across runs anyway.
+- The boundary rule is recorded in `genesisFrom.compaction` and is therefore
+  part of the child's `runId`: `{kind:"windows", archive:{…}}` carries the
+  windows inside itself, so an audit re-derives an inherited genesis from the
+  chain link and the parent's replayed state alone. `{kind:"none"}` remains the
+  identity rule (`anu lab live --no-compaction true`), and an unknown kind is
+  refused by the config and by the derivation rather than degraded to `none`.
+- Known remaining growth surfaces, stated rather than hidden: retired agents
+  (with their memory) and `capabilityInvocations` have no window in
+  `config.live.archive` and are not archived by this phase.
+
+**The supervisor (phase L3c).** `src/lab/live/supervisor.ts` holds two guards
+that stop the universe when running on would be worse than not running:
+
+| Guard | Observes | Trips when |
+|---|---|---|
+| outage | the cognition port's own answers, per tick | `outageTicks` consecutive ticks in which not one consultation came back |
+| disk | `statfs` of the evidence root, before each epoch and once per tick | free bytes below `minFreeBytes` |
+
+Both pause **at a tick boundary**: `LogicalUniverse.run` honours an abort by
+finishing the tick it is in and checkpointing, so a pause never happens
+mid-tick and a paused universe commits nothing at all — no `task.expired`, no
+`tick.completed`, no metrics. Recovery is a probe (typically the gateway's
+`/readyz`) every `probeIntervalMs`; the epoch then resumes from the boundary it
+stopped at and completes. Without the outage guard an epoch whose ticks are normally
+paced by real consultations runs at the speed of a replay while the provider is
+down, expiring its whole backlog and piling up epochs, chain links and anchors
+— evidence of nothing.
+
+**Where the supervisor's observations sit relative to the world's evidence.**
+This is the phase's one real tension: the guards must observe free bytes,
+provider health and elapsed milliseconds, and none of that may enter the chain.
+The boundary is drawn so that the supervisor's observations decide **when the
+world is allowed to advance, and nothing else**. It commits no event, holds no
+state the reducer reads, and is not a recorded input. It evaluates its guards
+on the way *out* of a tick's consultations, so an abort can never withdraw an
+in-flight consultation or change what the tick recorded. The consequence is
+testable and tested: a paused-and-resumed epoch has the same `runId`, final
+event hash, state hash and attestation commitment as an epoch that ran the same
+recorded answers and never paused. The inverse holds too — nothing in the chain
+says a pause happened. A pause is an operational fact about a process, and
+operational facts belong in observability, which is the design's "no wall clock
+in evidence" rule applied to the supervisor itself.
+
+**`anu lab live` (phase L3c).** The command resolves the universe's physics,
+the live cognition tiers, the three recorded-input ports and the two guards,
+then runs epochs and reports each as one JSON line; without `--epochs` it runs
+until SIGINT/SIGTERM pauses it at a tick boundary. Two surfaces configure it
+and they mean different things: **the config** (`--config`,
+`experiments/genesis-live/config.json`) is the universe's physics and is hashed
+into every epoch's `runId`; **the flags and `ANU_LIVE_*`** are deployment
+(`--outage-ticks`, `--min-free-bytes`, `--probe-interval-ms`, `--tiers`, the
+three inbox paths, `--recover-stale-lease`, `--accept-parent-engine`,
+`--no-compaction`) and are hashed into nothing. `anu lab live --help` documents
+every one of them. The command refuses to start without `--config` (the
+built-in config is the scientific one) and without live tiers (a live epoch has
+no unsteered fallback).
 
 ## 3. Recorded-input rules
 
@@ -333,5 +412,5 @@ IAM role bindings applied by hand, ACME path for the Observer edge.
 | L9 permanent CI gate — hardened science-isolation guard | delivered (`3a6ab0a`, merged `3ad5dd1`) |
 | L3a live engine — epoch chain, inherited genesis, idempotent boundary, live projection | delivered (§2.1) |
 | L3b live engine — recorded task sources, verdicts, economy, recorded physics | delivered (§2.1) |
-| L3c live engine — archival and compaction, supervisor, `anu lab live` | pending; seams declared and failing closed |
+| L3c live engine — archival and compaction, supervisor, `anu lab live` | delivered (§2.1) |
 | C1 canary · L5 infrastructure · L6 site · L7 link inheritance · L8 background extensions | pending; dependencies and criteria in the design |

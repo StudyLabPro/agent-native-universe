@@ -246,6 +246,84 @@ follows [Semantic Versioning](https://semver.org/).
   `runLiveEpoch` no longer fail closed, while `archive` and `supervisor` (L3c)
   still do and `anu lab live` still exits "not implemented in this build".
 
+### Genesis-Live — phase L3c (the bounded world, the supervisor, `anu lab live`)
+
+- **The bounded world.** A universe with no end must not have a state with no
+  end. The upkeep of every live tick commits `submission.archived`,
+  `task.archived` and `message.archived` for the records that have settled and
+  aged past `config.live.archive`, and `compactWorldState` applies the same
+  windows once more at a boundary. Both go through one rule
+  (`archivableRecords`, `src/lab/epoch-rules.ts`), which the protocol verifier
+  regenerates rather than trusts: an archival the rule does not name is
+  refused, and a tick that left an archivable record behind is refused at its
+  `tick.completed`. The plan is ordered so it is always safe to apply —
+  submissions first, then the tasks their departure frees, then delivered mail
+  — and never touches a record an observation is still built from (the newest
+  `PUBLIC_SUBMISSION_WINDOW` submissions, the newest `PUBLIC_INBOX_WINDOW`
+  entries of each inbox). A submission takes its verifications with it;
+  archived mail leaves its recipient's inbox.
+- **Archival removes state, never evidence.** An archived record is still in
+  the append-only log of the epoch that created it, and `verifyLiveChain`
+  replays the chain from epoch 0, so the whole history stays reconstructible.
+  Lifetime totals live on in `WorldState.counters`, which `metrics.ts` already
+  prefers over map lengths, so `tasksCreated` means after archival what it
+  meant before. Measured: 16 agents over 5 000 absolute ticks in ten chained
+  epochs hold a flat checkpoint — the working set stops growing while the
+  lifetime totals keep climbing.
+- The boundary rule is recorded in `genesisFrom.compaction` and is therefore
+  part of the child's `runId`. `{kind:"windows", archive:{…}}` carries the
+  windows inside itself, so an audit re-derives an inherited genesis from the
+  chain link and the parent's replayed final state alone; `{kind:"none"}`
+  remains the identity rule; an unknown kind is refused by the config and by
+  the derivation instead of degrading to `none`.
+- **The supervisor** (`src/lab/live/supervisor.ts`): an outage guard that
+  pauses after `outageTicks` consecutive ticks in which not one consultation
+  came back, and a disk guard that pauses when the evidence volume drops below
+  `minFreeBytes`. Both pause **at a tick boundary** — the tick finishes, its
+  checkpoint reaches disk, and a paused universe commits nothing at all, so an
+  outage can no longer race a 500-tick epoch to its end and expire the whole
+  backlog. Recovery is a probe every `probeIntervalMs`; the epoch resumes from
+  the boundary it stopped at.
+- **Where the supervisor's observations sit relative to the evidence.** The
+  guards observe free bytes, provider health and elapsed milliseconds — none of
+  which may enter a chain. They decide *when the world advances and nothing
+  else*: the supervisor commits no event, holds no state the reducer reads and
+  is not a recorded input, and it evaluates its guards on the way out of a
+  tick's consultations so an abort can never withdraw one in flight. Tested,
+  not asserted: a paused-and-resumed epoch has the same `runId`, final event
+  hash, state hash and attestation commitment as an epoch that ran the same
+  recorded answers and never paused. Nothing in the chain says a pause
+  happened; a pause is an operational fact and belongs in observability.
+- **`anu lab live` is a real command.** It resolves the universe's physics, the
+  live cognition tiers, the three recorded-input ports and the two guards, runs
+  epochs and reports each as one JSON line, and without `--epochs` runs until
+  SIGINT/SIGTERM pauses it at a tick boundary. Flags: `--data-dir`,
+  `--experiment`, `--universe-id`, `--config`, `--epoch-ticks`, `--epochs`,
+  `--tiers`, `--task-inbox`, `--verdict-inbox`, `--physics-inbox`,
+  `--outage-ticks`, `--min-free-bytes`, `--probe-interval-ms`,
+  `--recover-stale-lease`, `--accept-parent-engine`, `--no-compaction`, with
+  `ANU_LIVE_*` defaults; `anu lab live --help` documents every one. The config
+  is the universe's identity and is hashed into every epoch's `runId`; the
+  flags and the environment are deployment and are hashed into nothing. The
+  command refuses to start without `--config` (the built-in config is the
+  scientific one) and without live tiers (a live epoch has no unsteered
+  fallback). The per-command allowlist is unchanged: `live` accepts
+  `genesis-live` and nothing else, and `check-live-isolation` now proves that
+  in both directions.
+- `experiments/genesis-live/config.json` is pinned by a test: 32 agents,
+  `epochTicks 500`, `checkpointEvery 25`, `metricEvery 10`,
+  `initialResources.llmTokens 200000`, `acceptedTaskReward {credits 5,
+  llmTokens 5000}`, tiers priced x1/x3/x8, `exhaustion {minThinkTokens 1500,
+  graceTicks 20}`, `taskStream {tasksPerTick 8, deadlineTicks 60, maxBacklog
+  256}`, `archive {tasks 100, messages 100, submissions 200}`, `pressures []`.
+- Known remaining growth surfaces, stated rather than hidden: retired agents
+  (with their memory) and `capabilityInvocations` have no window in
+  `config.live.archive` and are not archived by this phase.
+- Added `test/lab-live-{archive,supervisor}.test.mjs`. The bounded-world
+  measurement executes and then semantically replays 5 000 ticks of a
+  sixteen-agent world and is by a wide margin the most expensive test in the
+  suite; it dominates the suite's wall clock.
+
 ### Genesis-Live — phase L4 (Observer live surface)
 
 - `GET /api/live` returns the live universe head: `currentRunId`, epoch,
