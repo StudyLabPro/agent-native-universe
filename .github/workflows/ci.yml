@@ -70,7 +70,13 @@ jobs:
         if: ${{ steps.scope.outputs.runtime == 'true' }}
         run: npm test
 
-      - name: Guard the scientific track against Genesis-Live
+      # The science guard (design §4.P, phase L9). The repository policy allows
+      # exactly one runner job, so the "live-isolation" gate is a step of the
+      # PR Gate rather than a job of its own. It reuses the dist/ that the test
+      # universe just built (rebuilding only when src/ is newer) and
+      # regenerates the five §33 arms at the 600-tick default, comparing every
+      # hash with experiments/genesis-1/expected/ — CI never reads runs/.
+      - name: Guard the scientific track against Genesis-Live (live-isolation)
         if: ${{ steps.scope.outputs.runtime == 'true' }}
         run: npm run check:live-isolation
 
