@@ -28,7 +28,7 @@ by calendar units.
 | Live universe | `U0001` under `<dataRoot>/genesis-live/` | `LIVE_UNIVERSE_ID`, `LIVE_DATA_ROOT_SEGMENT` (`src/lab/live/identity.ts`) |
 | Live physics | `GenesisConfig.live` — present exactly for `genesis-live`, part of `configHash` and therefore of `runId` | `validateLiveConfig` (`src/lab/config.ts`) |
 | Epoch manifest | built by the shared `createRunManifest` through `createLiveEpochManifest` — no second manifest builder | `src/lab/live/identity.ts` |
-| Canary experiment | `genesis-live-canary` — the `genesis-1` cognitive cohort path (`--cohort B\|C`, arm A) under its own name; universes `U0901` upwards; `mode: "cognitive"`, engine `genesis-cognitive-v1.1.0` | `assertCanaryUniverseId`, CLI allowlist (`src/lab/runner.ts`) |
+| Canary experiment | `genesis-live-canary` — the `genesis-1` cognitive cohort path (`--cohort B\|C`, arm A) under its own name; universes `U0901` upwards; `mode: "cognitive"`, engine `genesis-cognitive-v1.2.0` | `assertCanaryUniverseId`, CLI allowlist (`src/lab/runner.ts`) |
 
 The scientific engines refuse a live manifest fail-closed
 (`assertLabManifestImplementation`, `ReplayEngine`, `LabProtocolVerifier`,
@@ -180,10 +180,10 @@ implements a link protocol of its own.
 - A model's recorded answer is an input; replaying it proves the chain, not the
   model.
 - The scientific engine versions (`genesis-logical-v1.1.0`,
-  `genesis-cognitive-v1.1.0`) are bumped only by the scientific track. The
-  single planned exception is the L2 sound-resume change
-  (`genesis-cognitive-v1.2.0`), which needs the owner's confirmation and marks
-  earlier cognitive evidence LEGACY.
+  `genesis-cognitive-v1.2.0`) are bumped only by the scientific track. The
+  single planned exception was the L2 sound-resume change, delivered with the
+  owner's confirmation: it bumped `LAB_COGNITIVE_ENGINE_VERSION` from
+  `genesis-cognitive-v1.1.0` and marks earlier cognitive evidence LEGACY.
 
 ## 7. Canary — First Light (phase C1)
 

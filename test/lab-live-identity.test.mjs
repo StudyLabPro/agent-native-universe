@@ -72,7 +72,7 @@ function liveConfig() {
 test("the lab pins exactly three experiment identities and the live engine identity", () => {
   assert.deepEqual([...LAB_EXPERIMENT_IDS], ["genesis-1", "genesis-live", "genesis-live-canary"]);
   assert.equal(LAB_ENGINE_VERSION, "genesis-logical-v1.1.0");
-  assert.equal(LAB_COGNITIVE_ENGINE_VERSION, "genesis-cognitive-v1.1.0");
+  assert.equal(LAB_COGNITIVE_ENGINE_VERSION, "genesis-cognitive-v1.2.0");
   assert.equal(LAB_LIVE_ENGINE_VERSION, "genesis-live-v1.0.0");
   assert.equal(LAB_LIVE_POLICY_ID, "cohort-c-live-idle-v1");
   assert.ok(LAB_LIVE_POLICY_PATTERN.test(LAB_LIVE_POLICY_ID));

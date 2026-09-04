@@ -114,9 +114,18 @@ Genesis completion additionally compares replayed and live state hashes.
 Immutable artifacts refuse conflicting replacement. An incomplete stream is
 resumed only when it ends at a verified `tick.completed` boundary and its latest
 checkpoint matches independently replayed world state, event-chain tail, task
-generator state, and per-agent neutral-policy RNG streams. Mid-tick evidence,
-legacy checkpoints without runtime state, and mismatches remain preserved for
-diagnosis and fail closed instead of being truncated or rewritten.
+generator state, and the policy's own RNG streams — the manifest-bound neutral
+policy's directly, or a cognitive cohort's through the same streams via its
+neutral fallback (`CohortPolicy.checkpoint()`/`restore()` delegate to it, since
+the model's own answer is never regenerated and has nothing to checkpoint).
+Resume also independently replays the event stream from genesis to rebuild the
+evaluator's oracle map for every task still open at the checkpoint boundary
+before the resumed universe runs its first tick — oracles are never read back
+from a checkpoint file, only ever recomputed in memory, so they never leak into
+an artifact the observer could serve. Mid-tick evidence, legacy checkpoints
+without runtime state, checkpoints of a policy with no checkpointable RNG state
+(a fixed-routing baseline), and mismatches remain preserved for diagnosis and
+fail closed instead of being truncated or rewritten.
 
 Authoritative replay requires the stored `config.json`; the config hash, seed,
 experiment, deterministic run ID, and manifest implementation identity must all
@@ -242,13 +251,19 @@ interpretable; and arm F verification coverage is bounded by the public
 observation window — a tick producing more than 64 submissions evicts the
 overflow before its only verifiable tick.
 
-Baseline runs do not support checkpoint resume — their runtime policy state
-is recorded as `null`, and the world refuses to resume it rather than guess.
-An interrupted arm therefore cannot be continued: delete that arm's run
-directory and rerun the command, which redoes the arm from genesis under the
-same deterministic identity. Resuming interrupted *neutral* runs currently has
-a known engine defect (the evaluator's oracle map is not rebuilt on restore),
-so prefer restarting interrupted arms of any kind from genesis.
+Fixed-routing baseline runs (arms D, E and F) do not support checkpoint
+resume — their policies have no RNG state to checkpoint (routing is a fixed
+table, not a draw), so their runtime policy state is recorded as `null` and
+the world refuses to resume it rather than guess. An interrupted run of one of
+those arms therefore cannot be continued: delete that arm's run directory and
+rerun the command, which redoes the arm from genesis under the same
+deterministic identity. Arms A and C (the manifest-bound neutral policy) and
+any cognitive cohort resume soundly: `CohortPolicy.checkpoint()`/`restore()`
+delegate to the neutral policy that backs its fallback decisions, and on
+resume the evaluator's oracle map is independently rebuilt in memory from a
+replay of the event stream — rerunning the identical command continues an
+interrupted neutral or cognitive run from its last durable checkpoint instead
+of redoing it.
 
 Recorded readouts — including the 600-tick crisis run in which the
 fixed-roles arm collapses under the ×4 load spike, and the five-seed series

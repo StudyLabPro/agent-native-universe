@@ -28,6 +28,7 @@ import {
 import {
   assertLabManifestImplementation,
 } from "./manifest.js";
+import { readBootId, readProcessStartTicks, requireProcessStartTicks } from "./process-identity.js";
 import { ReplayEngine } from "./replay.js";
 import type {
   Checkpoint,
@@ -52,6 +53,27 @@ const MAX_SUMMARY_BYTES = 1_048_576;
 const MAX_METRICS_BYTES = 67_108_864;
 const MAX_CHECKPOINT_BYTES = 67_108_864;
 const MAX_ATTESTATION_BYTES = 1_048_576;
+const MAX_WRITER_LEASE_BYTES = 4_096;
+
+export interface WriterLeaseOptions {
+  /**
+   * Recover a lock left behind by a crashed writer instead of always failing
+   * closed. Staleness is judged by kernel-assigned process identity (boot id
+   * and the recorded process's start time), never by `kill(pid, 0)`: a pid is
+   * recycled the moment its owner exits, so mere pid existence cannot tell
+   * the lease's original writer from an unrelated later process. Omitted or
+   * `false` preserves the historical behaviour: any existing lock, live or
+   * stale, is always a conflict.
+   */
+  recoverStale?: boolean;
+}
+
+interface WriterLeaseRecord {
+  pid: number;
+  runId: string;
+  bootId: string;
+  startTicks: number;
+}
 
 export interface EvidenceStoreOptions {
   /** Retain the full event log for synchronous inspection. Disable for long runs. */
@@ -238,28 +260,48 @@ export class EvidenceStore {
    *
    * The lock is operational metadata, not scientific evidence. A process
    * crash intentionally leaves it behind so an operator must inspect the
-   * incomplete append-only log before explicitly removing a stale lock.
+   * incomplete append-only log before explicitly removing a stale lock —
+   * unless `recoverStale` is set, in which case a lock this process can prove
+   * stale (by kernel identity, not by `kill(pid, 0)`) is recovered instead.
    */
-  async acquireWriterLease(runId: string): Promise<() => Promise<void>> {
+  async acquireWriterLease(runId: string, options: WriterLeaseOptions = {}): Promise<() => Promise<void>> {
     assertSafeIdentifier(runId, "lease run id");
     await ensureNoSymlinkDirectoryHierarchy(this.directory);
     const path = containedPath(this.directory, ".runner.lock");
+
     let handle: Awaited<ReturnType<typeof openRegularFileNoFollow>>;
     try {
-      handle = await openRegularFileNoFollow(
-        path,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
-      );
+      handle = await this.#createLeaseFile(path);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (options.recoverStale !== true || !(await this.#isWriterLeaseStale(path))) {
         throw new EvidenceConflictError(
           `Universe ${this.universeId} already has an active or stale writer lease`,
         );
       }
-      throw error;
+      await unlinkEntryNoFollow(path).catch((unlinkError) => {
+        if (!isMissing(unlinkError)) throw unlinkError;
+      });
+      try {
+        handle = await this.#createLeaseFile(path);
+      } catch (retryError) {
+        if ((retryError as NodeJS.ErrnoException).code === "EEXIST") {
+          throw new EvidenceConflictError(
+            `Universe ${this.universeId} writer lease was recreated concurrently during recovery`,
+          );
+        }
+        throw retryError;
+      }
     }
+
     try {
-      await handle.writeFile(canonicalJson({ pid: process.pid, runId }), "utf8");
+      const record: WriterLeaseRecord = {
+        pid: process.pid,
+        runId,
+        bootId: await readBootId(),
+        startTicks: await requireProcessStartTicks(process.pid),
+      };
+      await handle.writeFile(canonicalJson(record), "utf8");
       await handle.sync();
     } catch (error) {
       await handle.close().catch(() => undefined);
@@ -274,6 +316,40 @@ export class EvidenceStore {
       await handle.close();
       await unlinkEntryNoFollow(path);
     };
+  }
+
+  async #createLeaseFile(path: string): Promise<Awaited<ReturnType<typeof openRegularFileNoFollow>>> {
+    return openRegularFileNoFollow(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+  }
+
+  /**
+   * A lock is stale exactly when this process can prove its recorded owner
+   * cannot be the one holding it: the boot changed under it, no process holds
+   * that pid any more, or a process does hold it but started at a different
+   * time than the one recorded — the same pid handed to an unrelated later
+   * process. An unreadable or malformed lock is never treated as stale: a
+   * lease this process cannot positively disprove is left as a conflict.
+   */
+  async #isWriterLeaseStale(path: string): Promise<boolean> {
+    let existing: WriterLeaseRecord;
+    try {
+      existing = await readCanonicalJson<WriterLeaseRecord>(path, MAX_WRITER_LEASE_BYTES);
+    } catch {
+      return false;
+    }
+    if (
+      typeof existing.pid !== "number" || !Number.isSafeInteger(existing.pid) || existing.pid <= 0
+      || typeof existing.bootId !== "string" || existing.bootId.length === 0
+      || typeof existing.startTicks !== "number" || !Number.isSafeInteger(existing.startTicks)
+      || existing.startTicks < 0
+    ) {
+      return false;
+    }
+    const currentBootId = await readBootId();
+    if (existing.bootId !== currentBootId) return true;
+    const actualStartTicks = await readProcessStartTicks(existing.pid);
+    if (actualStartTicks === undefined) return true;
+    return actualStartTicks !== existing.startTicks;
   }
 
   async initialize(manifest: RunManifest, config: GenesisConfig): Promise<LabEventRecorder> {

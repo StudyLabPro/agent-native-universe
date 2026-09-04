@@ -4,7 +4,7 @@ import { createCapabilityState, executeCapabilityPlan } from "./capability-regis
 import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import { createObservationFrame, observeWorldFromFrame } from "./environment.js";
-import { IndependentEvaluator } from "./evaluator.js";
+import { IndependentEvaluator, type PendingOracle } from "./evaluator.js";
 import type { LabEventRecorder } from "./event-recorder.js";
 import { createLabEvent } from "./events.js";
 import { deterministicId } from "./ids.js";
@@ -59,6 +59,22 @@ export interface LogicalUniverseOptions {
   onCheckpoint?: (checkpoint: Checkpoint) => void | Promise<void>;
   /** A replay-verified durable boundary from this exact recorder and manifest. */
   resumeFrom?: Checkpoint;
+  /**
+   * Oracles still open (registered but neither expired nor evaluated) as of
+   * `resumeFrom.tick`, independently reconstructed by replaying the event
+   * stream from genesis. Only meaningful alongside `resumeFrom`: a fresh run
+   * populates the evaluator itself as it generates tasks. Never persisted —
+   * the caller recomputes this on every resume rather than reading it back
+   * from a checkpoint, which never carries it.
+   */
+  pendingOracles?: readonly PendingOracle[];
+  /**
+   * Fsync the event log immediately after every `tick.completed`, not only at
+   * pause or completion. Durability only: it changes when bytes already
+   * written reach disk, never which bytes are written or their content, so it
+   * cannot affect any hash in the chain.
+   */
+  fsyncEveryTick?: boolean;
 }
 
 const UNSUPPORTED_ACTIONS = new Set<PrimitiveActionType>([
@@ -75,6 +91,7 @@ export class LogicalUniverse {
   readonly #cognition: CognitionPort | undefined;
   readonly #onMetrics: LogicalUniverseOptions["onMetrics"];
   readonly #onCheckpoint: LogicalUniverseOptions["onCheckpoint"];
+  readonly #fsyncEveryTick: boolean;
   readonly #physics = new ResourcePhysics();
   readonly #evaluator = new IndependentEvaluator();
   readonly #pressure: PressureEngine;
@@ -146,6 +163,7 @@ export class LogicalUniverse {
     this.#cognition = options.cognition;
     this.#onMetrics = options.onMetrics;
     this.#onCheckpoint = options.onCheckpoint;
+    this.#fsyncEveryTick = options.fsyncEveryTick === true;
     const rootRng = new DeterministicRng(hashValue({
       domain: "agent-native-universe/lab/logical-universe/v1",
       runId: manifest.runId,
@@ -160,6 +178,14 @@ export class LogicalUniverse {
     this.#world = initialWorldState(manifest);
     this.#initialAgentTotals = multiplyResources(config.initialResources, config.agents);
     if (options.resumeFrom !== undefined) this.#restore(options.resumeFrom);
+    // Independently reconstructed by the caller (genesis.ts) from a replay of
+    // the event stream, never read back from the checkpoint itself: the
+    // evaluator's oracle map is in-memory-only bookkeeping the world would
+    // otherwise have rebuilt one #generateTasks call at a time, which resume
+    // skips for every tick at or before the checkpoint.
+    for (const oracle of options.pendingOracles ?? []) {
+      this.#evaluator.registerOracle(oracle.taskId, oracle.expected);
+    }
   }
 
   static create(
@@ -278,7 +304,11 @@ export class LogicalUniverse {
     if (!checkpoint.state.started || checkpoint.state.completed || checkpoint.tick > this.config.ticks) {
       throw new Error("Checkpoint is not an incomplete resumable world boundary");
     }
-    if (!(this.#policy instanceof NeutralPolicy) || checkpoint.runtime.policy === null) {
+    if (
+      this.#policy.checkpoint === undefined
+      || this.#policy.restore === undefined
+      || checkpoint.runtime.policy === null
+    ) {
       throw new Error("The selected logical policy does not support deterministic resume");
     }
     this.#taskStream.restore(checkpoint.runtime.taskStream);
@@ -325,6 +355,10 @@ export class LogicalUniverse {
         type: "tick.completed",
         data: { tick },
       });
+      // Durability only: every byte here was already written and hashed by
+      // #commit above. This changes only when they reach disk, never what
+      // they are, so it cannot move any hash in the chain.
+      if (this.#fsyncEveryTick) await this.recorder.flush();
       this.#nextTick += 1;
       this.#assertConserved();
 
@@ -925,7 +959,7 @@ export class LogicalUniverse {
     const state = this.state();
     const runtime = {
       taskStream: this.#taskStream.checkpoint(),
-      policy: this.#policy instanceof NeutralPolicy ? this.#policy.checkpoint() : null,
+      policy: this.#policy.checkpoint?.() ?? null,
     };
     return {
       schemaVersion: LAB_SCHEMA_VERSION,

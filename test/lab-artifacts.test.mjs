@@ -7,6 +7,7 @@ import { EvidenceConflictError, EvidenceStore } from "../dist/lab/artifacts.js";
 import { canonicalJson, hashValue } from "../dist/lab/canonical.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
 import { LAB_ENGINE_VERSION } from "../dist/lab/manifest.js";
+import { readBootId, requireProcessStartTicks } from "../dist/lab/process-identity.js";
 import { LAB_SCHEMA_VERSION } from "../dist/lab/types.js";
 
 const zeroResources = () => ({
@@ -527,6 +528,102 @@ test("EvidenceStore writer lease excludes concurrent processes and releases clea
   await release();
   const releaseAgain = await second.acquireWriterLease("run:lease-test");
   await releaseAgain();
+});
+
+/* ------------------------------------------------------------------ */
+/* Writer lease recovery matrix (critic #10)                           */
+/* ------------------------------------------------------------------ */
+
+async function fabricateLock(store, record) {
+  await mkdir(store.directory, { recursive: true });
+  await writeFile(join(store.directory, ".runner.lock"), canonicalJson(record), "utf8");
+}
+
+test("acquireWriterLease({recoverStale:true}) recovers a lock left by a different boot", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-lease-recover-boot-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new EvidenceStore(directory, "genesis-1", "U0001");
+  const ownStartTicks = await requireProcessStartTicks(process.pid);
+  // Same pid as this very process, but a boot id that cannot be this boot's:
+  // staleness must be provable from bootId alone, independent of startTicks.
+  await fabricateLock(store, {
+    pid: process.pid,
+    runId: "run:crashed",
+    bootId: "00000000-0000-0000-0000-000000000000",
+    startTicks: ownStartTicks,
+  });
+  const release = await store.acquireWriterLease("run:recovered", { recoverStale: true });
+  const recovered = JSON.parse(await readFile(join(store.directory, ".runner.lock"), "utf8"));
+  assert.equal(recovered.runId, "run:recovered");
+  assert.equal(recovered.pid, process.pid);
+  await release();
+});
+
+test("acquireWriterLease({recoverStale:true}) recovers a same-boot lock whose pid now started later", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-lease-recover-starttime-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new EvidenceStore(directory, "genesis-1", "U0001");
+  const realBootId = await readBootId();
+  const ownStartTicks = await requireProcessStartTicks(process.pid);
+  // Same pid, same boot, but the lock's recorded start time is older than
+  // this process's actual start time: the pid was handed to an unrelated
+  // later process (the routine low-pid case after a container restart).
+  await fabricateLock(store, {
+    pid: process.pid,
+    runId: "run:crashed",
+    bootId: realBootId,
+    startTicks: Math.max(0, ownStartTicks - 1),
+  });
+  const release = await store.acquireWriterLease("run:recovered", { recoverStale: true });
+  await release();
+});
+
+test("acquireWriterLease({recoverStale:true}) refuses an exact pid+bootId+startTicks match as a live conflict", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-lease-exact-match-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new EvidenceStore(directory, "genesis-1", "U0001");
+  const realBootId = await readBootId();
+  const ownStartTicks = await requireProcessStartTicks(process.pid);
+  // This process's own true identity: acquireWriterLease cannot disprove that
+  // the recorded owner is still alive, because it is this very process.
+  await fabricateLock(store, { pid: process.pid, runId: "run:live", bootId: realBootId, startTicks: ownStartTicks });
+  await assert.rejects(
+    store.acquireWriterLease("run:new", { recoverStale: true }),
+    /active or stale writer lease/,
+  );
+});
+
+test("acquireWriterLease without recoverStale always conflicts, even on a provably stale lock", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-lease-no-flag-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new EvidenceStore(directory, "genesis-1", "U0001");
+  const ownStartTicks = await requireProcessStartTicks(process.pid);
+  await fabricateLock(store, {
+    pid: process.pid,
+    runId: "run:crashed",
+    bootId: "00000000-0000-0000-0000-000000000000",
+    startTicks: ownStartTicks,
+  });
+  await assert.rejects(store.acquireWriterLease("run:new"), /active or stale writer lease/);
+  await assert.rejects(
+    store.acquireWriterLease("run:new", { recoverStale: false }),
+    /active or stale writer lease/,
+  );
+  // The historical behaviour is preserved byte-for-byte: the stale lock is
+  // left completely untouched by a conflicting acquisition attempt.
+  const untouched = JSON.parse(await readFile(join(store.directory, ".runner.lock"), "utf8"));
+  assert.equal(untouched.runId, "run:crashed");
+});
+
+test("acquireWriterLease({recoverStale:true}) recovers a lock whose pid no longer exists", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-lease-recover-dead-pid-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new EvidenceStore(directory, "genesis-1", "U0001");
+  const realBootId = await readBootId();
+  // A pid essentially guaranteed not to be held by any process right now.
+  await fabricateLock(store, { pid: 999_999, runId: "run:crashed", bootId: realBootId, startTicks: 1 });
+  const release = await store.acquireWriterLease("run:recovered", { recoverStale: true });
+  await release();
 });
 
 test("conflicts and failed resumes preserve existing evidence byte-for-byte", async (t) => {

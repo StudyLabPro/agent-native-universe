@@ -8,6 +8,7 @@ import { CohortPolicy, type CognitionPort } from "./cognition.js";
 import type { LogicalPolicy } from "./policy-schedule.js";
 import { createRunManifest } from "./manifest.js";
 import { NeutralPolicy } from "./neutral-policy.js";
+import type { PendingOracle } from "./evaluator.js";
 import { ReplayEngine, type ReplayResult } from "./replay.js";
 import {
   LAB_SCHEMA_VERSION,
@@ -37,6 +38,14 @@ export interface GenesisRunOptions {
    * with a model would not be a control.
    */
   policy?: LogicalPolicy;
+  /**
+   * Recover a writer lease this process can prove is stale (see
+   * `EvidenceStore.acquireWriterLease`) instead of always failing closed.
+   * Omitted or `false` preserves the historical behaviour.
+   */
+  recoverStaleLease?: boolean;
+  /** Fsync the event log at every `tick.completed`. Durability only. */
+  fsyncEveryTick?: boolean;
 }
 
 export class GenesisRunPausedError extends Error {
@@ -97,7 +106,9 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
     manifest.universeId,
     { retainEvents: false, runId: manifest.runId },
   );
-  const releaseLease = await evidence.acquireWriterLease(manifest.runId);
+  const releaseLease = await evidence.acquireWriterLease(manifest.runId, {
+    recoverStale: options.recoverStaleLease === true,
+  });
 
   try {
     await evidence.initialize(manifest, config);
@@ -109,7 +120,10 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
       ...(cognition === undefined ? {} : { cognition }),
       onMetrics: (metrics) => evidence.appendMetrics(metrics),
       onCheckpoint: (checkpoint) => evidence.writeCheckpoint(checkpoint),
-      ...(recovery.kind === "checkpoint" ? { resumeFrom: recovery.checkpoint } : {}),
+      ...(options.fsyncEveryTick === true ? { fsyncEveryTick: true } : {}),
+      ...(recovery.kind === "checkpoint"
+        ? { resumeFrom: recovery.checkpoint, pendingOracles: recovery.pendingOracles }
+        : {}),
     });
     const liveState = await universe.run(options.signal);
     await evidence.flush();
@@ -140,7 +154,7 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
 
 type ExistingRunRecovery =
   | { kind: "fresh" }
-  | { kind: "checkpoint"; checkpoint: Checkpoint }
+  | { kind: "checkpoint"; checkpoint: Checkpoint; pendingOracles: PendingOracle[] }
   | { kind: "completed"; summary: RunSummary };
 
 async function recoverExistingRun(
@@ -166,7 +180,7 @@ async function recoverExistingRun(
     }
     assertCheckpointReplayEquivalent(checkpoint, replay);
     assertMetricsMatchReplay(await evidence.readMetrics(), replay.state.metrics);
-    return { kind: "checkpoint", checkpoint };
+    return { kind: "checkpoint", checkpoint, pendingOracles: replay.pendingOracles ?? [] };
   }
   assertCompletedReplay(replay, config);
   const reconstructed = await createSummary(evidence, manifest, config, replay);

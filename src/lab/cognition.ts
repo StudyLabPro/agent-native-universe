@@ -31,6 +31,7 @@ import type { LogicalPolicy } from "./policy-schedule.js";
 import type { JsonObject, JsonValue } from "../core/types.js";
 import type {
   LabAgentState,
+  NeutralPolicyCheckpoint,
   Observation,
   ResourceKind,
   WorldAction,
@@ -409,6 +410,22 @@ export class CohortPolicy implements LogicalPolicy {
     if (recorded === undefined) return this.#fallback.decide(observation, agent, rng);
     // Clone: the world must never hand a policy's own array to the reducer.
     return structuredClone(recorded);
+  }
+
+  /**
+   * A model's answer is never regenerated, so there is nothing of the model
+   * itself to checkpoint. What makes a cohort's tick sequence reproducible
+   * after a restart is entirely the fallback's RNG streams (drawn whenever an
+   * agent has no recorded action for the tick), so checkpoint and restore
+   * delegate to it verbatim — a cohort policy resumes exactly when its
+   * fallback would.
+   */
+  checkpoint(): NeutralPolicyCheckpoint {
+    return this.#fallback.checkpoint();
+  }
+
+  restore(checkpoint: NeutralPolicyCheckpoint, root: NeutralPolicyRandomSource): void {
+    this.#fallback.restore(checkpoint, root);
   }
 }
 

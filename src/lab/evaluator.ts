@@ -6,6 +6,20 @@ import {
 import type { JsonValue } from "../core/types.js";
 
 /**
+ * One task's hidden oracle, still unresolved (neither expired nor evaluated)
+ * at a durable tick boundary. Flows only between in-memory objects — the
+ * protocol verifier's replay-reconstructed oracle map on resume, into the
+ * live evaluator that regenerates from it — and is never written to a
+ * checkpoint or any other artifact on disk: the redaction contract in
+ * environment.ts keeps oracles out of observations and events, and a
+ * persisted oracle would defeat that the moment a checkpoint were served.
+ */
+export interface PendingOracle {
+  taskId: string;
+  expected: JsonValue;
+}
+
+/**
  * A hidden-oracle evaluator. Expected values never enter WorldState or the
  * public task observation and cannot be replaced after registration.
  */

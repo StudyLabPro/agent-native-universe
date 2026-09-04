@@ -6,6 +6,7 @@ import {
   initialEventHash,
   verifyNextEvent,
 } from "./events.js";
+import type { PendingOracle } from "./evaluator.js";
 import { assertLabManifestImplementation } from "./manifest.js";
 import { LabProtocolVerifier } from "./protocol-verifier.js";
 import { applyWorldEventMutable, initialWorldState } from "./reducer.js";
@@ -27,6 +28,12 @@ export interface ReplayResult {
   lastTick: number;
   /** Present only when the projection covers the verified end of the stream. */
   runtime?: CheckpointRuntimeState;
+  /**
+   * Oracles still open at the verified end of the stream. Present only for a
+   * recoverable (incomplete-boundary) replay — the one case a resume needs
+   * them — never for a complete run or an `--until-tick` projection.
+   */
+  pendingOracles?: PendingOracle[];
 }
 
 /** Replay verifies the complete deterministic protocol before returning its projection. */
@@ -148,6 +155,7 @@ async function replayEventStream(
     lastSeq,
     lastTick: projected.tick,
     ...(untilTick === undefined ? { runtime: protocol.checkpointRuntime() } : {}),
+    ...(allowIncompleteBoundary ? { pendingOracles: protocol.pendingOracles() } : {}),
   };
 }
 

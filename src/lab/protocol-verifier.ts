@@ -1,8 +1,8 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
 import { createGenesisAgents } from "./agent-factory.js";
-import { hashValue } from "./canonical.js";
+import { compareCodeUnits, hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
-import { equalJson } from "./evaluator.js";
+import { equalJson, type PendingOracle } from "./evaluator.js";
 import { deterministicId } from "./ids.js";
 import { createRunManifest, LAB_POLICY_ID } from "./manifest.js";
 import { computeMetrics } from "./metrics.js";
@@ -338,16 +338,34 @@ export class LabProtocolVerifier {
   }
 
   checkpointRuntime(): CheckpointRuntimeState {
+    this.#assertAtDurableBoundary();
+    return {
+      taskStream: this.#tasks.checkpoint(),
+      policy: this.#policy.checkpoint?.() ?? null,
+    };
+  }
+
+  /**
+   * Oracles for tasks that were generated but neither expired nor evaluated
+   * as of the current durable boundary — reconstructed the same way the rest
+   * of this verifier's state is, by replaying `task.created` / `task.expired`
+   * / `task.evaluated` from genesis. Used only to rebuild the live
+   * evaluator's in-memory map on resume (world.ts); never serialized.
+   */
+  pendingOracles(): PendingOracle[] {
+    this.#assertAtDurableBoundary();
+    return [...this.#oracles.entries()]
+      .sort(([left], [right]) => compareCodeUnits(left, right))
+      .map(([taskId, expected]) => ({ taskId, expected: structuredClone(expected) }));
+  }
+
+  #assertAtDurableBoundary(): void {
     if (!this.#started || this.#genesisAgentIndex !== this.#genesisAgents.length) {
       throw new ProtocolVerificationError("Cannot checkpoint before complete genesis");
     }
     if (this.#currentTick !== 0 && !this.#tickCompleted) {
       throw new ProtocolVerificationError("Cannot checkpoint inside an incomplete tick");
     }
-    return {
-      taskStream: this.#tasks.checkpoint(),
-      policy: this.#policy instanceof NeutralPolicy ? this.#policy.checkpoint() : null,
-    };
   }
 
   #verifyGenesis(event: LabEvent): boolean {

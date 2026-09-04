@@ -72,13 +72,14 @@ regeneration of `experiments/genesis-1/expected/*` in CI.
 ## A5 — Engine version bumps belong to the scientific track
 
 Genesis-Live never bumps `LAB_SCHEMA_VERSION`, `LAB_ENGINE_VERSION` or
-`LAB_COGNITIVE_ENGINE_VERSION`. The one planned exception is phase L2 (sound
-resume for cohort and live runs), which bumps `LAB_COGNITIVE_ENGINE_VERSION`
-to `genesis-cognitive-v1.2.0` and marks earlier cognitive evidence LEGACY.
-That bump needs the owner's confirmation before L2 starts. P3–P5 (two-layer
-link primitive, verifier seam, protocol in the lab) are executed by the
-scientific track; Live inherits the resulting engine at an epoch boundary via
-a recorded `--accept-parent-engine`.
+`LAB_COGNITIVE_ENGINE_VERSION`. The one planned exception was phase L2 (sound
+resume for cohort runs), which bumped `LAB_COGNITIVE_ENGINE_VERSION` from
+`genesis-cognitive-v1.1.0` to `genesis-cognitive-v1.2.0` and marks earlier
+cognitive evidence LEGACY, with the owner's confirmation. `LAB_ENGINE_VERSION`
+and `experiments/genesis-1/expected/*` are unaffected — the bump touches only
+cognitive-mode evidence. P3–P5 (two-layer link primitive, verifier seam,
+protocol in the lab) are executed by the scientific track; Live inherits the
+resulting engine at an epoch boundary via a recorded `--accept-parent-engine`.
 
 ## Status
 
@@ -88,4 +89,4 @@ a recorded `--accept-parent-engine`.
 | A2 deletions stand | yes (on the P0 PR) | no | unchanged |
 | A3 doc drift | no | yes | delivered in L0 |
 | A4 ablation clause | yes | yes | proposed; code-side guards delivered in L0 |
-| A5 version bumps | yes (L2 bump) | yes | proposed |
+| A5 version bumps | yes (L2 bump) | yes | delivered in L2 |

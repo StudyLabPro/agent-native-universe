@@ -401,13 +401,16 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
     });
   } catch (error) {
     if (error instanceof Error && /does not support deterministic resume/.test(error.message)) {
-      // Cohort and control-arm policies fail closed on resume by design (and
-      // resume itself is unsound until the evaluator's oracle map is rebuilt
-      // on restore). Fail with the recovery path instead of a bare engine error.
+      // Only a policy without checkpointable RNG state fails closed here now:
+      // the manifest-bound neutral policy and any cognitive cohort (its
+      // fallback IS the neutral policy) both resume soundly, oracle map
+      // included. A fixed-routing baseline (arm D, E or F) has no RNG state
+      // to checkpoint in the first place, so it still cannot resume.
       throw new CliUsageError(
-        "This run was interrupted earlier and cannot resume (only unresumed neutral runs "
-        + `support it). Delete ${runsRoot}/${config.experimentId}/${universeId}/ and rerun `
-        + "to redo the run from genesis under the same deterministic identity.",
+        "This run was interrupted earlier and cannot resume (its policy has no "
+        + "checkpointable decision state — a fixed-routing baseline arm, typically). "
+        + `Delete ${runsRoot}/${config.experimentId}/${universeId}/ and rerun to redo `
+        + "the run from genesis under the same deterministic identity.",
       );
     }
     if (!(error instanceof GenesisRunPausedError)) throw error;
@@ -553,13 +556,15 @@ async function executeBaselines(argv: readonly string[], io: LabCliIo): Promise<
     writeJson(io.stdout, { command: "baselines", status: "completed", path, comparison });
   } catch (error) {
     if (error instanceof Error && /does not support deterministic resume/.test(error.message)) {
-      // A previously interrupted control arm left a durable checkpoint that
-      // baseline policies refuse to resume by design. Fail with the recovery
-      // path instead of a bare engine error.
+      // A previously interrupted fixed-routing baseline arm (D, E or F) left
+      // a durable checkpoint: those policies have no RNG state to checkpoint
+      // in the first place, so they still fail closed on resume by design.
+      // Arms A and C use the manifest-bound neutral policy and resume fine.
       throw new CliUsageError(
         "A control arm was interrupted earlier and cannot resume "
-        + "(baseline policies fail closed on resume). Delete that arm's run directory "
-        + `under ${runsRoot}/${config.experimentId}/ and rerun to redo the arm from genesis.`,
+        + "(fixed-routing baseline policies have no checkpointable decision state). "
+        + `Delete that arm's run directory under ${runsRoot}/${config.experimentId}/ `
+        + "and rerun to redo the arm from genesis.",
       );
     }
     if (!(error instanceof GenesisRunPausedError)) throw error;

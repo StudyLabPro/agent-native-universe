@@ -3,6 +3,7 @@ import { createObservationFrame, observeWorldFromFrame } from "./environment.js"
 import type { NeutralPolicyRandomSource } from "./neutral-policy.js";
 import type {
   LabAgentState,
+  NeutralPolicyCheckpoint,
   Observation,
   WorldAction,
   WorldState,
@@ -11,6 +12,15 @@ import type {
 export interface LogicalPolicy {
   readonly id: string;
   decide(observation: Observation, agent: LabAgentState, rng: NeutralPolicyRandomSource): WorldAction[];
+  /**
+   * Resumable policies expose the RNG-stream state that makes their decision
+   * schedule reproducible after a restart. Absent on a policy whose decisions
+   * cannot be reconstructed deterministically (a baseline with fixed, not
+   * random, routing) — such a policy's world checkpoint records `policy: null`
+   * and the world refuses to resume it rather than guess.
+   */
+  checkpoint?(): NeutralPolicyCheckpoint;
+  restore?(checkpoint: NeutralPolicyCheckpoint, root: NeutralPolicyRandomSource): void;
 }
 
 export interface PolicyDecision {

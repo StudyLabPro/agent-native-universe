@@ -22,8 +22,18 @@ export const LAB_ENGINE_VERSION = "genesis-logical-v1.1.0";
  * consulting a different model, endpoint or consultation budget can never
  * collide with — and silently recover — a run made with another one. v1.0.0
  * evidence lacked that binding and is refused rather than reinterpreted.
+ *
+ * v1.2.0 (phase L2): resume of a cognitive (cohort) run is now sound.
+ * `CohortPolicy` exposes `checkpoint()`/`restore()` (delegated to its inner
+ * `NeutralPolicy`, which owns the RNG streams), and the evaluator's oracle
+ * map — previously never rebuilt on restore, so a resumed run with any open
+ * task failed every evaluation with "No oracle registered" — is now
+ * reconstructed in memory from a replay of the event stream before the
+ * resumed universe runs its first tick. Evidence made with v1.1.0 is refused
+ * rather than reinterpreted: it was produced by an engine that could not
+ * resume soundly, and a v1.2.0 verifier must not silently vouch for it.
  */
-export const LAB_COGNITIVE_ENGINE_VERSION = "genesis-cognitive-v1.1.0";
+export const LAB_COGNITIVE_ENGINE_VERSION = "genesis-cognitive-v1.2.0";
 /**
  * Genesis-Live epochs carry a third engine identity. A live run is neither
  * seed-reproducible nor a cohort of the scientific track: every non-seed
