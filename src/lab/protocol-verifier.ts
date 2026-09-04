@@ -11,9 +11,13 @@ import {
   externalTaskId,
   inheritedGenesisOf,
   isExternalTask,
+  isEmptyLiveArchivePlan,
+  emptyLiveArchivePlan,
   liveThinkingDebit,
   openTaskBacklog,
+  planLiveArchive,
   proportionalReward,
+  type LiveArchivePlan,
   type LiveExternalTaskInput,
 } from "./epoch-rules.js";
 import { equalJson, type PendingOracle } from "./evaluator.js";
@@ -93,7 +97,7 @@ const EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>
 });
 
 /**
- * Live epochs widen the frozen table in four places, all of them recorded-input
+ * Live epochs widen the frozen table in five places, all of them recorded-input
  * or bounded-world rules that do not exist in a bounded run:
  *
  *  - the final upkeep expires calibration work that would otherwise cross the
@@ -103,7 +107,10 @@ const EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhase[]>>
  *    its violation there too (phase L3b);
  *  - an agent that can no longer think is retired in the upkeep (phase L3b);
  *  - a recorded verdict is committed in the evaluation phase before the
- *    `task.evaluated` it justifies (phase L3b).
+ *    `task.evaluated` it justifies (phase L3b);
+ *  - settled records leave the bounded world at the end of the upkeep
+ *    (phase L3c) — three event types a bounded run has never had at all, so a
+ *    logical stream carrying one is refused by the frozen table above.
  *
  * The logical table itself is unchanged, so a bounded run is verified by
  * exactly the phases it always was.
@@ -115,6 +122,9 @@ const LIVE_EVENT_PHASES: Readonly<Partial<Record<LabEventType, readonly TickPhas
   "violation.recorded": ["resolution", "observation"],
   "agent.retired": ["pressure", "upkeep"],
   "verdict.recorded": ["evaluation"],
+  "task.archived": ["upkeep"],
+  "submission.archived": ["upkeep"],
+  "message.archived": ["upkeep"],
 });
 
 interface ExpectedPressureEvent {
@@ -242,6 +252,8 @@ export class LabProtocolVerifier {
   #thinkingExpected: ExpectedThinkingEvent[] = [];
   /** Live only: the upkeep's exhaustion retirements, once regenerated. */
   #exhaustionExpected: string[] | undefined;
+  /** Live only: the records this upkeep must archive, once regenerated. */
+  #archiveExpected: LiveArchivePlan | undefined;
   /** Live only: the recorded verdict that must be followed by its evaluation. */
   #pendingVerdict: string | undefined;
   /** The random source of this tick's physics; shared by schedule and inbox. */
@@ -397,6 +409,11 @@ export class LabProtocolVerifier {
         break;
       case "verdict.recorded":
         this.#verifyVerdict(event, state);
+        break;
+      case "submission.archived":
+      case "task.archived":
+      case "message.archived":
+        this.#verifyArchived(event, state);
         break;
       case "task.expired":
         this.#verifyExpiry(event);
@@ -593,6 +610,7 @@ export class LabProtocolVerifier {
     this.#cognitionRecords = [];
     this.#thinkingExpected = [];
     this.#exhaustionExpected = undefined;
+    this.#archiveExpected = undefined;
     this.#pendingVerdict = undefined;
     this.#recordedTaskSeen = false;
     // One fork per tick, shared by the configured schedule and the recorded
@@ -822,6 +840,65 @@ export class LabProtocolVerifier {
     if (expectedId === undefined) this.#fail(event, "unexpected task.expired event");
     assertExact(event.data, { taskId: expectedId }, event, this.#fail.bind(this), "task expiry data");
     this.#oracles.delete(expectedId);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Live: the bounded world (phase L3c)                                 */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * What this upkeep must archive, regenerated from the state at the moment
+   * archival begins — after the retirements and the boundary sweep, which is
+   * exactly where the world computes it.
+   *
+   * Not memoised across that point on purpose: unlike the exhaustion clock,
+   * the archive plan is a function of the state alone, and the state the
+   * archival step sees is the one after everything else in the upkeep has
+   * settled.
+   */
+  #ensureArchive(state: WorldState): void {
+    if (!this.#live || this.#archiveExpected !== undefined) return;
+    this.#archiveExpected = planLiveArchive(this.manifest, this.config, this.#currentTick, state);
+  }
+
+  /**
+   * One archived record: accepted only if the regenerated plan names it, in
+   * the plan's own order (submissions, then the tasks their departure frees,
+   * then delivered mail). A run therefore cannot archive a record the rule
+   * would have kept, and `#verifyTickCompleted` refuses a tick that kept a
+   * record the rule would have archived.
+   */
+  #verifyArchived(event: LabEvent, state: WorldState): void {
+    if (!this.#live) this.#fail(event, "archival is a live-only rule");
+    if (this.#exhaustionExpected !== undefined && this.#exhaustionExpected.length > 0) {
+      this.#fail(event, "archival precedes the upkeep's exhaustion retirements");
+    }
+    if (this.#boundaryExpiryExpected !== undefined && this.#boundaryExpiryExpected.length > 0) {
+      this.#fail(event, "archival precedes the epoch-boundary expiry sweep");
+    }
+    this.#ensureArchive(state);
+    const plan = this.#archiveExpected!;
+    assertNoParticipants(event, this.#fail.bind(this));
+    if (event.type === "submission.archived") {
+      const expected = plan.submissions.shift();
+      if (expected === undefined) this.#fail(event, "unexpected submission.archived event");
+      assertExact(event.data, { submissionId: expected }, event, this.#fail.bind(this), "submission archival data");
+      return;
+    }
+    if (plan.submissions.length > 0) {
+      this.#fail(event, "submissions are archived before the tasks and mail of the same upkeep");
+    }
+    if (event.type === "task.archived") {
+      const expected = plan.tasks.shift();
+      if (expected === undefined) this.#fail(event, "unexpected task.archived event");
+      assertExact(event.data, { taskId: expected }, event, this.#fail.bind(this), "task archival data");
+      this.#oracles.delete(expected);
+      return;
+    }
+    if (plan.tasks.length > 0) this.#fail(event, "tasks are archived before the mail of the same upkeep");
+    const expected = plan.messages.shift();
+    if (expected === undefined) this.#fail(event, "unexpected message.archived event");
+    assertExact(event.data, { messageId: expected }, event, this.#fail.bind(this), "message archival data");
   }
 
   /**
@@ -1512,6 +1589,13 @@ export class LabProtocolVerifier {
       || this.#pendingVerdict !== undefined
     ) {
       this.#fail(event, "tick.completed has unresolved causal work");
+    }
+    // The bounded world (phase L3c). The archive plan is a fixpoint, so a tick
+    // that archived exactly what the rule names leaves nothing archivable
+    // behind; anything still here is a record the run chose to keep.
+    this.#ensureArchive(state);
+    if (!isEmptyLiveArchivePlan(this.#archiveExpected ?? emptyLiveArchivePlan())) {
+      this.#fail(event, "the upkeep left records the archive windows require it to archive");
     }
     assertNoParticipants(event, this.#fail.bind(this));
     assertExact(event.data, { tick: this.#currentTick }, event, this.#fail.bind(this), "tick.completed data");

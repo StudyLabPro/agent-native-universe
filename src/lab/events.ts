@@ -16,6 +16,7 @@ const EVENT_TYPES = new Set<LabEventType>([
   "resource.spent", "resource.transferred", "memory.stored", "memory.retrieved", "message.sent",
   "message.delivered", "capability.published",
   "capability.used", "agent.learning.updated", "cognition.recorded", "verdict.recorded",
+  "task.archived", "submission.archived", "message.archived",
   "pressure.applied", "violation.recorded", "metrics.recorded",
   "tick.completed", "run.completed",
 ]);

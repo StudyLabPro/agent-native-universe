@@ -7,6 +7,7 @@ import {
   isLabExperimentId,
   type CheckpointRuntimeState,
   type GenesisConfig,
+  type LiveArchiveConfig,
   type LiveConfig,
   type PrimitiveActionType,
   type ResourceVector,
@@ -251,6 +252,19 @@ function validateInheritedRuntime(runtime: CheckpointRuntimeState): void {
   }
 }
 
+/** Archive windows, wherever they appear: the live physics or a compaction rule. */
+function validateLiveArchiveConfig(archive: LiveArchiveConfig, label: string): void {
+  if (typeof archive !== "object" || archive === null) throw new Error(`${label} must be an object`);
+  positiveInteger(archive.taskTicks, `${label}.taskTicks`);
+  positiveInteger(archive.messageTicks, `${label}.messageTicks`);
+  positiveInteger(archive.submissionTicks, `${label}.submissionTicks`);
+  for (const key of Object.keys(archive)) {
+    if (!["taskTicks", "messageTicks", "submissionTicks"].includes(key)) {
+      throw new Error(`${label} contains unknown field ${key}`);
+    }
+  }
+}
+
 export function validateLiveConfig(live: LiveConfig): void {
   if (typeof live !== "object" || live === null) throw new Error("live must be an object");
   positiveInteger(live.epochTicks, "live.epochTicks");
@@ -269,10 +283,7 @@ export function validateLiveConfig(live: LiveConfig): void {
   if (typeof live.exhaustion !== "object" || live.exhaustion === null) throw new Error("live.exhaustion must be an object");
   nonNegativeInteger(live.exhaustion.minThinkTokens, "live.exhaustion.minThinkTokens");
   positiveInteger(live.exhaustion.graceTicks, "live.exhaustion.graceTicks");
-  if (typeof live.archive !== "object" || live.archive === null) throw new Error("live.archive must be an object");
-  positiveInteger(live.archive.taskTicks, "live.archive.taskTicks");
-  positiveInteger(live.archive.messageTicks, "live.archive.messageTicks");
-  positiveInteger(live.archive.submissionTicks, "live.archive.submissionTicks");
+  validateLiveArchiveConfig(live.archive, "live.archive");
   if (typeof live.fsyncEveryTick !== "boolean") throw new Error("live.fsyncEveryTick must be a boolean");
   if (live.genesisFrom !== undefined) {
     const from = live.genesisFrom;
@@ -300,11 +311,26 @@ export function validateLiveConfig(live: LiveConfig): void {
     }
     // Fail closed on a rule this build cannot apply: the inherited state would
     // otherwise be trusted rather than re-derivable from the parent's.
-    if (from.compaction.kind !== "none") {
-      throw new Error(`Unsupported live.genesisFrom.compaction.kind ${String(from.compaction.kind)}`);
-    }
-    for (const key of Object.keys(from.compaction)) {
-      if (key !== "kind") throw new Error(`live.genesisFrom.compaction contains unknown field ${key}`);
+    const compaction = from.compaction as { kind?: unknown; archive?: unknown };
+    if (compaction.kind === "none") {
+      for (const key of Object.keys(compaction)) {
+        if (key !== "kind") throw new Error(`live.genesisFrom.compaction contains unknown field ${key}`);
+      }
+    } else if (compaction.kind === "windows") {
+      // The windows travel inside the rule, so the derivation of an inherited
+      // genesis is self-describing: `verifyLiveChain` re-applies exactly these
+      // and never has to read the parent's config to know what was dropped.
+      if (typeof compaction.archive !== "object" || compaction.archive === null) {
+        throw new Error("live.genesisFrom.compaction.archive must be an object");
+      }
+      validateLiveArchiveConfig(compaction.archive as LiveArchiveConfig, "live.genesisFrom.compaction.archive");
+      for (const key of Object.keys(compaction)) {
+        if (key !== "kind" && key !== "archive") {
+          throw new Error(`live.genesisFrom.compaction contains unknown field ${key}`);
+        }
+      }
+    } else {
+      throw new Error(`Unsupported live.genesisFrom.compaction.kind ${String(compaction.kind)}`);
     }
     for (const key of Object.keys(from)) {
       if (!GENESIS_FROM_FIELDS.includes(key)) {

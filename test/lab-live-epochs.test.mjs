@@ -508,20 +508,23 @@ test("mode and counters are absent from the keys of a logical checkpoint and pre
 /* Seams left open for L3b and L3c, and the scientific refusals        */
 /* ------------------------------------------------------------------ */
 
-test("the archive and supervisor seams fail closed", async (t) => {
+test("every port of an epoch is validated, never silently ignored", async (t) => {
   const root = await tempDir(t, "anu-live-seams-");
   const base = { dataRoot: root, config: liveTestConfig(), cognition: scriptedLiveCognition() };
-  // The three recorded-input seams were filled in phase L3b (see
-  // test/lab-live-inputs.test.mjs and test/lab-live-economy.test.mjs); these
-  // two remain, and a caller that supplies one still gets a refusal rather
-  // than a silently ignored argument.
-  const seams = {
-    archive: /archival and compaction \(phase L3c\) is not implemented/,
-    supervisor: /supervisor \(phase L3c\) is not implemented/,
-  };
-  for (const [seam, pattern] of Object.entries(seams)) {
-    await assert.rejects(() => planLiveEpoch({ ...base, [seam]: {} }), pattern);
-    await assert.rejects(() => runLiveEpoch({ ...base, [seam]: {} }), pattern);
+  // The two seams phase L3a left open were filled in L3c. What survives is the
+  // property they existed for: an argument this build does not understand is a
+  // refusal, not a silently dropped option.
+  const refusals = [
+    [{ archive: { compaction: "some-day" } }, /Unknown archive compaction some-day/],
+    [{ archive: { window: 10 } }, /archive contains unknown field window/],
+    [{ archive: 7 }, /archive must be an object/],
+    [{ supervisor: { outageTicks: -1 } }, /supervisor.outageTicks must be a non-negative safe integer/],
+    [{ supervisor: { minFree: 10 } }, /supervisor contains unknown field minFree/],
+    [{ supervisor: [] }, /supervisor must be an object/],
+  ];
+  for (const [ports, pattern] of refusals) {
+    await assert.rejects(() => planLiveEpoch({ ...base, ...ports }), pattern);
+    await assert.rejects(() => runLiveEpoch({ ...base, ...ports }), pattern);
   }
 
   // Recorded work nobody can grade is refused up front, not left to hang.
@@ -530,11 +533,14 @@ test("the archive and supervisor seams fail closed", async (t) => {
     /A recorded task source needs an evaluator port/,
   );
 
-  // Compaction is a recorded rule, not a convention: an unknown kind is
-  // refused by the config and by the derivation, never silently ignored.
-  const state = { schemaVersion: 1, mode: "live", tick: 1, completed: true };
+  // Compaction is a recorded rule, not a convention: a kind this build cannot
+  // apply is refused by the derivation, never quietly degraded to `none`.
+  const state = {
+    schemaVersion: 1, mode: "live", tick: 1, completed: true,
+    agents: {}, tasks: {}, submissions: {}, submissionOrder: [], verifications: {}, messages: {},
+  };
   assert.deepEqual(compactWorldState(state, { kind: "none" }), state);
-  assert.throws(() => compactWorldState(state, { kind: "windows" }), /Unsupported live compaction rule windows/);
+  assert.throws(() => compactWorldState(state, { kind: "everything" }), /Unsupported live compaction rule everything/);
 });
 
 test("live evidence stays unreadable to the scientific readers", async (t) => {

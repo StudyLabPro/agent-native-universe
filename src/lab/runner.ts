@@ -42,6 +42,19 @@ import {
 } from "./population.js";
 import { ReplayEngine } from "./replay.js";
 import { LIVE_UNIVERSE_ID, assertCanaryUniverseId } from "./live/identity.js";
+import {
+  runLiveEpoch,
+  type LiveUniverseOptions,
+} from "./live/epoch.js";
+import {
+  LiveSupervisor,
+  LIVE_DEFAULT_OUTAGE_TICKS,
+  LIVE_DEFAULT_PROBE_INTERVAL_MS,
+  type LiveSupervisorOptions,
+} from "./live/supervisor.js";
+import { FileTaskSource } from "./live/task-source.js";
+import { InboxEvaluator, LlmEvaluator } from "./live/evaluator-port.js";
+import { FilePressureSource } from "./live/physics-inbox.js";
 import type { LogicalPolicy } from "./policy-schedule.js";
 import {
   LAB_EXPERIMENT_IDS,
@@ -148,11 +161,22 @@ const VERIFY_ATTESTATION_OPTIONS = new Set([
 ]);
 const SERVE_OPTIONS = new Set(["auth-token-file", "data-dir", "host", "port"]);
 const LIVE_OPTIONS = new Set([
+  "accept-parent-engine",
   "config",
   "data-dir",
   "epoch-ticks",
+  "epochs",
   "experiment",
+  "min-free-bytes",
+  "no-compaction",
+  "outage-ticks",
+  "physics-inbox",
+  "probe-interval-ms",
+  "recover-stale-lease",
+  "task-inbox",
+  "tiers",
   "universe-id",
+  "verdict-inbox",
 ]);
 const GATEWAY_OPTIONS = new Set([
   "audit", "audit-rotate", "api-key-env", "api-key-file", "auth-token-file", "budget-window-ms", "host",
@@ -189,7 +213,7 @@ const HELP = {
     "genesis-1": "run one logical Genesis-1 universe",
     baselines: "run the §33 control arms on one seed and compare them",
     population: "run a bounded population of independent universes",
-    live: "run the Genesis-Live universe as a chain of attested epochs (not implemented in this build)",
+    live: "run the Genesis-Live universe as a chain of attested epochs, under the outage and disk guards",
     replay: "replay one universe from its append-only evidence",
     attest: "create or recover a deterministic final evidence attestation",
     "verify-attestation": "verify evidence and an externally published commitment",
@@ -212,6 +236,7 @@ const HELP = {
     "anu lab verify-attestation --data-dir ./runs --universe-id U0001 --run-id RUN_ID --expected sha256:HASH",
     "anu lab serve --data-dir ./runs --host 0.0.0.0 --port 3000 [--auth-token-file PATH]",
     "anu lab gateway --upstream https://host/v1 --api-key-file /run/secrets/provider-key --models kimi-k2-6 --max-total-tokens 200000",
+    "anu lab live --data-dir /var/lib/anu-live --config ./experiments/genesis-live/config.json --outage-ticks 3 --min-free-bytes 21474836480",
   ],
 } as const;
 
@@ -664,8 +689,8 @@ async function createCohortCognition(raw: string | undefined): Promise<Cognition
  * an unhealthy tier's circuit silently reroute a consultation to a different
  * model.
  */
-export async function createLiveCognition(): Promise<LiveCognition | undefined> {
-  const raw = process.env.ANU_LIVE_TIERS;
+export async function createLiveCognition(tiersJson?: string): Promise<LiveCognition | undefined> {
+  const raw = tiersJson ?? process.env.ANU_LIVE_TIERS;
   if (raw === undefined) return undefined;
   const tiers = parseLiveTiersEnv(raw);
 
@@ -840,10 +865,28 @@ function positiveEnv(name: string, fallback: number): number {
 }
 
 /**
- * `anu lab live` — the Genesis-Live supervisor (design §4.H, phase L3). The
- * command is registered in phase L0 so that its experiment allowlist is
- * enforced from the first build that knows the identity; the supervisor
- * itself is not part of this build and the command fails closed.
+ * `anu lab live` — the Genesis-Live supervisor (design §4.H, phase L3c).
+ *
+ * The command owns no engine of its own. It resolves the universe's physics,
+ * the cognition port, the three recorded-input ports and the two guards, then
+ * hands them to `runLiveEpoch` and reports each epoch as one JSON line. The
+ * epoch spine, the boundary and the chain are `src/lab/live/epoch.ts`; the
+ * guards are `src/lab/live/supervisor.ts`.
+ *
+ * Two surfaces configure it, and they mean different things:
+ *
+ *  - **the config** (`--config`, `experiments/genesis-live/config.json`) is
+ *    the universe's *physics*. Every value in it is hashed into `configHash`
+ *    and therefore into every epoch's `runId`. Changing one starts a
+ *    differently-identified chain.
+ *  - **the flags and `ANU_LIVE_*`** are *deployment*: which provider, which
+ *    inbox files, how patient the guards are. None of them is hashed, and none
+ *    of them may change what an epoch's evidence says. The one exception is
+ *    documented as such: the tier a model is consulted at is chosen from
+ *    `ANU_LIVE_TIERS` and is recorded as an input, exactly like the answer.
+ *
+ * Without `--epochs` the universe runs until SIGINT/SIGTERM, which pauses it
+ * at a tick boundary — the shape a `restart: unless-stopped` container needs.
  */
 async function executeLive(argv: readonly string[], io: LabCliIo): Promise<void> {
   const options = parseOptions(argv, LIVE_OPTIONS);
@@ -851,10 +894,48 @@ async function executeLive(argv: readonly string[], io: LabCliIo): Promise<void>
     writeJson(io.stdout, {
       command: "live",
       status: "ok",
-      usage: `anu lab live [--data-dir PATH] [--experiment ${LAB_LIVE_EXPERIMENT_ID}] [--universe-id ${LIVE_UNIVERSE_ID}] [--config PATH] [--epoch-ticks N]`,
+      usage: `anu lab live [--data-dir PATH] [--experiment ${LAB_LIVE_EXPERIMENT_ID}] [--universe-id ${LIVE_UNIVERSE_ID}]`
+        + " [--config PATH] [--epoch-ticks N] [--epochs N] [--tiers PATH]"
+        + " [--task-inbox PATH] [--verdict-inbox PATH] [--physics-inbox PATH]"
+        + " [--outage-ticks N] [--min-free-bytes N] [--probe-interval-ms N]"
+        + " [--recover-stale-lease true] [--accept-parent-engine VERSION] [--no-compaction true]",
+      options: {
+        "--data-dir": "evidence root; the universe lives at <data-dir>/genesis-live/<universe-id>/ (default: ./runs)",
+        "--experiment": `only ${LAB_LIVE_EXPERIMENT_ID}; the scientific track and the canary are refused`,
+        "--universe-id": `universe of this chain (default: ${LIVE_UNIVERSE_ID})`,
+        "--config": "universe physics in epoch-0 shape (default: the built-in safe config is NOT live; supply experiments/genesis-live/config.json)",
+        "--epoch-ticks": "override live.epochTicks; part of configHash, so it changes the identity of every epoch",
+        "--epochs": "stop after this many epochs (default: run until SIGINT/SIGTERM pauses at a tick boundary)",
+        "--tiers": `JSON file in ${"ANU_LIVE_TIERS"} shape; without it the tiers come from ${"ANU_LIVE_TIERS"} itself`,
+        "--task-inbox": "recorded external work (tasks/inbox.jsonl); requires a grader",
+        "--verdict-inbox": "recorded verdicts (verdicts/inbox.jsonl); the alternative to a grader model",
+        "--physics-inbox": "recorded operator physics (physics/inbox.jsonl); pressures only, never addressed to an agent",
+        "--outage-ticks": `consecutive ticks with no consulted answer before the universe pauses at a tick boundary (default: ${LIVE_DEFAULT_OUTAGE_TICKS}; 0 disables)`,
+        "--min-free-bytes": "free bytes of the evidence volume below which the universe pauses (default: 0, the guard is off)",
+        "--probe-interval-ms": `milliseconds between recovery probes while paused (default: ${LIVE_DEFAULT_PROBE_INTERVAL_MS})`,
+        "--recover-stale-lease": "take over a writer lease this process can prove stale (a crashed epoch)",
+        "--accept-parent-engine": "continue a chain whose parent epoch was produced by this engine version",
+        "--no-compaction": "inherit a parent's final state verbatim instead of compacting it with the archive windows",
+      },
+      environment: {
+        ANU_LIVE_TIERS: "JSON {fast,standard,deliberate} of {model,maxTokens,timeoutMs,concurrency,pricePpm}; required — a live epoch has no unsteered fallback",
+        ANU_LLM_BASE_URL: "the gateway; the universe never holds a provider key",
+        ANU_LLM_API_KEY_FILE: "or ANU_LLM_API_KEY, when the gateway itself demands a bearer",
+        ANU_LLM_IDENTITY_URL: "gateway identity endpoint; its hash, not the service name, enters cognitionId",
+        ANU_LIVE_GRADER_MODEL: "grader model for recorded external work, consulted through the same gateway",
+        ANU_LIVE_TASK_INBOX: "default for --task-inbox",
+        ANU_LIVE_VERDICT_INBOX: "default for --verdict-inbox",
+        ANU_LIVE_PHYSICS_INBOX: "default for --physics-inbox",
+        ANU_LIVE_OUTAGE_TICKS: "default for --outage-ticks",
+        ANU_LIVE_MIN_FREE_BYTES: "default for --min-free-bytes",
+        ANU_LIVE_PROBE_INTERVAL_MS: "default for --probe-interval-ms",
+      },
       notes: [
         `Only experiment ${LAB_LIVE_EXPERIMENT_ID} may run live; the scientific track and the canary are refused.`,
-        "The live supervisor is not implemented in this build; the command exists so that its allowlist is enforced.",
+        "A guard that trips pauses the universe at the next tick boundary, never mid-tick: the tick finishes, its"
+        + " checkpoint reaches disk, and nothing at all is committed while the pause lasts.",
+        "The guards observe free space and provider health outside the world. Nothing they observe enters the"
+        + " evidence, and a paused-and-resumed epoch writes what an uninterrupted one would have written.",
       ],
     });
     return;
@@ -863,13 +944,185 @@ async function executeLive(argv: readonly string[], io: LabCliIo): Promise<void>
   const requested = options.values.get("experiment") ?? LAB_LIVE_EXPERIMENT_ID;
   assertExperimentAllowed("live", requested);
   const configPath = options.values.get("config");
-  if (configPath !== undefined) {
-    const config = await configuredGenesis(options.values, "live");
-    assertExperimentAllowed("live", config.experimentId);
+  if (configPath === undefined) {
+    throw new CliUsageError(
+      `anu lab live requires --config: the built-in config is ${LAB_SCIENCE_EXPERIMENT_ID},`
+      + " and a live universe's physics are its identity (experiments/genesis-live/config.json)",
+    );
   }
-  optionUniverseId(options.values, "universe-id", LIVE_UNIVERSE_ID);
-  optionalInteger(options.values, "epoch-ticks", 1, MAX_TICKS);
-  throw new CliUsageError("anu lab live is not implemented in this build");
+  const config = await configuredGenesis(options.values, "live");
+  assertExperimentAllowed("live", config.experimentId);
+  const dataRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
+  const universeId = optionUniverseId(options.values, "universe-id", LIVE_UNIVERSE_ID);
+  const epochTicks = optionalInteger(options.values, "epoch-ticks", 1, MAX_TICKS);
+  if (epochTicks !== undefined) config.live = { ...config.live!, epochTicks };
+  const epochs = optionalInteger(options.values, "epochs", 1, MAX_LIVE_EPOCHS);
+  // Deployment values are parsed before anything reaches a provider or the
+  // disk, so a mistyped guard is a usage error and not a half-started epoch.
+  const outageTicks = optionalInteger(options.values, "outage-ticks", 0, MAX_TICKS)
+    ?? environmentInteger("ANU_LIVE_OUTAGE_TICKS", LIVE_DEFAULT_OUTAGE_TICKS, 0);
+  const minFreeBytes = optionalInteger(options.values, "min-free-bytes", 0, Number.MAX_SAFE_INTEGER)
+    ?? environmentInteger("ANU_LIVE_MIN_FREE_BYTES", 0, 0);
+  const probeIntervalMs = optionalInteger(options.values, "probe-interval-ms", 1, MAX_PROBE_INTERVAL_MS)
+    ?? environmentInteger("ANU_LIVE_PROBE_INTERVAL_MS", LIVE_DEFAULT_PROBE_INTERVAL_MS, 1);
+  const compaction = optionFlag(options.values, "no-compaction") ? "none" : "windows";
+  const recoverStaleLease = optionFlag(options.values, "recover-stale-lease");
+
+  const cognition = await createLiveCognition(await optionalTiersJson(options.values));
+  if (cognition === undefined) {
+    throw new CliUsageError(
+      "anu lab live requires the live tiers: set ANU_LIVE_TIERS or pass --tiers PATH."
+      + " A live epoch is steered by a model at every tick; there is no unsteered live run.",
+    );
+  }
+  const taskInbox = optionalInboxPath(options.values, "task-inbox", "ANU_LIVE_TASK_INBOX");
+  const verdictInbox = optionalInboxPath(options.values, "verdict-inbox", "ANU_LIVE_VERDICT_INBOX");
+  const physicsInbox = optionalInboxPath(options.values, "physics-inbox", "ANU_LIVE_PHYSICS_INBOX");
+  const evaluator = verdictInbox !== undefined
+    ? new InboxEvaluator(verdictInbox)
+    : await createLiveEvaluator();
+  if (taskInbox !== undefined && evaluator === undefined) {
+    throw new CliUsageError(
+      "Recorded external work has no oracle: pass --verdict-inbox or set ANU_LIVE_GRADER_MODEL",
+    );
+  }
+
+  const shutdown = installRunAbortController();
+  const universeOptions: LiveUniverseOptions = {
+    dataRoot,
+    universeId,
+    config,
+    cognition,
+    signal: shutdown.signal,
+    archive: { compaction },
+    supervisor: {
+      outageTicks,
+      minFreeBytes,
+      probeIntervalMs,
+      onPause: (pause) => writeJson(io.stdout, {
+        command: "live", status: "paused", universeId, ...pause,
+      }),
+      onResume: (pause) => writeJson(io.stdout, {
+        command: "live", status: "resumed", universeId, reason: pause.reason,
+      }),
+    },
+    ...(taskInbox === undefined ? {} : { taskSource: new FileTaskSource(taskInbox) }),
+    ...(evaluator === undefined ? {} : { evaluator }),
+    ...(physicsInbox === undefined ? {} : { pressureSource: new FilePressureSource(physicsInbox) }),
+    ...(recoverStaleLease ? { recoverStaleLease: true } : {}),
+    ...(options.values.has("accept-parent-engine")
+      ? { acceptParentEngine: options.values.get("accept-parent-engine")! }
+      : {}),
+  };
+
+  // One supervisor for the whole life of this process: the outage clock and the
+  // disk floor belong to the deployment, not to an epoch.
+  const supervisor = new LiveSupervisor(dataRoot, universeOptions.supervisor as LiveSupervisorOptions);
+  const shared: LiveUniverseOptions = { ...universeOptions, supervisor };
+  try {
+    for (let index = 0; epochs === undefined || index < epochs; index += 1) {
+      if (shutdown.signal.aborted) break;
+      const result = await runLiveEpoch(shared);
+      writeJson(io.stdout, {
+        command: "live",
+        status: "epoch",
+        universeId,
+        epoch: result.epoch,
+        runId: result.runId,
+        startTick: result.startTick,
+        ticks: result.ticks,
+        events: result.summary.events,
+        commitment: result.link.commitment,
+      });
+    }
+    writeJson(io.stdout, { command: "live", status: "stopped", universeId });
+  } catch (error) {
+    if (!(error instanceof GenesisRunPausedError)) throw error;
+    writeJson(io.stdout, {
+      command: "live",
+      status: "paused",
+      universeId,
+      reason: "signal",
+      runId: error.runId,
+      tick: error.tick,
+    });
+  } finally {
+    shutdown.cleanup();
+  }
+}
+
+const MAX_LIVE_EPOCHS = 1_000_000;
+const MAX_PROBE_INTERVAL_MS = 86_400_000;
+
+/** `--tiers PATH`, read as the JSON `ANU_LIVE_TIERS` would have carried. */
+async function optionalTiersJson(values: ReadonlyMap<string, string>): Promise<string | undefined> {
+  const path = values.get("tiers");
+  if (path === undefined) return undefined;
+  return readSecretFile(safePath(path, "tiers"), "live tiers");
+}
+
+function optionalInboxPath(
+  values: ReadonlyMap<string, string>,
+  name: string,
+  environmentName: string,
+): string | undefined {
+  const raw = values.get(name) ?? process.env[environmentName];
+  if (raw === undefined) return undefined;
+  return safePath(raw, name);
+}
+
+/** A boolean flag in this CLI's `--name true` shape. */
+function optionFlag(values: ReadonlyMap<string, string>, name: string): boolean {
+  const raw = values.get(name);
+  if (raw === undefined) return false;
+  if (raw !== "true" && raw !== "false") throw new CliUsageError(`--${name} must be true or false`);
+  return raw === "true";
+}
+
+function environmentInteger(name: string, fallback: number, minimum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^(0|[1-9][0-9]*)$/.test(raw)) throw new CliUsageError(`${name} must be an integer`);
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum) {
+    throw new CliUsageError(`${name} must be at least ${minimum}`);
+  }
+  return parsed;
+}
+
+/**
+ * The grader of recorded external work, through the same gateway the cognition
+ * tiers use — one egress, one budget, one audit. Absent unless
+ * `ANU_LIVE_GRADER_MODEL` names a model, in which case an epoch grades only
+ * calibration work and names the hidden oracle as its evaluator.
+ */
+export async function createLiveEvaluator(): Promise<LlmEvaluator | undefined> {
+  const model = process.env.ANU_LIVE_GRADER_MODEL;
+  if (model === undefined) return undefined;
+  const baseUrl = process.env.ANU_LLM_BASE_URL;
+  if (!baseUrl) throw new Error("A live grader requires ANU_LLM_BASE_URL");
+  const apiKeyFile = process.env.ANU_LLM_API_KEY_FILE;
+  if (apiKeyFile !== undefined && process.env.ANU_LLM_API_KEY !== undefined) {
+    throw new Error("Set only one of ANU_LLM_API_KEY and ANU_LLM_API_KEY_FILE");
+  }
+  const apiKey = apiKeyFile === undefined
+    ? process.env.ANU_LLM_API_KEY
+    : await readSecretFile(safePath(apiKeyFile, "ANU_LLM_API_KEY_FILE"), "LLM API key");
+  const router = new LlmRouter();
+  router.register(new OpenAICompatibleProvider({
+    baseUrl,
+    defaultModel: model,
+    ...(apiKey === undefined ? {} : { apiKey }),
+    timeoutMs: positiveEnv("ANU_LIVE_GRADER_TIMEOUT_MS", 120_000),
+    cooldownMs: positiveEnv("ANU_LLM_COOLDOWN_MS", 30_000),
+    id: "live-grader",
+    capabilities: ["chat", "json", "grader"],
+  }));
+  return new LlmEvaluator({
+    completion: router,
+    model,
+    maxTokens: positiveEnv("ANU_LIVE_GRADER_MAX_TOKENS", 512),
+  });
 }
 
 function assertExperimentAllowed(command: string, experimentId: string): void {

@@ -38,7 +38,7 @@ import { hashValue } from "../canonical.js";
 import type { CognitionPort } from "../cognition.js";
 import { compactWorldState, isExternalTask } from "../epoch-rules.js";
 import { createRunEvidenceAttestation } from "../evidence-attestation.js";
-import { runGenesis, type GenesisRunOptions } from "../genesis.js";
+import { GenesisRunPausedError, runGenesis, type GenesisRunOptions } from "../genesis.js";
 import { LAB_LIVE_ENGINE_VERSION } from "../manifest.js";
 import { ReplayEngine, type ReplayProjectionOptions } from "../replay.js";
 import {
@@ -59,12 +59,20 @@ import type {
   LiveRecordedInputs,
   LiveTaskSource,
 } from "../live-ports.js";
+import {
+  assertLiveArchiveOptions,
+  liveCompactionRule,
+  LIVE_COMPACTION_NONE,
+  type LiveArchiveOptions,
+} from "./archive.js";
+import {
+  LiveSupervisor,
+  assertLiveSupervisorOptions,
+  type LiveSupervisorOptions,
+} from "./supervisor.js";
 import { LIVE_ORACLE_EVALUATOR_ID } from "./evaluator-port.js";
 import { createLiveIdlePolicy } from "./live-idle-policy.js";
 import { LIVE_DATA_ROOT_SEGMENT, LIVE_UNIVERSE_ID, createLiveEpochManifest } from "./identity.js";
-
-/** The compaction rule this build applies at a boundary (see `compactWorldState`). */
-export const LIVE_COMPACTION_NONE: LiveCompaction = Object.freeze({ kind: "none" });
 
 /**
  * The points of the epoch boundary a caller can observe. They exist for the
@@ -73,6 +81,8 @@ export const LIVE_COMPACTION_NONE: LiveCompaction = Object.freeze({ kind: "none"
  * at exactly one of the design's four kill points.
  */
 export type LiveBoundaryStep = "genesis_written" | "epoch_attested" | "chain_linked";
+
+export { LIVE_COMPACTION_NONE } from "./archive.js";
 
 export interface LiveUniverseHooks {
   /** After a durable tick boundary is on disk. Never writes evidence. */
@@ -100,10 +110,20 @@ export interface LiveRecordedInputPorts {
   evaluator?: LiveEvaluatorPort;
   /** `RecordedPressureSource` / `FilePressureSource` over `physics/inbox.jsonl` (L3b). */
   pressureSource?: LivePressureSource;
-  /** Archive windows and state compaction (L3c). */
-  archive?: unknown;
-  /** Outage and disk guards of `anu lab live` (L3c). */
-  supervisor?: unknown;
+  /**
+   * How the universe bounds itself at a boundary (L3c). Absent means the
+   * default: an inherited genesis is compacted with the universe's own
+   * `live.archive` windows. The per-tick archival is not optional — it is the
+   * physics of the universe and part of every epoch's `configHash`.
+   */
+  archive?: LiveArchiveOptions;
+  /**
+   * The outage and disk guards (L3c). Absent means an unsupervised run, which
+   * is what a test or a bounded audit wants; `anu lab live` always supplies
+   * one. `runLiveUniverse` builds a single instance and shares it across
+   * epochs, because the outage clock belongs to the provider, not the epoch.
+   */
+  supervisor?: LiveSupervisorOptions | LiveSupervisor;
 }
 
 export interface LiveUniverseOptions extends LiveRecordedInputPorts {
@@ -196,21 +216,23 @@ export function assertLiveUniverseConfig(base: GenesisConfig): void {
   }
 }
 
-function assertNoUnimplementedPorts(options: LiveRecordedInputPorts): void {
-  const pending: Array<[keyof LiveRecordedInputPorts, string]> = [
-    ["archive", "bounded-world archival and compaction (phase L3c)"],
-    ["supervisor", "the outage and disk supervisor (phase L3c)"],
-  ];
-  for (const [key, what] of pending) {
-    if (options[key] !== undefined) {
-      throw new Error(`${String(key)}: ${what} is not implemented in this build`);
-    }
+function assertPorts(options: LiveRecordedInputPorts): void {
+  if (options.archive !== undefined) assertLiveArchiveOptions(options.archive);
+  if (options.supervisor !== undefined && !(options.supervisor instanceof LiveSupervisor)) {
+    assertLiveSupervisorOptions(options.supervisor);
   }
   // Recorded work that nobody can grade would hang until its deadline and then
   // expire; refusing the combination up front is the honest failure.
   if (options.taskSource !== undefined && options.evaluator === undefined) {
     throw new Error("A recorded task source needs an evaluator port: external work has no oracle");
   }
+}
+
+/** The supervisor of this call, built from options or reused across epochs. */
+function resolveSupervisor(options: LiveUniverseOptions): LiveSupervisor | undefined {
+  if (options.supervisor === undefined) return undefined;
+  if (options.supervisor instanceof LiveSupervisor) return options.supervisor;
+  return new LiveSupervisor(options.dataRoot, options.supervisor);
 }
 
 /** The evaluator identity of an epoch, named even when only oracles grade. */
@@ -268,7 +290,7 @@ export function liveReplayProjection(genesisState?: WorldState): ReplayProjectio
  * start and after every boundary, so a crash anywhere converges here.
  */
 export async function planLiveEpoch(options: LiveUniverseOptions): Promise<LiveEpochPlan> {
-  assertNoUnimplementedPorts(options);
+  assertPorts(options);
   assertLiveUniverseConfig(options.config);
   const universeId = options.universeId ?? LIVE_UNIVERSE_ID;
   const links = await chainIndexOf(options.dataRoot, universeId).readLinks();
@@ -286,7 +308,12 @@ export async function planLiveEpoch(options: LiveUniverseOptions): Promise<LiveE
     };
   }
   assertParentEngine(parent.engineVersion, options.acceptParentEngine);
-  const inherited = await inheritFromParent(options.dataRoot, universeId, parent);
+  const inherited = await inheritFromParent(
+    options.dataRoot,
+    universeId,
+    parent,
+    liveCompactionRule(options.config, options.archive),
+  );
   // An epoch that inherits open external work must be able to grade it: the
   // grader is not a per-epoch convenience, it is part of the universe.
   if (
@@ -332,6 +359,7 @@ async function inheritFromParent(
   dataRoot: string,
   universeId: string,
   parent: LiveChainLink,
+  compaction: LiveCompaction,
 ): Promise<InheritedGenesis> {
   const store = epochStore(dataRoot, universeId, parent.runId);
   const manifest = await store.readManifest();
@@ -381,7 +409,7 @@ async function inheritFromParent(
     runtime = replay.runtime;
   }
 
-  const genesisState = compactWorldState(state, LIVE_COMPACTION_NONE);
+  const genesisState = compactWorldState(state, compaction);
   return {
     genesisState,
     genesisFrom: {
@@ -394,7 +422,7 @@ async function inheritFromParent(
       runtimeHash: hashValue(runtime),
       genesisStateHash: hashValue(genesisState),
       runtime: structuredClone(runtime!),
-      compaction: { ...LIVE_COMPACTION_NONE },
+      compaction: structuredClone(compaction),
     },
   };
 }
@@ -409,6 +437,12 @@ async function inheritFromParent(
  */
 export async function runLiveEpoch(options: LiveUniverseOptions): Promise<LiveEpochResult> {
   const universeId = options.universeId ?? LIVE_UNIVERSE_ID;
+  const supervisor = resolveSupervisor(options);
+  // The disk guard runs before any byte of this epoch reaches the disk: a
+  // universe that starts under a full volume writes nothing at all rather than
+  // a manifest it cannot follow with events.
+  await supervisor?.awaitClearance(options.signal);
+
   const plan = await planLiveEpoch(options);
   const context: LiveBoundaryContext = {
     epoch: plan.epoch,
@@ -445,7 +479,16 @@ export async function runLiveEpoch(options: LiveUniverseOptions): Promise<LiveEp
   };
   // Boundary steps 1 and 2: `run.completed`, then `summary.json` and
   // `attestations/final.json`, both written by the shared genesis runner.
-  const summary = await runGenesis(genesisOptions);
+  //
+  // Supervised, this is a loop rather than a call: a guard that trips aborts
+  // the run, `LogicalUniverse` finishes the tick it is in and checkpoints at
+  // the tick boundary, `runGenesis` reports the pause, and the next attempt
+  // resumes from exactly that boundary once the guard clears. The resumed
+  // epoch continues the same event chain, so its evidence is what an
+  // uninterrupted epoch would have written.
+  const summary = supervisor === undefined
+    ? await runGenesis(genesisOptions)
+    : await runSupervised(supervisor, genesisOptions, options);
   await options.hooks?.onBoundaryStep?.("epoch_attested", context);
 
   // Boundary step 3: the index entry. It is derived from the epoch's own
@@ -463,16 +506,57 @@ export async function runLiveEpoch(options: LiveUniverseOptions): Promise<LiveEp
   };
 }
 
-/** Run `epochs` further epochs of the universe, chaining each into the next. */
+async function runSupervised(
+  supervisor: LiveSupervisor,
+  genesisOptions: GenesisRunOptions,
+  options: LiveUniverseOptions,
+): Promise<RunSummary> {
+  for (;;) {
+    await supervisor.awaitClearance(options.signal);
+    const signal = supervisor.attach(options.signal);
+    try {
+      return await runGenesis({
+        ...genesisOptions,
+        signal,
+        cognition: supervisor.instrument(options.cognition),
+      });
+    } catch (error) {
+      // A pause the supervisor itself caused is resumable; a pause the caller
+      // caused (SIGTERM) is the caller's, and is re-thrown untouched. An
+      // aborted caller wins even when a guard tripped in the same tick:
+      // retrying under an already-aborted signal would pause immediately and
+      // for ever.
+      if (
+        !(error instanceof GenesisRunPausedError)
+        || supervisor.pause === undefined
+        || options.signal?.aborted === true
+      ) throw error;
+    } finally {
+      supervisor.detach();
+    }
+  }
+}
+
+/**
+ * Run `epochs` further epochs of the universe, chaining each into the next.
+ *
+ * One supervisor serves the whole call: the outage clock and the disk floor
+ * are properties of the deployment, not of an epoch, and a provider that came
+ * back mid-epoch must not have to fail three more ticks in the next one.
+ */
 export async function runLiveUniverse(
   options: LiveUniverseOptions & { epochs: number },
 ): Promise<LiveEpochResult[]> {
   if (!Number.isSafeInteger(options.epochs) || options.epochs < 1) {
     throw new RangeError("epochs must be a positive safe integer");
   }
+  const supervisor = resolveSupervisor(options);
+  const shared: LiveUniverseOptions = supervisor === undefined
+    ? options
+    : { ...options, supervisor };
   const results: LiveEpochResult[] = [];
   for (let index = 0; index < options.epochs; index += 1) {
-    results.push(await runLiveEpoch(options));
+    results.push(await runLiveEpoch(shared));
   }
   return results;
 }

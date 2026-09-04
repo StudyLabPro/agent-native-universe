@@ -145,11 +145,16 @@ export interface LiveArchiveConfig {
  * How the inherited genesis state was derived from the parent's final state.
  *
  * `none` is the identity rule: the child inherits exactly what the parent
- * ended with. Bounded-world compaction (phase L3c) adds further kinds here;
- * because the rule is part of `genesisFrom` it is part of `configHash`, so a
- * child can never silently inherit a differently-derived world.
+ * ended with. `windows` is the bounded-world rule (phase L3c): the archive
+ * windows applied once more at the parent's final tick, so the derivation is
+ * self-describing — the windows that produced the genesis travel inside the
+ * rule instead of being read back out of the parent's config. Because the rule
+ * is part of `genesisFrom` it is part of `configHash`, so a child can never
+ * silently inherit a differently-derived world.
  */
-export type LiveCompaction = { kind: "none" };
+export type LiveCompaction =
+  | { kind: "none" }
+  | { kind: "windows"; archive: LiveArchiveConfig };
 
 /**
  * Genesis of an inherited epoch: the parent epoch's final state, pinned by
@@ -579,6 +584,9 @@ export type LabEventType =
   | "agent.learning.updated"
   | "cognition.recorded"
   | "verdict.recorded"
+  | "task.archived"
+  | "submission.archived"
+  | "message.archived"
   | "pressure.applied"
   | "violation.recorded"
   | "metrics.recorded"

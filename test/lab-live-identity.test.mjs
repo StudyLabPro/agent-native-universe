@@ -25,6 +25,7 @@ import {
   ReplayEngine,
   assertCanaryUniverseId,
   assertLabManifestImplementation,
+  assertLiveUniverseConfig,
   canonicalJson,
   createGenesisAgents,
   createLiveEpochManifest,
@@ -32,6 +33,7 @@ import {
   hashValue,
   initialWorldState,
   isLiveManifest,
+  liveCompactionRule,
   runPopulation,
   validateGenesisConfig,
 } from "../dist/lab/index.js";
@@ -164,13 +166,65 @@ test("live physics are validated only for genesis-live and refused elsewhere", (
   };
   assert.doesNotThrow(() => validateGenesisConfig(inherited));
   const unknownCompaction = structuredClone(inherited);
-  unknownCompaction.live.genesisFrom.compaction = { kind: "windows" };
+  unknownCompaction.live.genesisFrom.compaction = { kind: "everything" };
   assert.throws(() => validateGenesisConfig(unknownCompaction), /Unsupported live.genesisFrom.compaction.kind/);
+  // Phase L3c added exactly one further rule, and it is self-describing: the
+  // archive windows the genesis was derived with travel inside the rule, so a
+  // `windows` compaction that does not say which windows is refused.
+  const windowsWithoutWindows = structuredClone(inherited);
+  windowsWithoutWindows.live.genesisFrom.compaction = { kind: "windows" };
+  assert.throws(() => validateGenesisConfig(windowsWithoutWindows), /compaction.archive must be an object/);
+  const windows = structuredClone(inherited);
+  windows.live.genesisFrom.compaction = {
+    kind: "windows",
+    archive: { taskTicks: 100, messageTicks: 100, submissionTicks: 200 },
+  };
+  assert.doesNotThrow(() => validateGenesisConfig(windows));
+  const windowsWithExtra = structuredClone(windows);
+  windowsWithExtra.live.genesisFrom.compaction.archive.agentTicks = 100;
+  assert.throws(() => validateGenesisConfig(windowsWithExtra), /compaction.archive contains unknown field agentTicks/);
   const noRuntime = structuredClone(inherited);
   delete noRuntime.live.genesisFrom.runtime;
   assert.throws(() => validateGenesisConfig(noRuntime), /genesisFrom.runtime must be an object/);
   inherited.live.genesisFrom.eventHash = "not-a-digest";
   assert.throws(() => validateGenesisConfig(inherited), /genesisFrom.eventHash/);
+});
+
+test("the shipped Genesis-Live universe config is the physics the design fixes", async () => {
+  // `experiments/genesis-live/config.json` is epoch 0 of the real universe.
+  // Every value here is hashed into `configHash` and therefore into the runId
+  // of every epoch of the chain, so it is pinned by a test rather than left to
+  // drift: a change to any of it starts a differently-identified universe.
+  const path = join(import.meta.dirname, "..", "experiments", "genesis-live", "config.json");
+  const config = JSON.parse(await readFile(path, "utf8"));
+  assert.doesNotThrow(() => validateGenesisConfig(config));
+  assert.equal(config.experimentId, "genesis-live");
+  assert.equal(config.agents, 32);
+  assert.equal(config.metricEvery, 10);
+  assert.equal(config.checkpointEvery, 25);
+  assert.equal(config.ticks, 500);
+  assert.equal(config.initialResources.llmTokens, 200_000);
+  assert.equal(config.acceptedTaskReward.credits, 5);
+  assert.equal(config.acceptedTaskReward.llmTokens, 5_000);
+  assert.deepEqual(config.pressures, [], "a live universe takes its physics as recorded operator input");
+  assert.equal(config.live.epochTicks, 500);
+  // The three tiers are priced x1, x3 and x8 of a metered token.
+  assert.equal(config.live.tiers.fast.pricePpm, 1_000_000);
+  assert.equal(config.live.tiers.standard.pricePpm, 3_000_000);
+  assert.equal(config.live.tiers.deliberate.pricePpm, 8_000_000);
+  assert.deepEqual(config.live.exhaustion, { minThinkTokens: 1_500, graceTicks: 20 });
+  assert.equal(config.taskStream.tasksPerTick, 8);
+  assert.equal(config.taskStream.deadlineTicks, 60);
+  assert.equal(config.taskStream.maxBacklog, 256);
+  assert.deepEqual(config.live.archive, { taskTicks: 100, messageTicks: 100, submissionTicks: 200 });
+  // The universe config describes epoch 0: the parent of an epoch is derived
+  // from the disk, never configured.
+  assert.equal(config.live.genesisFrom, undefined);
+  assert.doesNotThrow(() => assertLiveUniverseConfig(config));
+  assert.deepEqual(liveCompactionRule(config, undefined), {
+    kind: "windows",
+    archive: { taskTicks: 100, messageTicks: 100, submissionTicks: 200 },
+  });
 });
 
 test("a live epoch manifest comes from the shared builder and is refused by this build's projector", () => {
@@ -280,8 +334,12 @@ test("the CLI refusal matrix keeps live identities off the scientific instrument
     [["genesis-1", "--experiment", "genesis-2"], /Unsupported experiment: genesis-2/],
     [["live", "--experiment", "genesis-1"], /not allowed for live; allowed: genesis-live$/],
     [["live", "--experiment", "genesis-live-canary"], /not allowed for live/],
-    [["live"], /not implemented in this build/],
-    [["live", "--experiment", "genesis-live"], /not implemented in this build/],
+    // Phase L3c made the command real. What it must still refuse is a run
+    // whose physics are not a live universe's: the built-in config is the
+    // scientific one, and the tiers a live epoch is steered by are not
+    // optional, because a live epoch has no unsteered fallback.
+    [["live"], /anu lab live requires --config/],
+    [["live", "--experiment", "genesis-live"], /anu lab live requires --config/],
     [["replay", "--experiment", "genesis-2", "--data-dir", "runs"], /Unsupported experiment: genesis-2/],
     [["attest", "--experiment", "genesis-2", "--data-dir", "runs"], /Unsupported experiment: genesis-2/],
   ];

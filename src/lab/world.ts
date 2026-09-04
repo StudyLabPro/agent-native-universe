@@ -13,6 +13,7 @@ import {
   isExternalTask,
   liveThinkingDebit,
   openTaskBacklog,
+  planLiveArchive,
   proportionalReward,
 } from "./epoch-rules.js";
 import type { LiveRecordedInputs } from "./live-ports.js";
@@ -449,6 +450,9 @@ export class LogicalUniverse {
       // Upkeep of the final tick: nothing with a hidden oracle may cross into
       // the next epoch, because oracles live only in memory.
       await this.#expireAtEpochBoundary(tick);
+      // The bounded world: settled records leave the live state last, once
+      // this tick's retirements and expiries have settled what they settle.
+      await this.#archiveSettled(tick);
 
       await this.#commit({
         tick,
@@ -530,6 +534,39 @@ export class LogicalUniverse {
         actorId: agentId,
         data: { agentId, retiredTick: tick, reason: "exhausted" },
       });
+    }
+  }
+
+  /**
+   * The bounded world (phase L3c).
+   *
+   * A universe with no end must keep a working set of bounded size, so the
+   * upkeep of every live tick removes the records that have settled and aged
+   * past their window: submissions first, then the tasks whose last submission
+   * just left, then delivered mail. Nothing is lost — every archived record is
+   * still in this epoch's append-only log, and a replay of the chain from
+   * epoch 0 reconstructs all of it. What leaves is the *state*, not the
+   * evidence.
+   *
+   * The plan is a pure function of the state (`planLiveArchive`), so the
+   * protocol verifier regenerates it instead of trusting these events, and
+   * demands at `tick.completed` that nothing archivable was left behind.
+   */
+  async #archiveSettled(tick: number): Promise<void> {
+    const plan = planLiveArchive(this.manifest, this.config, tick, this.#world);
+    for (const submissionId of plan.submissions) {
+      await this.#commit({
+        tick,
+        phase: "upkeep",
+        type: "submission.archived",
+        data: { submissionId },
+      });
+    }
+    for (const taskId of plan.tasks) {
+      await this.#commit({ tick, phase: "upkeep", type: "task.archived", data: { taskId } });
+    }
+    for (const messageId of plan.messages) {
+      await this.#commit({ tick, phase: "upkeep", type: "message.archived", data: { messageId } });
     }
   }
 

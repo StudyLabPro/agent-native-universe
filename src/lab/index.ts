@@ -44,4 +44,6 @@ export * from "./live/evaluator-port.js";
 export * from "./live/physics-inbox.js";
 export * from "./live/live-cognition.js";
 export * from "./live/live-idle-policy.js";
+export * from "./live/archive.js";
+export * from "./live/supervisor.js";
 export * from "./live/epoch.js";

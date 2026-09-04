@@ -620,9 +620,13 @@ async function runCliCases(cases) {
   return outcomes;
 }
 
-function runCli({ args, pattern }) {
+function runCli({ args, pattern, env }) {
   return new Promise((resolveOutcome) => {
-    const child = spawn(process.execPath, [runnerPath, ...args], { cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [runnerPath, ...args], {
+      cwd: repositoryRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(env === undefined ? {} : { env }),
+    });
     let stderr = "";
     child.stderr.setEncoding("utf8");
     child.stdout.resume();
@@ -695,6 +699,35 @@ async function checkCliAllowlist() {
     }
   }
   report("CLI allowlist refuses live identities on the scientific instruments (exit 2)", ok, `${cases.length} cases`);
+
+  // The allowlist proven in the other direction (phase L3c).
+  //
+  // Until L3c the `live` command was a registered identity gate in front of an
+  // unimplemented supervisor, and "fails closed as not implemented" was a true
+  // statement about it. L3c made the command real, so that half of the old
+  // expectation is gone by construction. What must survive — and is asserted
+  // here — is that the gate itself did not loosen: exactly one identity gets
+  // through it, and the refusal the admitted identity then meets is about
+  // deployment (no model tiers configured), never about who it is. Without
+  // this case, a regression that let `live` accept `genesis-1` would only be
+  // caught by the negative cases above; with it, the guard also fails if the
+  // gate stops admitting the one identity it exists for.
+  //
+  // The environment is cleared of ANU_LIVE_* so an operator's shell cannot
+  // change what this case observes.
+  const cleanEnvironment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => !name.startsWith("ANU_LIVE_")),
+  );
+  const [admitted] = await runCliCases([{
+    args: ["live", "--experiment", LIVE_EXPERIMENT, "--config", livePath],
+    pattern: /requires the live tiers/,
+    env: cleanEnvironment,
+  }]);
+  report(
+    "the live command admits genesis-live and only genesis-live (exit 2 on deployment, not identity)",
+    admitted.status === 2 && admitted.matched,
+    `exit ${admitted.status}: ${admitted.message}`,
+  );
 }
 
 /**

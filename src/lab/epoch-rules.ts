@@ -13,6 +13,7 @@
  * scientific instruments from reaching anything under `src/lab/live/`.
  */
 import { compareCodeUnits, hashValue } from "./canonical.js";
+import { PUBLIC_INBOX_WINDOW, PUBLIC_SUBMISSION_WINDOW } from "./environment.js";
 import {
   ResourcePhysics,
   fixedMultiplyCeil,
@@ -22,6 +23,7 @@ import {
   PPM,
   type GenesisConfig,
   type LabTaskState,
+  type LiveArchiveConfig,
   type LiveCompaction,
   type LiveExhaustionCheckpoint,
   type LiveGenesisFrom,
@@ -119,21 +121,191 @@ export function epochBoundaryExpiries(
     .sort(compareCodeUnits);
 }
 
+/* ------------------------------------------------------------------------ */
+/* Phase L3c: the bounded world                                              */
+/*                                                                           */
+/* A universe that runs indefinitely must not grow indefinitely. Settled      */
+/* records — tasks nobody can still act on, submissions nobody can still      */
+/* verify, mail nobody can still read — leave the live state once they are    */
+/* older than the configured window. They do not leave the evidence: every    */
+/* one of them is still in the append-only event log of the epoch that        */
+/* created it, and a replay of the chain from epoch 0 reconstructs the whole  */
+/* history. The live state is a working set, the chain is the record.        */
+/* ------------------------------------------------------------------------ */
+
+/** The ids one upkeep archives, each list in id order. */
+export interface LiveArchivePlan {
+  submissions: string[];
+  tasks: string[];
+  messages: string[];
+}
+
+export function emptyLiveArchivePlan(): LiveArchivePlan {
+  return { submissions: [], tasks: [], messages: [] };
+}
+
+export function isEmptyLiveArchivePlan(plan: LiveArchivePlan): boolean {
+  return plan.submissions.length === 0 && plan.tasks.length === 0 && plan.messages.length === 0;
+}
+
+/**
+ * The tick a task settled on.
+ *
+ * A completed task carries its own `completedTick`. An expired one carries
+ * nothing, because expiry is regenerated rather than asserted — but a task
+ * expires exactly when its deadline has passed, so the deadline IS the settle
+ * tick. A task swept at an epoch boundary keeps a deadline in the future and
+ * therefore waits out its own deadline before the window starts, which is
+ * bounded and needs no special case.
+ */
+export function liveTaskSettledTick(task: LabTaskState): number {
+  return task.completedTick ?? task.deadlineTick;
+}
+
+/**
+ * What an upkeep at `tick` archives out of `state`, given the windows.
+ *
+ * Pure, and a fixpoint: applying the plan and recomputing yields an empty
+ * plan, which is what lets the protocol verifier demand that a tick's archival
+ * is complete by regenerating the plan from the state the archived events
+ * left behind.
+ *
+ * Three ordering rules make the result safe to apply:
+ *
+ *  - the newest `PUBLIC_SUBMISSION_WINDOW` submissions and the newest
+ *    `PUBLIC_INBOX_WINDOW` messages of each inbox are what an observation is
+ *    built from, so they are never archived while they are still observable;
+ *  - a submission is archived only once its task has settled;
+ *  - a task is archived only once every submission naming it is archived in
+ *    the same plan, so the observation frame can never reach a task that is
+ *    no longer there.
+ */
+export function archivableRecords(
+  windows: LiveArchiveConfig,
+  tick: number,
+  state: WorldState,
+): LiveArchivePlan {
+  const observableSubmissions = new Set(state.submissionOrder.slice(-PUBLIC_SUBMISSION_WINDOW));
+  const archivedSubmissions = new Set<string>();
+  const submissions: string[] = [];
+  for (const id of Object.keys(state.submissions).sort(compareCodeUnits)) {
+    if (observableSubmissions.has(id)) continue;
+    const submission = state.submissions[id]!;
+    if (submission.submittedTick > tick - windows.submissionTicks) continue;
+    const task = state.tasks[submission.taskId];
+    if (task !== undefined && task.status !== "completed" && task.status !== "expired") continue;
+    submissions.push(id);
+    archivedSubmissions.add(id);
+  }
+
+  const referenced = new Set<string>();
+  for (const submission of Object.values(state.submissions)) {
+    if (!archivedSubmissions.has(submission.id)) referenced.add(submission.taskId);
+  }
+  const tasks = Object.values(state.tasks)
+    .filter((task) => (
+      (task.status === "completed" || task.status === "expired")
+      && liveTaskSettledTick(task) <= tick - windows.taskTicks
+      && !referenced.has(task.id)
+    ))
+    .map((task) => task.id)
+    .sort(compareCodeUnits);
+
+  const observableMessages = new Set<string>();
+  for (const agent of Object.values(state.agents)) {
+    for (const id of agent.inbox.slice(-PUBLIC_INBOX_WINDOW)) observableMessages.add(id);
+  }
+  const messages = Object.values(state.messages)
+    .filter((message) => (
+      message.deliveredTick !== undefined
+      && message.deliveredTick <= tick - windows.messageTicks
+      && !observableMessages.has(message.id)
+    ))
+    .map((message) => message.id)
+    .sort(compareCodeUnits);
+
+  return { submissions, tasks, messages };
+}
+
+/** The archive windows of a live epoch; `undefined` outside live mode. */
+export function liveArchiveWindows(
+  manifest: Pick<RunManifest, "mode">,
+  config: GenesisConfig,
+): LiveArchiveConfig | undefined {
+  if (!isLiveMode(manifest)) return undefined;
+  const archive = config.live?.archive;
+  if (archive === undefined) throw new Error("A live epoch requires live.archive windows");
+  return archive;
+}
+
+/** What the upkeep of `tick` archives — the rule the world applies and the verifier regenerates. */
+export function planLiveArchive(
+  manifest: Pick<RunManifest, "mode">,
+  config: GenesisConfig,
+  tick: number,
+  state: WorldState,
+): LiveArchivePlan {
+  const windows = liveArchiveWindows(manifest, config);
+  if (windows === undefined) return emptyLiveArchivePlan();
+  return archivableRecords(windows, tick, state);
+}
+
+/* The three removals, written once. The reducer applies them event by event
+ * and `compactWorldState` applies them in bulk at a boundary; a second
+ * implementation of "what archiving a record means" is exactly the drift the
+ * single-embodiment invariant forbids. */
+
+export function removeArchivedTask(state: WorldState, taskId: string): void {
+  delete state.tasks[taskId];
+}
+
+export function removeArchivedSubmission(state: WorldState, submissionId: string): void {
+  delete state.submissions[submissionId];
+  state.submissionOrder = state.submissionOrder.filter((id) => id !== submissionId);
+  // A verification is a statement about one submission; without the submission
+  // it cannot be read, so it leaves with it.
+  for (const [id, verification] of Object.entries(state.verifications)) {
+    if (verification.submissionId === submissionId) delete state.verifications[id];
+  }
+}
+
+export function removeArchivedMessage(state: WorldState, messageId: string): void {
+  const message = state.messages[messageId];
+  delete state.messages[messageId];
+  if (message === undefined) return;
+  const recipient = state.agents[message.recipientId];
+  if (recipient !== undefined && recipient.inbox.includes(messageId)) {
+    recipient.inbox = recipient.inbox.filter((id) => id !== messageId);
+  }
+}
+
 /**
  * Derive the genesis state of epoch `k+1` from the final state of epoch `k`.
  *
  * The rule is part of `config.live.genesisFrom.compaction`, so it is inside
  * `configHash` and therefore inside the child's `runId`: a child can never
- * inherit a differently-derived world than its identity claims. `none` is the
- * identity rule this build implements; bounded-world compaction (archive
- * windows, phase L3c) adds further kinds and is refused fail-closed until it
- * exists, rather than silently degrading to `none`.
+ * inherit a differently-derived world than its identity claims.
+ *
+ * `none` is the identity rule. `windows` is the bounded-world rule: the same
+ * archive windows the epoch's own upkeep applies, applied once more at the
+ * parent's final tick. In a universe whose epochs archived as they ran it is a
+ * fixpoint — that is the point, the child's genesis is provably bounded either
+ * way — and it is the rule that bounds a genesis inherited from an epoch that
+ * did not archive. The windows travel inside the rule rather than being read
+ * back out of the parent's config, so `verifyLiveChain` re-derives the genesis
+ * from the link alone.
  */
 export function compactWorldState(state: WorldState, rule: LiveCompaction): WorldState {
-  if (rule.kind !== "none") {
+  const compacted = structuredClone(state);
+  if (rule.kind === "none") return compacted;
+  if (rule.kind !== "windows") {
     throw new Error(`Unsupported live compaction rule ${String((rule as { kind: string }).kind)}`);
   }
-  return structuredClone(state);
+  const plan = archivableRecords(rule.archive, compacted.tick, compacted);
+  for (const id of plan.submissions) removeArchivedSubmission(compacted, id);
+  for (const id of plan.tasks) removeArchivedTask(compacted, id);
+  for (const id of plan.messages) removeArchivedMessage(compacted, id);
+  return compacted;
 }
 
 /* ------------------------------------------------------------------------ */
