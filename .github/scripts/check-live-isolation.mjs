@@ -628,14 +628,20 @@ function runCli({ args, pattern }) {
     child.stdout.resume();
     child.stderr.on("data", (chunk) => { stderr += chunk; });
     child.on("error", (error) => resolveOutcome({ args, status: null, message: error.message, matched: false }));
-    child.on("exit", (code) => {
+    let status = null;
+    child.on("exit", (code) => { status = code; });
+    // `close`, not `exit`: the child's exit code is known before its stderr
+    // pipe has drained in this process, and reading the refusal message at
+    // `exit` intermittently sees an empty string and reports a refusal that
+    // did happen as a failure.
+    child.on("close", () => {
       let message = "";
       try {
         message = JSON.parse(stderr.trim().split("\n").at(-1)).error.message;
       } catch {
         message = stderr.trim();
       }
-      resolveOutcome({ args, status: code, message, matched: pattern.test(message) });
+      resolveOutcome({ args, status, message, matched: pattern.test(message) });
     });
   });
 }
