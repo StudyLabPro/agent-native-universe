@@ -179,9 +179,72 @@ follows [Semantic Versioning](https://semver.org/).
   fallback that already carries the cohort-qualified live literal.
 - Added `experiments/genesis-live/config.json` (the epoch-0 physics of the
   live universe) and the tests `test/lab-live-{epochs,boundary}.test.mjs`.
-  Still to come: recorded task sources, verdicts and economy (L3b), and
-  archival, the supervisor and the `live` command (L3c) — each declared as a
-  seam that fails closed today.
+  Still to come at the time: recorded task sources, verdicts and economy
+  (delivered in L3b below), and archival, the supervisor and the `live`
+  command (L3c) — each declared as a seam that fails closed.
+
+### Genesis-Live — phase L3b (recorded inputs, verdicts, the economy of thinking)
+
+- Three recorded-input ports carry into a live epoch what a seed cannot
+  produce. Their interfaces are `src/lab/live-ports.ts`, deliberately OUTSIDE
+  `src/lab/live/`: `world.ts` and `genesis.ts` name them, and the science guard
+  forbids the scientific instruments from importing that directory even
+  type-only. The implementations are `src/lab/live/{task-source,evaluator-port,
+  physics-inbox}.ts` over the shared reader `src/lab/live/recorded-inbox.ts`.
+- `external` is the live-only task family of work that entered from
+  `tasks/inbox.jsonl`. Its id is a commitment to its own content
+  (`externalTaskId`), so the verifier checks a recorded task against itself
+  without ever reading the inbox, a byte-identical record cannot enter twice,
+  and a swapped prompt or deadline is refused at replay. External work is
+  admitted after the tick's calibration work, within `taskStream.maxBacklog`,
+  and never touches `learning`/`taskCounts` — specialization is still measured
+  over exactly the frozen eight families, and external work is counted in the
+  live-only `WorldState.counters`. Because it carries no hidden oracle it is
+  the one kind of work allowed to cross an epoch boundary, and it expires on
+  its own ABSOLUTE tick in whatever epoch that tick falls in.
+- `LiveEvaluatorPort` grades what no oracle can. A verdict is committed
+  verbatim as a state-neutral `verdict.recorded` immediately BEFORE the
+  `task.evaluated{qualityPpm, evaluatorId}` it justifies — the same treatment
+  `cognition.recorded` gets, for the same reason — and an accepted verdict pays
+  `floor(acceptedTaskReward × qualityPpm / PPM)`. `LlmEvaluator` puts a grader
+  model behind the existing completion surface (`temperature 0`, JSON only, an
+  unparsable answer grades zero and stays on record); `InboxEvaluator` reads
+  `verdicts/inbox.jsonl`. Replay reads the recorded verdict and never asks a
+  grader again. `RunManifest.evaluatorId` is present exactly in live mode and
+  hashed into the `runId`, as `cognitionId` is; an epoch that grades only
+  calibration work names the hidden oracle (`oracle-evaluator-v1`).
+- Thinking is paid for inside the world. A live `cognition.recorded` states its
+  tier, and exactly one `resource.spent{action:"reason"}` follows it
+  immediately in the observation phase, caused by it:
+  `ceil(usage.totalTokens × tiers[tier].pricePpm / PPM)` plus `costs.reason`,
+  scaled by the current physics. The verifier recomputes that price from the
+  recorded usage and refuses anything between the record and its debit. An
+  uncoverable price is charged to zero and committed as
+  `violation.recorded{reason:"cognition overdraft"}`. An active agent below
+  `live.exhaustion.minThinkTokens` holding no claimed task starves; after
+  `graceTicks` consecutive starving ticks it is retired in the upkeep as
+  `agent.retired{reason:"exhausted"}`, with no causal parent because
+  `LiveExhaustionTracker` regenerates the rule from the states. That clock is
+  live-only runtime state (`CheckpointRuntimeState.exhaustion`), so logical and
+  cognitive `runtimeHash`es are byte-identical to what they were, and it
+  travels in `genesisFrom.runtime` so the grace period is continuous across
+  boundaries.
+- `physics/inbox.jsonl` is the whole control surface of a live universe. A
+  record applies on its own absolute tick; a record ADDRESSED TO AN AGENT is
+  refused by the parser with a message naming the invariant, rather than
+  dropped or honoured — the control plane sets physics only, never who does
+  what. `retire_agent_fraction` still draws its victims from
+  `pressureRng.fork(tick)`, and the verifier recomputes the whole payload with
+  `pressureEffect`, so an operator cannot aim a retirement.
+- Single embodiment throughout: the shape of a pressure is `parsePressureSpec`
+  and its effect is `pressureEffect` (both in `pressure-engine.ts`), used by
+  the configured schedule, the recorded inbox and the verifier alike; the
+  external-task shape, the thinking price, the proportional reward and the
+  exhaustion clock live once in `src/lab/epoch-rules.ts`. An inbox record names
+  its absolute tick, so a source needs no cursor to survive a crash.
+- Added `test/lab-live-{inputs,economy}.test.mjs`; the recorded-input seams of
+  `runLiveEpoch` no longer fail closed, while `archive` and `supervisor` (L3c)
+  still do and `anu lab live` still exits "not implemented in this build".
 
 ### Genesis-Live — phase L4 (Observer live surface)
 
@@ -216,6 +279,10 @@ follows [Semantic Versioning](https://semver.org/).
   200 ticks, so both fixture sets in `experiments/genesis-1/expected/*.json`
   are regenerated and hash-compared on every pull request rather than
   shape-checked. Both steps stay inside the single required PR Gate job.
+- The CLI-allowlist check reads a refused case on the child's `close`, not its
+  `exit`: the exit code is known before the child's stderr pipe has drained in
+  the guard process, so the refusal message was intermittently read as empty
+  and a refusal that did happen was reported as a failure.
 
 ### Controlled LLM egress
 

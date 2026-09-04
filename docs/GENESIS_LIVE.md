@@ -89,7 +89,7 @@ generated `deadlineTicks + 1` ticks before the epoch ends and the last upkeep
 expires what is still open (`task.expired{reason:"epoch_boundary"}`). External
 tasks have no oracle and may cross.
 
-### 2.1 Engine — how an epoch runs (phase L3a)
+### 2.1 Engine — how an epoch runs (phases L3a, L3b)
 
 `src/lab/live/epoch.ts` is the whole spine; there is no second runtime.
 
@@ -121,13 +121,81 @@ tasks have no oracle and may cross.
   changing what a metric means.
 - Epoch-0 physics of the universe: `experiments/genesis-live/config.json`.
 
+**Recorded inputs (phase L3b).** Three ports carry into the world what a seed
+cannot produce. Their interfaces are `src/lab/live-ports.ts` — outside
+`src/lab/live/`, because `world.ts` and `genesis.ts` name them and the science
+guard forbids the scientific instruments from importing that directory, even
+type-only. Their implementations are `src/lab/live/{task-source,
+evaluator-port,physics-inbox}.ts` over the shared inbox reader
+`src/lab/live/recorded-inbox.ts`. The rules the world and the verifier must
+agree on — the external-task shape and its content-committing id, the price of
+a thought, the proportional reward, the exhaustion clock — live once in
+`src/lab/epoch-rules.ts`.
+
+| Port | Reads | Commits | How the verifier treats it |
+|---|---|---|---|
+| `LiveTaskSource` (`FileTaskSource`, `CompositeTaskSource`) | `tasks/inbox.jsonl` | `task.created{source:"external"}` with family `external`, after the tick's calibration work | by form: the payload must be a well-formed external task whose id is `externalTaskId(createdTick, deadlineTick, input)`, admitted within `taskStream.maxBacklog`, never before the tick's calibration work |
+| `LiveEvaluatorPort` (`LlmEvaluator`, `InboxEvaluator`) | a grader model, or `verdicts/inbox.jsonl` | `verdict.recorded` (state-neutral, verbatim) immediately before the `task.evaluated{qualityPpm, evaluatorId}` it justifies | by form: `evaluatorId` is the manifest's, `qualityPpm ∈ [0, PPM]`, the verdict precedes its evaluation and grades the next pending submission |
+| `LivePressureSource` (`FilePressureSource`) | `physics/inbox.jsonl` | `pressure.applied` on the record's own tick, followed by the retirements it caused | shape by `parsePressureSpec`, effect by `pressureEffect` against the same per-tick `pressureRng.fork(tick)` — an operator cannot aim a `retire_agent_fraction` |
+
+- An inbox record names the **absolute tick** it applies on, so a source is a
+  pure function of the file and the tick. There is no cursor to lose: a resume
+  re-reads the same file, and a record written for a tick that has already
+  passed is never admitted late.
+- A record that names an individual agent is **refused by the parser**
+  (`assertNotAddressed`), not dropped and not honoured. The control plane sets
+  physics only; it never says who does what.
+- `external` is the one task family a seed cannot produce, so it is the one
+  kind of work that may cross an epoch boundary: it carries no hidden oracle,
+  and it expires on its own absolute tick in whatever epoch that tick falls in.
+  Calibration work is still swept at the boundary, which is why the full-chain
+  sweep is exercised against a task source whose deadlines are unbounded by the
+  epoch (`test/lab-live-inputs.test.mjs`).
+- The `evaluatorId` is part of the epoch's identity — validated by
+  `assertLabManifestImplementation` and hashed into the `runId`, exactly as
+  `cognitionId` is. An epoch that grades only calibration work names the hidden
+  oracle (`oracle-evaluator-v1`) rather than leaving the field blank. A
+  `taskSource` without an `evaluator` is refused up front, and so is an epoch
+  that would inherit open external work with no grader.
+- An accepted verdict pays `floor(acceptedTaskReward × qualityPpm / PPM)`;
+  `qualityPpm = 0` is not an acceptance. Calibration work stays all-or-nothing
+  against its oracle, and a calibration `task.evaluated` carries no
+  `evaluatorId`.
+
+**The economy of thinking (phase L3b).** A live `cognition.recorded` states the
+tier it was consulted at, and the world commits exactly one
+`resource.spent{action:"reason"}` **immediately after** it, in the observation
+phase, with `causationId` pointing at the record:
+`llmTokens = ceil(usage.totalTokens × tiers[tier].pricePpm / PPM)` plus
+`costs.reason`, all scaled by the current physics. The verifier recomputes that
+price from the recorded usage, the configured tier price and the state's
+physics, and refuses anything at all between the record and its debit — so a
+run cannot under-charge itself for thinking. A balance that cannot cover the
+price is charged to zero and the shortfall is committed as
+`violation.recorded{reason:"cognition overdraft"}`; forgiving it silently would
+make the balance a fiction. An active agent holding fewer than
+`live.exhaustion.minThinkTokens` and no claimed task is *starving*;
+`live.exhaustion.graceTicks` consecutive starving ticks retire it in the upkeep
+as `agent.retired{reason:"exhausted"}`, with no causal parent because the rule
+is regenerated from the states rather than asserted by the event. The clock is
+runtime state (`CheckpointRuntimeState.exhaustion`, live-only and therefore
+absent from every logical `runtimeHash`) and travels across a boundary in
+`genesisFrom.runtime`, so the grace period is continuous over the life of the
+universe instead of restarting each epoch.
+
+What the verifier accepts by form here, and cannot do better: the **tier** a
+record names. Which tier `LiveCognition` would have chosen depends on
+`ANU_LIVE_TIERS` (`maxTokens` per tier), which is port configuration and not
+part of `configHash`; the chain carries no `nextTier` either. The tier is
+therefore a recorded input like the answer and the token count beside it, and
+what the verifier does check is that the debit is exactly the price of the
+tier and usage on record.
+
 Not implemented in this build, each a seam that fails closed rather than a
-silent gap: recorded task sources, the evaluator port and verdicts, the
-`llmTokens` economy and exhaustion, `physics/inbox.jsonl` pressures (phase
-L3b); archival and compaction (`compactWorldState` refuses every kind but
+silent gap: archival and compaction (`compactWorldState` refuses every kind but
 `none`), the outage and disk supervisor and the `anu lab live` command
-(phase L3c). Passing `taskSource`, `evaluator`, `pressureSource`, `archive` or
-`supervisor` to `runLiveEpoch` is refused, not ignored.
+(phase L3c). Passing `archive` or `supervisor` to `runLiveEpoch` is refused,
+not ignored, and `anu lab live` still exits "not implemented in this build".
 
 ## 3. Recorded-input rules
 
@@ -138,7 +206,7 @@ implementation):
 
 | Input | Source | Event | What the verifier checks |
 |---|---|---|---|
-| Model answer | `LiveCognition` through the gateway | `cognition.recorded` (+ one `resource.spent{action:"reason"}` charged from `llmTokens` by `usage.totalTokens × pricePpm`) | one record per consulted agent; spend follows the record; tier = `expectedTier(nextTier, balance, prices)` |
+| Model answer | `LiveCognition` through the gateway | `cognition.recorded` (+ one `resource.spent{action:"reason"}` charged from `llmTokens` by `usage.totalTokens × pricePpm`) | one record per consulted agent; the debit follows the record immediately and is recomputed from the recorded usage, the tier price and the state's physics; the tier itself is accepted by form (§2.1) |
 | External task | `tasks/inbox.jsonl` | `task.created{source}` with family `external` | form, deadline ≥ tick, forbidden fields; the parser **rejects addressed entries** |
 | Verdict | grader model or `verdicts/inbox.jsonl` | `verdict.recorded` (state-neutral, verbatim) before `task.evaluated{qualityPpm, evaluatorId}` | `evaluatorId ∈ manifest`, `qualityPpm ∈ [0, PPM]` |
 | Physics | `physics/inbox.jsonl` | `pressure.applied` | multipliers and fractions only; `retire_agent_fraction` still drawn from `pressureRng` |
@@ -264,6 +332,6 @@ IAM role bindings applied by hand, ACME path for the Observer edge.
 | L4 Observer live surface — `/api/live`, run head/state, ETag/304 | delivered (`fb0c1bc`, merged `aa677f3`) |
 | L9 permanent CI gate — hardened science-isolation guard | delivered (`3a6ab0a`, merged `3ad5dd1`) |
 | L3a live engine — epoch chain, inherited genesis, idempotent boundary, live projection | delivered (§2.1) |
-| L3b live engine — recorded task sources, verdicts, economy, recorded physics | pending; seams declared and failing closed |
+| L3b live engine — recorded task sources, verdicts, economy, recorded physics | delivered (§2.1) |
 | L3c live engine — archival and compaction, supervisor, `anu lab live` | pending; seams declared and failing closed |
 | C1 canary · L5 infrastructure · L6 site · L7 link inheritance · L8 background extensions | pending; dependencies and criteria in the design |
