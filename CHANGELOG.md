@@ -362,6 +362,43 @@ follows [Semantic Versioning](https://semver.org/).
   the guard process, so the refusal message was intermittently read as empty
   and a refusal that did happen was reported as a failure.
 
+### Protocol verifier action coverage
+
+- `LabProtocolVerifier` regenerated the deterministic outcome of only six of
+  the nineteen priced action types (`claimTask`, `execute`, `submit`,
+  `connect`, `send`, `verify`) and threw
+  `unsupported action <type> in the manifest-bound policy` on every other one,
+  killing the process. The violation branch had the matching gap: an action
+  refused by the world (`disconnect` without a link, `retrieve` of an unknown
+  key, an unaffordable `transfer`, an unknown capability, and the five priced
+  but unimplemented actions) was refused as "cannot be replaced by a
+  violation". Nothing in the scientific track reaches the gap — its
+  deterministic policies only ever choose those six — so it was a live-only
+  defect and was found by a real epoch against a real model, not by review: a
+  live agent chose `store`, and the whole universe stopped.
+- Every action type now has a real check. `store`, `retrieve`, `disconnect`,
+  `transfer`, `publishCapability` and `useCapability` are regenerated
+  field-for-field from the decision and the projected state, including all
+  four ways an invocation ends (accepted to the owner, accepted to the
+  treasury, rejected by its own bounded plan, rejected for want of resources).
+  A forged outcome the reducer alone would accept — a transfer of 300 credits
+  where 3 were decided, a capability published at a price nobody agreed to, an
+  invocation recorded against an input the caller never chose — is now refused.
+- `spawn`, `clone`, `merge`, `reserve` and `trade` remain priced and
+  unimplemented (their implementation is background work of a later phase).
+  The verifier now regenerates the world's refusal verbatim and refuses any
+  successful outcome event claiming one of them, rather than crashing on both.
+- The unsupported-action rule moved to `src/lab/action-rules.ts` so the world
+  and the verifier read one definition instead of two, the way `epoch-rules.ts`
+  already holds the live rules. The verifier builds an expected publication
+  with the same `createCapabilityState` the world publishes with, and runs a
+  capability plan through the same `executeCapabilityPlan`.
+- The outcome switch is exhaustive at compile time: a new action type now fails
+  the build instead of reaching production as an unverified outcome.
+- Added `test/lab-protocol-actions.test.mjs`: real epochs in which each action
+  is actually chosen, each verified, and each then re-signed with a tampered
+  outcome and refused.
+
 ### Controlled LLM egress
 
 - Added a dependency-free OpenAI-compatible gateway and `anu lab gateway` CLI

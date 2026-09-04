@@ -133,6 +133,12 @@ agree. It then regenerates the exact genesis population, pressures, task stream
 and hidden task oracles, neutral-policy observations and decisions, deterministic
 resolution order, evaluator results, rewards, metric schedule, tick/phase state
 machine, and action-payment causality. A terminal `run.completed` is mandatory.
+Every one of the nineteen priced action types is covered: the outcome event of
+a validated decision is regenerated field-for-field, the refusal of an action
+the world could not perform is regenerated word-for-word, and the five priced
+but unimplemented actions (`spawn`, `clone`, `merge`, `reserve`, `trade`) can
+produce no successful outcome at all. The switch is exhaustive at compile time,
+so a new action type cannot ship without its check.
 `--until-tick` changes only the returned projection: replay still validates the
 complete event file so a valid prefix cannot hide a forged suffix.
 

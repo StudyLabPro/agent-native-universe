@@ -108,7 +108,18 @@ tasks have no oracle and may cross.
 - Rules that differ between a bounded run and an epoch live once, in
   `src/lab/epoch-rules.ts`, and are called by both the world and the verifier:
   the calibration stop, the boundary sweep, the inherited `run.started`
-  payload and `compactWorldState`.
+  payload and `compactWorldState`. `src/lab/action-rules.ts` holds the rule
+  that does not depend on the mode at all — which priced actions this engine
+  can actually perform — for the same reason and with the same two callers.
+- **The whole action vocabulary is verified, not a scientific subset.** A
+  deterministic policy only ever chooses six of the nineteen priced actions; a
+  live agent chooses freely, so every type has a deterministic-outcome check:
+  the outcome event is regenerated field-for-field from the decision and the
+  projected state, and an action the world refused has its refusal regenerated
+  word-for-word. `spawn`, `clone`, `merge`, `reserve` and `trade` are priced
+  and unimplemented (§9, L8): they can only ever produce the refusal, never a
+  successful outcome. `test/lab-protocol-actions.test.mjs` proves each type
+  both ways — the honest chain verifies, the tampered one is refused.
 - The calibration realization is seeded from the universe (a derived
   `taskStream.realizationSeed`), not from each epoch's `runId`, so the child
   continues the parent's stream instead of starting a new one; the cursor and

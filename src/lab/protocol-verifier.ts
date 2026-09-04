@@ -1,6 +1,8 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
+import { isUnsupportedAction, unsupportedActionReason } from "./action-rules.js";
 import { createGenesisAgents } from "./agent-factory.js";
 import { compareCodeUnits, hashValue } from "./canonical.js";
+import { createCapabilityState, executeCapabilityPlan } from "./capability-registry.js";
 import { validateGenesisConfig } from "./config.js";
 import {
   LIVE_COGNITION_OVERDRAFT_REASON,
@@ -39,6 +41,8 @@ import { DeterministicRng } from "./rng.js";
 import { DeterministicTaskStream, taskStreamRng, type GeneratedTask } from "./task-stream.js";
 import {
   PPM,
+  ZERO_RESOURCES,
+  type CapabilityState,
   type CheckpointRuntimeState,
   type GenesisConfig,
   type LabTaskState,
@@ -50,6 +54,7 @@ import {
   type ResourceVector,
   type RunManifest,
   type TickPhase,
+  type WorldAction,
   type WorldState,
 } from "./types.js";
 
@@ -1325,16 +1330,156 @@ export class LabProtocolVerifier {
         assertExact(event.data, { verification }, event, this.#fail.bind(this), "verify outcome");
         return;
       }
+      case "disconnect": {
+        const link = this.#findLink(state, actorId, decision.action.targetId);
+        if (link === undefined) this.#fail(event, "deterministic disconnect has no active link");
+        if (event.type !== "link.removed" || event.targetId !== decision.action.targetId) {
+          this.#fail(event, "disconnect outcome differs from its deterministic decision");
+        }
+        assertExact(event.data, { linkId: link.id }, event, this.#fail.bind(this), "disconnect outcome");
+        return;
+      }
+      case "store":
+        if (event.type !== "memory.stored" || event.targetId !== undefined) {
+          this.#fail(event, "store outcome differs from its deterministic decision");
+        }
+        assertExact(
+          event.data,
+          {
+            agentId: actorId,
+            key: decision.action.key,
+            value: decision.action.value,
+            action: "store",
+          },
+          event,
+          this.#fail.bind(this),
+          "store outcome",
+        );
+        return;
+      case "retrieve": {
+        // A retrieval publishes what the world holds, not what the event says
+        // it holds: the value is read back out of the state the verifier has
+        // projected, so a forged recall of a key is refused.
+        const memory = state.agents[actorId]?.memory;
+        if (memory === undefined || !Object.hasOwn(memory, decision.action.key)) {
+          this.#fail(event, "retrieve outcome reads a memory key the world does not hold");
+        }
+        if (event.type !== "memory.retrieved" || event.targetId !== undefined) {
+          this.#fail(event, "retrieve outcome differs from its deterministic decision");
+        }
+        assertExact(
+          event.data,
+          {
+            agentId: actorId,
+            key: decision.action.key,
+            value: memory[decision.action.key]!,
+            action: "retrieve",
+          },
+          event,
+          this.#fail.bind(this),
+          "retrieve outcome",
+        );
+        return;
+      }
+      case "transfer":
+        if (event.type !== "resource.transferred" || event.targetId !== decision.action.targetId) {
+          this.#fail(event, "transfer outcome differs from its deterministic decision");
+        }
+        assertExact(
+          event.data,
+          {
+            fromId: actorId,
+            toId: decision.action.targetId,
+            resource: decision.action.resource,
+            amount: decision.action.amount,
+          },
+          event,
+          this.#fail.bind(this),
+          "transfer outcome",
+        );
+        return;
+      case "publishCapability": {
+        if (event.type !== "capability.published" || event.targetId !== undefined) {
+          this.#fail(event, "publishCapability outcome differs from its deterministic decision");
+        }
+        // Single embodiment: the published record is built by the same
+        // `createCapabilityState` the world published it with, validation and
+        // all, rather than re-derived here.
+        const capability = capabilityPublicationOf(actorId, event.tick, decision.action.capability);
+        if (typeof capability === "string") {
+          this.#fail(event, `publishCapability outcome is not a valid publication: ${capability}`);
+        }
+        assertExact(event.data, { capability }, event, this.#fail.bind(this), "publishCapability outcome");
+        return;
+      }
+      case "useCapability": {
+        const capability = state.capabilities[decision.action.capabilityId];
+        if (capability === undefined) this.#fail(event, "useCapability outcome names an unknown capability");
+        if (event.type !== "capability.used" || event.targetId !== capability.ownerId) {
+          this.#fail(event, "useCapability outcome differs from its deterministic decision");
+        }
+        const caller = state.agents[actorId];
+        if (caller === undefined) this.#fail(event, "useCapability outcome has no calling agent");
+        const invocation = {
+          id: deterministicId(
+            "capability-invocation",
+            this.manifest.runId,
+            this.manifest.universeId,
+            event.tick,
+            actorId,
+            capability.id,
+            decision.localIndex,
+          ),
+          capabilityId: capability.id,
+          callerId: actorId,
+          input: structuredClone(decision.action.input),
+          createdTick: event.tick,
+          localIndex: decision.localIndex,
+          // The world's three branches, in the world's order: the bounded plan
+          // is executed here through the same function, and affordability is
+          // measured against the balance left after the action payment.
+          ...outcomeOfInvocation(
+            executedCapabilityOutput(capability, decision.action.input),
+            this.#physics.canAfford(caller.resources, capability.cost),
+            capability,
+            actorId,
+          ),
+        };
+        assertExact(event.data, { invocation }, event, this.#fail.bind(this), "useCapability outcome");
+        return;
+      }
+      case "spawn":
+      case "clone":
+      case "merge":
+      case "reserve":
+      case "trade":
+        // Priced, but no reducer performs them: the world pays for the attempt
+        // and records the refusal (regenerated in `#expectedActionViolation`).
+        // An outcome event for one of them claims a world transition this
+        // engine has no implementation of, so it is refused outright rather
+        // than checked against a shape that does not exist.
+        this.#fail(
+          event,
+          `${decision.action.type} is unsupported by this engine and cannot produce an action outcome`,
+        );
       case "observe":
       case "reason":
         this.#fail(event, `${decision.action.type} must not emit an action outcome`);
-      default:
-        this.#fail(event, `unsupported action ${decision.action.type} in the manifest-bound policy`);
+      default: {
+        // Exhaustive: a new action type fails the build here rather than
+        // reaching production as an unverified outcome.
+        const unhandled: never = decision.action;
+        this.#fail(event, `unsupported action ${(unhandled as WorldAction).type} in the manifest-bound policy`);
+      }
     }
   }
 
   #expectedActionViolation(decision: PolicyDecision, state: WorldState): string | undefined {
     const action = decision.action;
+    // An action this engine prices but cannot perform is refused before any
+    // referential check: the world pays for the attempt and records exactly
+    // this reason, which is regenerated here rather than trusted.
+    if (isUnsupportedAction(action.type)) return unsupportedActionReason(action.type);
     switch (action.type) {
       case "connect":
       case "send":
@@ -1369,6 +1514,43 @@ export class LabProtocolVerifier {
           ? undefined
           : "Verification verdict does not match the independently computed result";
       }
+      case "disconnect":
+        // `disconnect` does not check the target the way `connect`/`send` do:
+        // a self-target or an inactive peer simply has no link.
+        return this.#findLink(state, decision.actorId, action.targetId) === undefined
+          ? "Agents are not connected"
+          : undefined;
+      case "retrieve": {
+        const memory = state.agents[decision.actorId]?.memory;
+        return memory !== undefined && Object.hasOwn(memory, action.key)
+          ? undefined
+          : `Unknown memory key ${action.key}`;
+      }
+      case "transfer": {
+        // The world's checks in their exact order: target, then amount, then
+        // the balance left after the action payment.
+        if (action.targetId === decision.actorId) return "Agent cannot target itself";
+        if (!state.agents[action.targetId]?.active) return `Target ${action.targetId} is not active`;
+        if (!Number.isSafeInteger(action.amount) || action.amount <= 0) return "Transfer amount must be positive";
+        const balance = state.agents[decision.actorId]?.resources[action.resource] ?? 0;
+        return balance < action.amount ? `Insufficient ${action.resource}` : undefined;
+      }
+      case "publishCapability": {
+        if (state.capabilities[action.capability.id] !== undefined) {
+          return `Capability ${action.capability.id} already exists`;
+        }
+        // The publication is validated by the same constructor the world used;
+        // `createdTick` plays no part in whether it is accepted.
+        const published = capabilityPublicationOf(decision.actorId, state.tick, action.capability);
+        return typeof published === "string" ? published : undefined;
+      }
+      case "useCapability":
+        // Only an unknown capability refuses the call. A plan that throws or a
+        // caller that cannot pay is a recorded, rejected invocation — an
+        // outcome event, not a violation.
+        return state.capabilities[action.capabilityId] === undefined
+          ? `Unknown capability ${action.capabilityId}`
+          : undefined;
       default:
         return undefined;
     }
@@ -1661,6 +1843,60 @@ function assertExact(
   label: string,
 ): void {
   if (hashValue(actual) !== hashValue(expected)) fail(event, `${label} differs from deterministic protocol data`);
+}
+
+/**
+ * The capability record a publication would produce, or the exact message the
+ * world would have recorded as the violation instead.
+ *
+ * Both answers come from the one constructor the world publishes with, so the
+ * verifier never carries a second copy of what a valid capability is.
+ */
+function capabilityPublicationOf(
+  ownerId: string,
+  tick: number,
+  publication: Extract<WorldAction, { type: "publishCapability" }>["capability"],
+): CapabilityState | string {
+  try {
+    return createCapabilityState(ownerId, tick, publication);
+  } catch (error) {
+    return errorMessage(error);
+  }
+}
+
+/** The bounded plan's output, or `undefined` when the plan refuses the input. */
+function executedCapabilityOutput(capability: CapabilityState, input: JsonValue): JsonObject | undefined {
+  try {
+    return executeCapabilityPlan(capability, input);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The variable half of a capability invocation, in the world's own order:
+ * a plan that refuses the input is rejected before affordability is consulted,
+ * and only a call that both executes and can be paid for is accepted.
+ */
+function outcomeOfInvocation(
+  output: JsonObject | undefined,
+  affordable: boolean,
+  capability: CapabilityState,
+  callerId: string,
+): JsonObject {
+  if (output === undefined) {
+    return { accepted: false, success: false, chargedCost: { ...ZERO_RESOURCES }, reason: "execution_failed" };
+  }
+  if (!affordable) {
+    return { accepted: false, success: false, chargedCost: { ...ZERO_RESOURCES }, reason: "insufficient_resources" };
+  }
+  return {
+    accepted: true,
+    success: true,
+    output,
+    chargedCost: { ...capability.cost },
+    paymentTo: capability.ownerId === callerId ? "@treasury" : capability.ownerId,
+  };
 }
 
 function assertNoParticipants(

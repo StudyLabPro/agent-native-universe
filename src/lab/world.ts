@@ -1,4 +1,5 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
+import { isUnsupportedAction, unsupportedActionReason } from "./action-rules.js";
 import { assertRoleNeutralGenesis, createGenesisAgents } from "./agent-factory.js";
 import { createCapabilityState, executeCapabilityPlan } from "./capability-registry.js";
 import { hashValue } from "./canonical.js";
@@ -105,10 +106,6 @@ export interface LogicalUniverseOptions {
    */
   recordedInputs?: LiveRecordedInputs;
 }
-
-const UNSUPPORTED_ACTIONS = new Set<PrimitiveActionType>([
-  "spawn", "clone", "merge", "reserve", "trade",
-]);
 
 /** Deterministic, event-sourced logical Genesis universe. */
 export class LogicalUniverse {
@@ -798,11 +795,11 @@ export class LogicalUniverse {
     if (!this.#world.agents[actorId]?.active) return;
     const payment = await this.#pay(actorId, action.type, tick);
     if (!payment) return;
-    if (UNSUPPORTED_ACTIONS.has(action.type)) {
+    if (isUnsupportedAction(action.type)) {
       await this.#violation(
         actorId,
         action.type,
-        `${action.type} is unsupported in logical v1`,
+        unsupportedActionReason(action.type),
         tick,
         payment.eventId,
       );
