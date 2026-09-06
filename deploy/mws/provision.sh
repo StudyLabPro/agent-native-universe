@@ -355,9 +355,16 @@ ensure "Подсеть anu-live-nodes" \
   --network anu-live --cidr 10.77.0.0/24 \
   --idempotency-key "$(idem_key 'subnet-anu-live-nodes')"
 
+# Реальный API 2026-09-06 отклонил вызов без --body (`415 Content type ''
+# not supported` — CLI не ставит Content-Type для буквально пустого тела), а
+# затем `--body '{}'` (`required field is not filled: spec`). Ни одна из
+# этих двух попыток ничего не создала (обе провалились до записи). Рабочая
+# гипотеза, ПОКА НЕ ПРОВЕРЕННАЯ реальным запуском — пустой, но
+# присутствующий объект spec:
 ensure "Внешний адрес anu-live-1-ip" \
   mws vpc external-address get "vpc/projects/${MWS_PROJECT}/externalAddresses/anu-live-1-ip" -- \
   mws vpc external-address create "vpc/projects/${MWS_PROJECT}/externalAddresses/anu-live-1-ip" \
+  --body '{"spec":{}}' \
   --idempotency-key "$(idem_key 'external-address-anu-live-1-ip')"
 
 # https-from-lab / acme-http / deny-all-ingress уже существуют в реальном
