@@ -4,23 +4,53 @@
 # постоянного живого инстанса ANU (фаза L5a архитектуры Genesis-Live,
 # docs/GENESIS_LIVE.md §7.2).
 #
-# ЧТО ЭТОТ СКРИПТ ДЕЛАЕТ: создаёт (идемпотентно, где CLI это поддерживает)
-# сервисные аккаунты и ключи IAM, пустые контейнеры секретов в Secret
-# Manager, сеть/подсеть/внешний адрес/правила firewall в VPC, загрузочный и
-# evidence-диски, виртуальную машину anu-live-1 и реестр образов anu.
+# ФАКТ (2026-09-06): бо́льшая часть ресурсов ниже уже существует в реальном
+# аккаунте — их создал более ранний запуск 2026-09-04 01:39–01:56 в обход
+# предохранителя этого скрипта (см. RUNBOOK.md, раздел "Инцидент
+# 2026-09-04"). Проверено напрямую через `mws ... list -f json` 2026-09-06:
+#   УЖЕ ЕСТЬ: SA anu-live/anu-site-ask/anu-anchor; сеть anu-live + подсеть
+#   anu-live-nodes; диск anu-live-1-boot; VM anu-live-1 (РАБОТАЕТ, power ON,
+#   но как base-4-8, не base-8-32 — квота vCPU не позволила; собственное
+#   описание VM в API так и гласит: "Interim type base-4-8 until vCPU quota
+#   allows base-8-32"); правила firewall https-from-lab / acme-http /
+#   deny-all-ingress (значения совпадают с §7.2 по факту, хотя приоритеты
+#   отличаются от чисел в тексте архитектурного документа — см. ниже) и
+#   ssh-from-lab (совпадает с §7.2 по имени и структуре, НО пускает только
+#   Lab 185.233.3.14 — IP владельца в нём нет, документ называл эту роль
+#   "ssh-from-owner"); реестр anu + репозиторий agent-native-universe-lab.
+#   ЧЕГО НЕТ: ни одного IAM-ключа (api-key/hmac-key/authorized-key), ни
+#   одного секрета в Secret Manager, external-address anu-live-1-ip, диска
+#   anu-live-evidence-01 (300GB) — то есть VM работает голая, без данных,
+#   без ключей и без доступа снаружи.
+# Поэтому этот скрипт больше не пишет прямые `create` без проверки — каждый
+# ресурс сначала проверяется через `get` (exit 0 = уже есть, exit 1 = 404 =
+# нет) и создаётся только если отсутствует. Так его можно безопасно
+# перезапускать сколько угодно раз, включая уже частично провизионированный
+# аккаунт вроде текущего.
+#
+# ЧТО ЭТОТ СКРИПТ ДЕЛАЕТ: доводит IAM/Secret Manager/VPC/диски/реестр до
+# состояния §7.2 везде, где это НЕ требует трогать уже работающую VM.
 #
 # ЧТО ЭТОТ СКРИПТ НЕ ДЕЛАЕТ: не назначает IAM role bindings (в CLI `mws iam
-# role` есть только get/list — привязка ролей делается вручную в консоли
-# MWS/REST, см. RUNBOOK.md), не создаёт версии секретов с реальными данными
-# (это ручной шаг владельца, см. KEYS.md), не создаёт S3-бакет
-# (см. s3-bucket.sh) и не собирает/пушит образ (см. scripts/live/build-push.sh).
+# role` есть только get/list — вручную, см. RUNBOOK.md), не создаёт версии
+# секретов с реальными данными (ручной шаг владельца, см. KEYS.md), не
+# создаёт S3-бакет (см. s3-bucket.sh), не собирает/пушит образ (см.
+# scripts/live/build-push.sh) и — специально — НЕ подключает новый
+# evidence-диск и внешний адрес к уже работающей VM anu-live-1 автоматически:
+# `mws compute vm update --storage-disks/--network-interfaces` по тексту
+# `--help` выглядит как полная замена списка (тот же repeatable-flag
+# паттерн, что и в `create`), а не слияние. Собрать это неверно на живой VM
+# значит рискнуть отключить её текущий boot-диск или сеть. Этот шаг скрипт
+# только печатает как явную ручную инструкцию в конце (раздел 8) —
+# реконструированную из СВЕЖЕГО `vm get`, а не из значений на момент
+# написания этого файла.
 #
-# ПРЕДОХРАНИТЕЛЬ: каждый вызов ниже создаёт биллингуемый или потенциально
-# security-significant реальный ресурс в проекте MWS project-vxgxs2. Условие
-# перехода фазы L5a в самом архитектурном документе требует, чтобы владелец
-# сначала подтвердил список ресурсов (§10 документа) и лично выполнил шаг с
-# секретами и IAM-биндингами. Поэтому скрипт не продолжает работу без явного
-# человеческого подтверждения — см. раздел "Предохранитель" ниже.
+# ПРЕДОХРАНИТЕЛЬ: каждый вызов ниже, который реально что-то создаёт —
+# биллингуемый или security-significant ресурс в проекте MWS
+# project-vxgxs2. Условие перехода фазы L5a в архитектурном документе
+# требует, чтобы владелец сначала подтвердил список ресурсов и лично
+# выполнил шаг с секретами и IAM-биндингами. Скрипт не продолжает работу без
+# явного человеческого подтверждения — см. раздел "Предохранитель" ниже.
 #
 # БЮДЖЕТ (§7.4, только для контекста — логика бюджета живёт не здесь, а в
 # шлюзе, уже реализованном в фазе L3b):
@@ -35,24 +65,15 @@
 #      чисел.
 #   3. Мир: казна treasuryResources.llmTokens = грант в токенах.
 #
-# ФАКТ, ОБНАРУЖЕННЫЙ ПРИ ПОДГОТОВКЕ ЭТОГО СКРИПТА (2026-09-04): более ранняя
-# попытка выполнить часть команд §7.2 для реального проекта project-vxgxs2
-# (под профилем xteam-pro, а не выделенным anu-live) провалилась на каждом
-# вызове — `vpc network create` и `vpc firewall-rule create` из-за
-# нечитаемого mws idempotency-key (сервис требует РЕАЛЬНЫЙ UUID, а не
-# произвольную строку вида "anu-live-network-v1"), `vpc firewall-rule create
-# .../https-from-lab` из-за приоритета вне допустимого диапазона
-# (сервис вернул: "priority has invalid value ... range [1000-64535]" — то
-# есть числа 100/105/110/65000 из текста архитектурного документа реальный
-# API не примет), а `compute vm create` / `compute disk create` / `vpc
-# external-address create` — из-за исчерпанной квоты проекта (vCPU,
-# суммарный размер дисков nbs-pl2, внешние адреса). Повторные `get`-проверки
-# каждого ресурса вернули 404 — то есть НИ ОДИН ресурс anu-live тогда не был
-# реально создан. Из этого учтено ниже: idempotency-key генерируется как
-# настоящий UUID (idem_key), приоритеты firewall смещены в допустимый
-# диапазон (см. комментарий в разделе VPC), а перед первым реальным запуском
-# нужно свериться с квотами проекта в консоли/поддержке MWS — это отдельно
-# отмечено в RUNBOOK.md.
+# ФАКТ, ОБНАРУЖЕННЫЙ ПРИ ПОДГОТОВКЕ ПЕРВОЙ ВЕРСИИ ЭТОГО СКРИПТА (2026-09-04,
+# из логов неудачной части попытки 01:39–01:54, до того как выяснилось, что
+# другая часть той же попытки реально успела создать ресурсы выше): реальный
+# API отклоняет idempotency-key, который не парсится как UUID (человекочит-
+# аемые слаги вида "anu-live-network-v1" не годятся), и требует приоритет
+# firewall-правила в диапазоне [1000-64535], а не произвольное 100/65000 из
+# текста документа. Учтено ниже: idempotency-key — настоящий UUIDv5,
+# приоритеты новых правил (если когда-либо понадобится создавать их с нуля)
+# смещены в допустимый диапазон.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -74,12 +95,13 @@ readonly IDEM_NAMESPACE="a26e9d3e-9f9a-4c9b-8f38-8a6a2e5b6a11"
 : "${OWNER_SSH_IP:?$(cat <<'EOF'
 Ошибка: переменная окружения OWNER_SSH_IP не задана.
 
-Правило firewall ssh-from-owner (§7.2) требует IP-адрес владельца в качестве
-источника. Задайте его перед запуском, например:
+Правило firewall ssh-from-lab (де-факто исполняющее роль ssh-from-owner из
+§7.2) должно включать IP-адрес владельца как дополнительный источник.
+Задайте его перед запуском, например:
 
   OWNER_SSH_IP=203.0.113.7 ./deploy/mws/provision.sh
 
-Скрипт остановлен до создания каких-либо ресурсов.
+Скрипт остановлен до создания/изменения каких-либо ресурсов.
 EOF
 )}"
 
@@ -90,19 +112,12 @@ section() { printf '\n=== %s ===\n' "$1"; }
 step()    { printf -- '--- %s\n' "$1"; }
 
 # Детерминированный UUIDv5 из строки-описания ресурса. Реальный MWS API
-# отклоняет idempotency-key, который не парсится как UUID (см. заголовок
-# файла) — человекочитаемые слаги здесь недопустимы.
+# отклоняет idempotency-key, который не парсится как UUID — человекочитаемые
+# слаги здесь недопустимы.
 idem_key() {
   local seed="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    python3 -c "import uuid,sys; print(uuid.uuid5(uuid.UUID(sys.argv[1]), sys.argv[2]))" \
-      "$IDEM_NAMESPACE" "$seed"
-  elif command -v uuidgen >/dev/null 2>&1; then
-    uuidgen --sha1 -n @url -N "$seed"
-  else
-    echo "Ошибка: не найден ни python3, ни uuidgen — нечем построить детерминированный idempotency-key." >&2
-    exit 1
-  fi
+  python3 -c "import uuid,sys; print(uuid.uuid5(uuid.UUID(sys.argv[1]), sys.argv[2]))" \
+    "$IDEM_NAMESPACE" "$seed"
 }
 
 # Печатает команду перед выполнением — чтобы при реальном запуске оператор
@@ -112,20 +127,37 @@ run() {
   "$@"
 }
 
-# Паттерн "--validate-only, затем реальный вызов" — только для ресурсов, у
-# которых флаг --validate-only реально существует И которые архитектурный
-# документ прямо просит проверять так: vpc network/subnet/firewall-rule.
-# ВНИМАНИЕ: документ просил включить сюда ещё и `compute vm create`, но
-# `mws compute vm create --help` (сверено 2026-09-04) такого флага не
-# показывает вовсе — раздел 5 ниже создаёт VM одним прямым вызовом и это
-# явно откомментировано на месте.
-create_validated() {
-  local desc="$1" seed="$2"
-  shift 2
-  step "${desc}: dry-run (--validate-only)"
-  run "$@" --validate-only --idempotency-key "$(idem_key "${seed}-validate")"
-  step "${desc}: создание"
-  run "$@" --idempotency-key "$(idem_key "${seed}")"
+# Есть ли уже ресурс? Использует то, что `mws <group> <resource> get <id>`
+# возвращает exit 0, если ресурс существует, и exit 1 (404) если нет —
+# проверено напрямую 2026-09-06 на всех типах ресурсов, использованных ниже.
+exists() {
+  "$@" >/dev/null 2>&1
+}
+
+# Обёртка "проверить — и только если нет, создать": печатает, что произошло,
+# в обоих случаях, чтобы лог запуска был читаем без сверки с консолью.
+ensure() {
+  local desc="$1"; shift
+  local i
+  # Вызывающий код передаёт get-команду и create-команду, разделённые
+  # литералом "--".
+  local args=("$@")
+  local sep_idx=-1
+  for i in "${!args[@]}"; do
+    if [[ "${args[$i]}" == "--" ]]; then sep_idx=$i; break; fi
+  done
+  if [[ $sep_idx -lt 0 ]]; then
+    echo "Ошибка программирования: ensure() без разделителя '--' между get и create." >&2
+    exit 1
+  fi
+  local get_full=("${args[@]:0:$sep_idx}")
+  local create_full=("${args[@]:$((sep_idx+1))}")
+  if exists "${get_full[@]}"; then
+    step "${desc}: уже существует — пропускаю создание"
+  else
+    step "${desc}: не найден — создаю"
+    run "${create_full[@]}"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -143,83 +175,94 @@ for arg in "$@"; do
   fi
 done
 
-section "Предохранитель: провижининг реальной инфраструктуры MWS"
+section "Предохранитель: провижининг/донастройка реальной инфраструктуры MWS"
 cat <<EOF
-Этот запуск создаст в проекте MWS ${MWS_PROJECT} (зона ${MWS_ZONE}) реальные,
-БИЛЛИНГУЕМЫЕ и/или security-significant ресурсы:
+Этот запуск проверит состояние проекта MWS ${MWS_PROJECT} (зона ${MWS_ZONE})
+и создаст только то, чего там ЕЩЁ НЕТ (см. факт-раздел в заголовке файла):
 
-  IAM:      сервисные аккаунты anu-live, anu-site-ask, anu-anchor;
-            API-ключ anu-live-inference, API-ключ ask-lab, HMAC-ключ anchors,
-            authorized key vm-anu-live-1.
+  IAM:      API-ключ anu-live-inference, API-ключ ask-lab, HMAC-ключ anchors,
+            authorized key vm-anu-live-1 (сервисные аккаунты anu-live /
+            anu-site-ask / anu-anchor уже существуют — не трогаются).
   Secret Manager: пустые секреты anu-live-provider-key, anu-live-gateway-token,
             anu-live-observer-token (без данных — данные создаёт владелец).
-  VPC:      сеть anu-live, подсеть anu-live-nodes, внешний адрес
-            anu-live-1-ip, правила firewall https-from-lab / acme-http /
-            ssh-from-owner / deny-all-ingress.
-  Compute:  диски anu-live-1-boot (50GB) и anu-live-evidence-01 (300GB,
-            nbs-pl2), виртуальная машина anu-live-1 (base-8-32).
-  Registry: реестр anu и репозиторий agent-native-universe-lab.
+  VPC:      внешний адрес anu-live-1-ip (сеть/подсеть/большинство правил
+            firewall уже существуют); правило ssh-from-lab будет ДОПОЛНЕНО
+            вашим IP, если его там ещё нет — существующий доступ с Lab
+            (185.233.3.14) не убирается.
+  Compute:  диск anu-live-evidence-01 (300GB, nbs-pl2). VM anu-live-1 УЖЕ
+            РАБОТАЕТ (base-4-8) — этот скрипт её не создаёт и не меняет;
+            подключение нового диска и внешнего адреса к ней — отдельный
+            ручной шаг, который скрипт только опишет в конце (раздел 8).
+  Registry: реестр anu и репозиторий agent-native-universe-lab уже
+            существуют — не трогаются.
 
-Условие перехода фазы L5a (docs/GENESIS_LIVE.md): владелец ПОДТВЕРДИЛ список
-ресурсов и лично выполняет последующий шаг с секретами и IAM-биндингами (его
-CLI не умеет — только консоль/REST). Прежде чем продолжать, проверьте в
-консоли/поддержке MWS квоты проекта: более ранняя попытка (см. заголовок
-файла) упёрлась в исчерпанные vCPU, суммарный размер дисков nbs-pl2 и
-external address — без запаса по квоте реальные вызовы ниже провалятся.
+Прежде чем продолжать, проверьте в консоли/поддержке MWS квоты проекта:
+VM anu-live-1 уже работает как base-4-8 именно из-за нехватки квоты на
+base-8-32 — новый диск на 300GB тоже посчитается в квоту дисков.
 
-Ни один из вызовов ниже не выполняется, пока вы явно не подтвердите запуск.
+Ни один из вызовов ниже не создаёт и не меняет ресурс, пока вы явно не
+подтвердите запуск.
 EOF
 
 if [[ "$ASSUME_YES" -eq 1 ]]; then
   echo "Флаг ${CONFIRM_FLAG} передан — пропускаю интерактивный вопрос."
 else
   if [[ ! -t 0 ]]; then
-    echo "Отказ: нет ни флага ${CONFIRM_FLAG}, ни интерактивного терминала для подтверждения. Ни один ресурс не создан." >&2
+    echo "Отказ: нет ни флага ${CONFIRM_FLAG}, ни интерактивного терминала для подтверждения. Ничего не создано и не изменено." >&2
     exit 1
   fi
-  read -r -p "Продолжить и создать перечисленные выше реальные ресурсы? [y/N] " REPLY
+  read -r -p "Продолжить и создать/дополнить перечисленное выше? [y/N] " REPLY
   case "$REPLY" in
     y|Y|yes|Yes|YES) ;;
     *)
-      echo "Остановлено оператором. Ни один ресурс не создан." >&2
+      echo "Остановлено оператором. Ничего не создано и не изменено." >&2
       exit 1
       ;;
   esac
 fi
 
-step "Текущий профиль mws (проверьте, что это ожидаемый субъект)"
-run mws profile get -f json || true
+step "Текущий активный профиль mws (проверьте, что это ожидаемый субъект)"
+run mws profile current -f json || true
 
 # ===========================================================================
-# 4. IAM — сервисные аккаунты и ключи (§7.2)
+# 4. IAM — сервисные аккаунты (проверка) и ключи (§7.2)
 # ===========================================================================
-section "IAM: сервисные аккаунты и ключи"
+section "IAM: сервисные аккаунты (проверка) и ключи (создание недостающих)"
 
-# `mws iam service-account create --help` не показывает флаг
-# --idempotency-key вовсе — не передаём его сюда (в отличие от api-key /
-# hmac-key / authorized-key create, где флаг есть и подтверждён).
-run mws iam service-account create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live" \
+ensure "SA anu-live" \
+  mws iam service-account get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live" -- \
+  mws iam service-account create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live" \
   --display-name anu-live
 
-run mws iam api-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/apiKeys/anu-live-inference" \
+ensure "API-ключ anu-live-inference" \
+  mws iam api-key get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/apiKeys/anu-live-inference" -- \
+  mws iam api-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/apiKeys/anu-live-inference" \
   --service-account "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live" \
   --expiration-time 2027-03-01T00:00:00Z --active \
   --idempotency-key "$(idem_key 'apikey-anu-live-inference')"
 
-run mws iam service-account create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask" \
+ensure "SA anu-site-ask" \
+  mws iam service-account get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask" -- \
+  mws iam service-account create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask" \
   --display-name anu-site-ask
 
 # Замена ключа сайта studylabpro.com (SA xteam-pro), который истекает
 # 2026-11-22 — см. KEYS.md.
-run mws iam api-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask/apiKeys/ask-lab" \
+ensure "API-ключ ask-lab" \
+  mws iam api-key get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask/apiKeys/ask-lab" -- \
+  mws iam api-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask/apiKeys/ask-lab" \
   --service-account "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask" \
   --expiration-time 2027-03-01T00:00:00Z --active \
   --idempotency-key "$(idem_key 'apikey-ask-lab')"
 
-run mws iam service-account create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anchor" \
+ensure "SA anu-anchor" \
+  mws iam service-account get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anchor" -- \
+  mws iam service-account create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anchor" \
   --display-name anu-anchor
 
-run mws iam hmac-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anchor/hmacKeys/anchors" \
+ensure "HMAC-ключ anchors" \
+  mws iam hmac-key get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anchor/hmacKeys/anchors" -- \
+  mws iam hmac-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anchor/hmacKeys/anchors" \
   --service-account "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anchor" \
   --expiration-time 2027-03-01T00:00:00Z \
   --idempotency-key "$(idem_key 'hmackey-anchors')"
@@ -230,7 +273,9 @@ run mws iam hmac-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-anc
 # ОДИН РАЗ при создании. Скрипт эту приватную часть никуда не пишет и не
 # логирует — она уходит только в stdout самой команды mws на усмотрение
 # оператора.
-run mws iam authorized-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/authorizedKeys/vm-anu-live-1" \
+ensure "Authorized key vm-anu-live-1" \
+  mws iam authorized-key get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/authorizedKeys/vm-anu-live-1" -- \
+  mws iam authorized-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/authorizedKeys/vm-anu-live-1" \
   --service-account "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live" \
   --expiration-time 2027-03-01T00:00:00Z \
   --idempotency-key "$(idem_key 'authorizedkey-vm-anu-live-1')"
@@ -244,9 +289,8 @@ IAM role bindings в CLI НЕДОСТУПНЫ (mws iam role = get/list). Наз�
                compute disk-backup на диск anu-live-evidence-01
   anu-anchor → запись в S3 anu-live-anchors (и только туда)
 
-После назначения биндингов (и после того, как соответствующие ресурсы
-из разделов ниже реально существуют) проверьте их вручную — ни одна из
-следующих команд не выполняется этим скриптом:
+После назначения биндингов проверьте их вручную — ни одна из следующих
+команд не выполняется этим скриптом:
 
   mws --impersonate iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live \\
       secretmanager secret-version get-data --name anu-live-provider-key -f json
@@ -263,153 +307,202 @@ EOF
 # ===========================================================================
 # 5. Secret Manager — пустые контейнеры секретов (§7.2, §7.3)
 # ===========================================================================
-section "Secret Manager: пустые секреты (данные создаёт владелец вручную)"
+section "Secret Manager: пустые секреты (создание недостающих; данные — вручную владельцем)"
 
-run mws secretmanager secret create "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-provider-key" \
+ensure "Секрет anu-live-provider-key" \
+  mws secretmanager secret get "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-provider-key" -- \
+  mws secretmanager secret create "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-provider-key" \
   --active --description 'MWS GPT key for Genesis-Live gateway' \
   --idempotency-key "$(idem_key 'secret-anu-live-provider-key')"
 
-run mws secretmanager secret create "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-gateway-token" \
+ensure "Секрет anu-live-gateway-token" \
+  mws secretmanager secret get "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-gateway-token" -- \
+  mws secretmanager secret create "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-gateway-token" \
   --active \
   --idempotency-key "$(idem_key 'secret-anu-live-gateway-token')"
 
-run mws secretmanager secret create "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-observer-token" \
+ensure "Секрет anu-live-observer-token" \
+  mws secretmanager secret get "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-observer-token" -- \
+  mws secretmanager secret create "secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-observer-token" \
   --active \
   --idempotency-key "$(idem_key 'secret-anu-live-observer-token')"
 
 cat <<'EOF'
 
-Секреты созданы как ПУСТЫЕ контейнеры. Версии с реальными данными создаёт
+Секреты — только ПУСТЫЕ контейнеры. Версии с реальными данными создаёт
 только владелец вручную (см. KEYS.md и §7.3) — этот скрипт не содержит и не
 может содержать значения секретов.
 EOF
 
 # ===========================================================================
-# 6. VPC — сеть, подсеть, внешний адрес, firewall (§7.2)
+# 6. VPC — сеть/подсеть (проверка), внешний адрес (создание), firewall (§7.2)
 # ===========================================================================
-section "VPC: сеть, подсеть, внешний адрес, firewall"
+section "VPC: сеть/подсеть (проверка), внешний адрес (создание), firewall (проверка + донастройка SSH)"
 
-create_validated "Сеть anu-live" "network-anu-live" \
-  mws vpc network create "vpc/projects/${MWS_PROJECT}/networks/anu-live" \
-  --internet-access
+ensure "Сеть anu-live" \
+  mws vpc network get "vpc/projects/${MWS_PROJECT}/networks/anu-live" -- \
+  mws vpc network create "vpc/projects/${MWS_PROJECT}/networks/anu-live" --internet-access \
+  --idempotency-key "$(idem_key 'network-anu-live')"
 
-create_validated "Подсеть anu-live-nodes" "subnet-anu-live-nodes" \
+ensure "Подсеть anu-live-nodes" \
+  mws vpc subnet get "vpc/projects/${MWS_PROJECT}/networks/anu-live/subnets/anu-live-nodes" -- \
   mws vpc subnet create "vpc/projects/${MWS_PROJECT}/networks/anu-live/subnets/anu-live-nodes" \
-  --network anu-live --cidr 10.77.0.0/24
+  --network anu-live --cidr 10.77.0.0/24 \
+  --idempotency-key "$(idem_key 'subnet-anu-live-nodes')"
 
-# --validate-only у external-address существует, но архитектурный документ
-# не просил проверять его так (список --validate-only ограничен
-# network/subnet/firewall-rule/vm) — создаём одним вызовом.
-run mws vpc external-address create "vpc/projects/${MWS_PROJECT}/externalAddresses/anu-live-1-ip" \
+ensure "Внешний адрес anu-live-1-ip" \
+  mws vpc external-address get "vpc/projects/${MWS_PROJECT}/externalAddresses/anu-live-1-ip" -- \
+  mws vpc external-address create "vpc/projects/${MWS_PROJECT}/externalAddresses/anu-live-1-ip" \
   --idempotency-key "$(idem_key 'external-address-anu-live-1-ip')"
 
-# ВНИМАНИЕ — приоритеты ниже НЕ совпадают с числами в тексте архитектурного
-# документа (100/105/110/65000). Реальный `mws vpc firewall-rule create`
-# отклонил приоритет 100 при попытке 2026-09-04: "priority has invalid
-# value ... range [1000-64535]". Порядок точно тот же, шкала сдвинута в
-# допустимый диапазон:
-#   https-from-lab     100   -> 1000
-#   acme-http          105   -> 1005
-#   ssh-from-owner     110   -> 1010
-#   deny-all-ingress 65000   -> 64535 (максимум допустимого диапазона)
-create_validated "Firewall https-from-lab" "firewall-https-from-lab" \
-  mws vpc firewall-rule create "vpc/projects/${MWS_PROJECT}/networks/anu-live/firewallRules/https-from-lab" \
-  --network anu-live --direction INGRESS --action ALLOW --priority 1000 \
-  --proto-ports tcp:443 \
-  --source-spec-cidrs "${LAB_IP}/32" \
-  --destination-spec-cidrs 10.77.0.10/32 --active
+# https-from-lab / acme-http / deny-all-ingress уже существуют в реальном
+# аккаунте с приоритетами 1000/1050/64000 (не 100/105/65000 из текста
+# документа) — функционально идентичны требуемому: source/dest/proto/action
+# совпадают, приоритеты просто сдвинуты в допустимый API-диапазон
+# [1000-64535]. Ничего не создаём заново — только фиксируем это фактом ниже.
+for rule in https-from-lab acme-http deny-all-ingress; do
+  if exists mws vpc firewall-rule get "vpc/projects/${MWS_PROJECT}/networks/anu-live/firewallRules/${rule}"; then
+    step "Firewall ${rule}: уже существует, значения сверены при подготовке скрипта — пропускаю"
+  else
+    echo "ВНИМАНИЕ: правило ${rule} ожидалось существующим (по факту от 2026-09-06), но get вернул 404." >&2
+    echo "Проверьте вручную — этот скрипт не пытается воссоздать его автоматически, чтобы не разойтись с ожиданиями." >&2
+    exit 1
+  fi
+done
 
-# Только ACME (caddy :80 без редиректов и без проксирования какого-либо
-# другого пути — см. caddy/Caddyfile).
-create_validated "Firewall acme-http" "firewall-acme-http" \
-  mws vpc firewall-rule create "vpc/projects/${MWS_PROJECT}/networks/anu-live/firewallRules/acme-http" \
-  --network anu-live --direction INGRESS --action ALLOW --priority 1005 \
-  --proto-ports tcp:80 \
-  --source-spec-cidrs 0.0.0.0/0 \
-  --destination-spec-cidrs 10.77.0.10/32 --active
-
-create_validated "Firewall ssh-from-owner" "firewall-ssh-from-owner" \
-  mws vpc firewall-rule create "vpc/projects/${MWS_PROJECT}/networks/anu-live/firewallRules/ssh-from-owner" \
-  --network anu-live --direction INGRESS --action ALLOW --priority 1010 \
-  --proto-ports tcp:22 \
-  --source-spec-cidrs "${OWNER_SSH_IP}/32" \
-  --source-spec-cidrs "${LAB_IP}/32" \
-  --destination-spec-cidrs 10.77.0.10/32 --active
-
-create_validated "Firewall deny-all-ingress" "firewall-deny-all-ingress" \
-  mws vpc firewall-rule create "vpc/projects/${MWS_PROJECT}/networks/anu-live/firewallRules/deny-all-ingress" \
-  --network anu-live --direction INGRESS --action DENY --priority 64535 \
-  --source-spec-cidrs 0.0.0.0/0 \
-  --destination-spec-cidrs 10.77.0.0/24 --active
+# ssh-from-lab существует, но по факту пускает только Lab (185.233.3.14) —
+# роль "ssh-from-owner" из §7.2 в нём не выполнена. Донастраиваем идемпотентно:
+# читаем текущий список CIDR только чтобы РЕШИТЬ, нужно ли что-то менять;
+# сама update-команда всегда передаёт оба известных адреса явно (LAB_IP +
+# OWNER_SSH_IP), а не реконструирует список динамически из текста — так
+# нельзя случайно потерять или исказить CIDR при разборе вывода.
+# `firewall-rule update --source-spec-cidrs` заменяет список целиком, как и
+# `create`, поэтому оба адреса передаются вместе, а не только новый.
+step "Firewall ssh-from-lab: проверяю, включён ли IP владельца"
+OWNER_CIDR="${OWNER_SSH_IP}/32"
+CURRENT_SSH_CIDRS_JSON="$(mws vpc firewall-rule get "vpc/projects/${MWS_PROJECT}/networks/anu-live/firewallRules/ssh-from-lab" -f json)"
+if echo "$CURRENT_SSH_CIDRS_JSON" | python3 -c "import json,sys; cidrs=json.load(sys.stdin)['spec']['source']['spec']['cidrs']; sys.exit(0 if '${OWNER_CIDR}' in cidrs else 1)"; then
+  step "Firewall ssh-from-lab: ${OWNER_CIDR} уже разрешён — пропускаю"
+else
+  step "Firewall ssh-from-lab: добавляю ${OWNER_CIDR} (сохраняя существующий ${LAB_IP}/32)"
+  run mws vpc firewall-rule update "vpc/projects/${MWS_PROJECT}/networks/anu-live/firewallRules/ssh-from-lab" \
+    --source-spec-cidrs "${LAB_IP}/32" \
+    --source-spec-cidrs "${OWNER_CIDR}" \
+    --idempotency-key "$(idem_key 'firewall-ssh-from-lab-add-owner')"
+fi
 
 echo "tcp/7400 intra-subnet — только со вторым узлом (L8/P9, не сейчас) — правило намеренно не создаётся."
 
 # ===========================================================================
-# 7. Диски и виртуальная машина (§7.2)
+# 7. Диски (§7.2) — VM anu-live-1 уже существует, не создаётся и не меняется здесь
 # ===========================================================================
-section "Compute: диски и виртуальная машина anu-live-1"
+section "Compute: диски"
 
-run mws compute disk create "compute/projects/${MWS_PROJECT}/disks/anu-live-1-boot" \
+ensure "Диск anu-live-1-boot" \
+  mws compute disk get "compute/projects/${MWS_PROJECT}/disks/anu-live-1-boot" -- \
+  mws compute disk create "compute/projects/${MWS_PROJECT}/disks/anu-live-1-boot" \
   --zone "${MWS_ZONE}" --size 50GB --os-type LINUX \
   --disk-type compute/diskTypes/nbs-pl2 \
   --source-image compute/projects/mws-ubuntu/images/mws-ubuntu-2404-lts-v20260324 \
   --idempotency-key "$(idem_key 'disk-anu-live-1-boot')"
 
-run mws compute disk create "compute/projects/${MWS_PROJECT}/disks/anu-live-evidence-01" \
+ensure "Диск anu-live-evidence-01 (300GB)" \
+  mws compute disk get "compute/projects/${MWS_PROJECT}/disks/anu-live-evidence-01" -- \
+  mws compute disk create "compute/projects/${MWS_PROJECT}/disks/anu-live-evidence-01" \
   --zone "${MWS_ZONE}" --size 300GB --disk-type compute/diskTypes/nbs-pl2 --iops 3000 \
   --idempotency-key "$(idem_key 'disk-anu-live-evidence-01')"
 
-# ВНИМАНИЕ: архитектурный документ просил обернуть эту команду в
-# --validate-only так же, как сеть/подсеть/firewall выше. `mws compute vm
-# create --help` (сверено 2026-09-04; реальное имя подкоманды —
-# `compute virtual-machine create`, `vm` работает как алиас) такого флага
-# не показывает вовсе — вызов с --validate-only здесь завершился бы ошибкой
-# "unknown flag". Создаём одним прямым вызовом с --idempotency-key (флаг
-# этот у VM есть и подтверждён).
-run mws compute vm create "compute/projects/${MWS_PROJECT}/virtualMachines/anu-live-1" \
-  --zone "${MWS_ZONE}" --vm-type compute/vmTypes/base-8-32 \
-  --service-account "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live" \
-  --os-hostname anu-live-1 \
-  --os-metadata-attributes @deploy/mws/cloud-init.yaml \
-  --storage-disks 'boot: true, deviceName: boot, disk: {ref: "compute/projects/'"${MWS_PROJECT}"'/disks/anu-live-1-boot"}' \
-  --storage-disks 'boot: false, deviceName: evidence, disk: {ref: "compute/projects/'"${MWS_PROJECT}"'/disks/anu-live-evidence-01"}' \
-  --network-interfaces 'primary: true, name: eth0, addresses: [{address: {spec: {subnet: "vpc/projects/'"${MWS_PROJECT}"'/networks/anu-live/subnets/anu-live-nodes", ipAddress: 10.77.0.10}}, oneToOneNat: {external: {address: {ref: "vpc/projects/'"${MWS_PROJECT}"'/externalAddresses/anu-live-1-ip"}}}}]' \
-  --idempotency-key "$(idem_key 'vm-anu-live-1')"
+if exists mws compute vm get "compute/projects/${MWS_PROJECT}/virtualMachines/anu-live-1"; then
+  step "VM anu-live-1: уже существует и работает (base-4-8, интерим до квоты base-8-32) — не трогаю"
+else
+  echo "ВНИМАНИЕ: VM anu-live-1 ожидалась существующей (по факту от 2026-09-06), но get вернул 404." >&2
+  echo "Это меняет весь план — она либо была удалена, либо это другой проект/профиль. Остановка для ручной проверки." >&2
+  exit 1
+fi
 
+# ===========================================================================
+# 8. РУЧНОЙ ШАГ (НЕ выполняется этим скриптом): подключить evidence-диск и
+#    внешний адрес к уже работающей VM anu-live-1
+# ===========================================================================
+section "РУЧНОЙ ШАГ: подключение evidence-диска и внешнего адреса к anu-live-1"
 cat <<'EOF'
+`mws compute vm update` принимает --storage-disks и --network-interfaces как
+повторяемые флаги — по тексту --help это похоже на ПОЛНУЮ ЗАМЕНУ списка (тот
+же паттерн, что и в `create`), а не слияние с уже существующими значениями.
+Собрать команду неправильно на РАБОТАЮЩЕЙ VM значит рискнуть отключить её
+текущий boot-диск или сетевой интерфейс. Поэтому:
 
-НЕПРОВЕРЕННЫЙ ФАКТ (см. docs/GENESIS_LIVE.md §8 "Operational facts to record
-at first launch"): формат значения --os-metadata-attributes для передачи
-cloud-init.yaml (ожидается ли ключ user-data внутри YAML-структуры или файл
-интерпретируется как cloud-init напрямую) — сверить при первом реальном
-запуске и вписать сюда/в docs/GENESIS_LIVE.md результат.
+1. Прямо перед выполнением получите СВЕЖЕЕ состояние VM (не полагайтесь на
+   значения из более раннего запуска этого скрипта или из документации):
+
+     mws compute vm get compute/projects/project-vxgxs2/virtualMachines/anu-live-1 -f json
+
+2. Соберите --storage-disks дважды: с текущей boot-записью БЕЗ ИЗМЕНЕНИЙ
+   (скопировать из шага 1, поле status.storage.disks) и новой evidence-
+   записью:
+
+     --storage-disks 'boot: true, deviceName: boot, disk: {ref: "compute/projects/project-vxgxs2/disks/anu-live-1-boot"}' \
+     --storage-disks 'boot: false, deviceName: evidence, disk: {ref: "compute/projects/project-vxgxs2/disks/anu-live-evidence-01"}'
+
+3. Соберите --network-interfaces с текущим адресом БЕЗ ИЗМЕНЕНИЙ (поле
+   status.network.networkInterfaces[0].addresses[0].ref из шага 1) плюс
+   oneToOneNat на новый внешний адрес:
+
+     --network-interfaces 'primary: true, name: eth0, addresses: [{address: {ref: "vpc/projects/project-vxgxs2/networks/anu-live/addresses/anu-live-1-internal"}, oneToOneNat: {external: {address: {ref: "vpc/projects/project-vxgxs2/externalAddresses/anu-live-1-ip"}}}}]'
+
+4. Рекомендация: сделать это при кратком плановом простое, а не «на живую» —
+   гарантии hot-attach в документации CLI не подтверждены:
+
+     mws compute vm update compute/projects/project-vxgxs2/virtualMachines/anu-live-1 --hardware-power OFF --wait-timeout 3m
+     mws compute vm update compute/projects/project-vxgxs2/virtualMachines/anu-live-1 \
+       --storage-disks '...' --storage-disks '...' \
+       --network-interfaces '...' \
+       --idempotency-key "<новый UUID>"
+     mws compute vm update compute/projects/project-vxgxs2/virtualMachines/anu-live-1 --hardware-power ON
+
+5. После включения — примонтировать evidence-диск внутри VM (см.
+   cloud-init.yaml, тот же блок форматирования/монтирования в
+   /var/lib/anu-live, который применяется при первом создании — здесь его
+   нужно выполнить вручную по SSH, cloud-init второй раз не запустится).
+
+Зафиксируйте фактический путь устройства (lsblk) и итоговый результат в
+docs/GENESIS_LIVE.md §8, как и для остальных "Operational facts to record at
+first launch".
 EOF
 
 # ===========================================================================
-# 8. Реестр образов (§7.2)
+# 9. Registry (§7.2) — уже существует, проверка вместо создания
 # ===========================================================================
-section "Registry: реестр anu и репозиторий agent-native-universe-lab"
+section "Registry: проверка anu / agent-native-universe-lab"
 
-# `mws registry registry create --help` и `mws registry repository create
-# --help` не показывают ни --validate-only, ни --idempotency-key — прямые
-# вызовы без этих флагов, как и предполагает архитектурный документ.
-run mws registry registry create "registry/projects/${MWS_PROJECT}/registries/anu" \
-  --ip-filter-mode WHITELIST --ip-filter-operations PUSH \
-  --ip-filter-source-ip-cidr-ranges "${LAB_IP}/32"
+if exists mws registry registry get "registry/projects/${MWS_PROJECT}/registries/anu"; then
+  step "Реестр anu: уже существует — пропускаю"
+else
+  step "Реестр anu: не найден — создаю"
+  run mws registry registry create "registry/projects/${MWS_PROJECT}/registries/anu" \
+    --ip-filter-mode WHITELIST --ip-filter-operations PUSH \
+    --ip-filter-source-ip-cidr-ranges "${LAB_IP}/32"
+fi
 
-run mws registry repository create "registry/projects/${MWS_PROJECT}/registries/anu/repositories/agent-native-universe-lab" \
-  --registry anu
+if exists mws registry repository get "registry/projects/${MWS_PROJECT}/registries/anu/repositories/agent-native-universe-lab"; then
+  step "Репозиторий agent-native-universe-lab: уже существует — пропускаю"
+else
+  step "Репозиторий agent-native-universe-lab: не найден — создаю"
+  run mws registry repository create "registry/projects/${MWS_PROJECT}/registries/anu/repositories/agent-native-universe-lab" \
+    --registry anu
+fi
 
 run mws registry configure-docker
 
-echo "Реестр и репозиторий созданы. Сборка и push образа — scripts/live/build-push.sh (запускается отдельно, не отсюда)."
+echo "Сборка и push образа — scripts/live/build-push.sh (запускается отдельно, не отсюда)."
 
 # ===========================================================================
-# 9. Напоминание: DNS (ручной шаг, выполняется отдельно от этого скрипта)
+# 10. Напоминание: DNS (ручной шаг, выполняется отдельно от этого скрипта)
 # ===========================================================================
 section "DNS (напоминание — выполняется отдельно, не этим скриптом)"
 cat <<'EOF'
-Когда внешний адрес anu-live-1-ip получит значение, добавьте A-запись:
+Когда внешний адрес anu-live-1-ip получит значение (см. раздел 8 выше),
+добавьте A-запись:
 
   xt-plesk dns-add studylabpro.com A live.anu <external-ip>
 
@@ -419,18 +512,19 @@ cat <<'EOF'
 EOF
 
 # ===========================================================================
-# 10. Напоминание: резервное копирование (настраивается отдельно)
+# 11. Напоминание: резервное копирование (настраивается отдельно, на VM)
 # ===========================================================================
 section "Backup (напоминание — настраивается через deploy/mws/backup.timer на VM)"
 cat <<'EOF'
 Ежедневный disk-backup (cron 0 3 * * *, хранить 14 последних копий) настроен
 не здесь, а systemd-таймером на самой VM — см. deploy/mws/backup.timer,
 deploy/mws/backup.service и deploy/mws/backup.sh. Этот скрипт таймер не
-устанавливает (он живёт на VM, которая ещё не существует до раздела 7 выше).
+устанавливает и не включает (systemctl enable --now backup.timer — отдельный
+шаг на VM, cloud-init.yaml его тоже не делает автоматически).
 EOF
 
 # ===========================================================================
-# 11. Напоминание: аварийная остановка мышления
+# 12. Напоминание: аварийная остановка мышления
 # ===========================================================================
 section "Аварийная остановка (напоминание — НЕ выполняется автоматически)"
 cat <<EOF
@@ -446,4 +540,5 @@ cat <<EOF
 EOF
 
 section "Готово"
-echo "Провижининг из §7.2 завершён. Дальнейшие шаги (роли, секреты, DNS, S3, образ) — см. RUNBOOK.md."
+echo "Провижининг/донастройка из §7.2 завершены там, где это безопасно автоматизировать."
+echo "Оставшееся: role bindings, значения секретов, подключение диска+адреса к VM (раздел 8), DNS, S3, образ — см. RUNBOOK.md."
