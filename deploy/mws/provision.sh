@@ -273,10 +273,15 @@ ensure "HMAC-ключ anchors" \
 # ОДИН РАЗ при создании. Скрипт эту приватную часть никуда не пишет и не
 # логирует — она уходит только в stdout самой команды mws на усмотрение
 # оператора.
+# `--key-algorithm` не заполняется по умолчанию — реальный API 2026-09-06
+# отклонил вызов без него (`keyAlgorithm has invalid value ... not in list
+# [ES256]`), хотя в --help это выглядело необязательным. ES256 — то же
+# значение, что уже предполагал заголовок этого файла и cloud-init.yaml.
 ensure "Authorized key vm-anu-live-1" \
   mws iam authorized-key get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/authorizedKeys/vm-anu-live-1" -- \
   mws iam authorized-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/authorizedKeys/vm-anu-live-1" \
   --service-account "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live" \
+  --key-algorithm ES256 \
   --expiration-time 2027-03-01T00:00:00Z \
   --idempotency-key "$(idem_key 'authorizedkey-vm-anu-live-1')"
 
