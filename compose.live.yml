@@ -351,6 +351,20 @@ services:
     depends_on:
       lab-observer-live:
         condition: service_healthy
+    environment:
+      # Caddyfile монтируется как есть и подставляет их сам синтаксисом
+      # {$VAR}; compose внутрь монтируемых файлов не заглядывает. Без
+      # значения профиль edge не поднимется — это намеренно: пустой домен
+      # дал бы Caddy сертификат неизвестно на что, пустой адрес — матчер
+      # remote_ip, не совпадающий ни с чем.
+      # Не `:?`: compose интерполирует переменные ВСЕХ сервисов, включая
+      # выключенные профилем, поэтому обязательное значение здесь ломало бы
+      # обычный запуск без edge. Дефолты подобраны так, чтобы профиль edge
+      # при незаполненном target.env падал громко и самообъясняюще: зона
+      # .invalid (RFC 2606) не резолвится никогда, а имя переменной видно
+      # прямо в ошибке Caddy.
+      ANU_LIVE_DOMAIN: "${ANU_LIVE_DOMAIN:-ANU-LIVE-DOMAIN-not-set.invalid}"
+      ANU_LIVE_LAB_IP: "${ANU_LIVE_LAB_IP:-0.0.0.0}"
     volumes:
       - ${ANU_LIVE_CADDYFILE:-/opt/anu-live/Caddyfile}:/etc/caddy/Caddyfile:ro
       - anu-live-caddy-data:/data

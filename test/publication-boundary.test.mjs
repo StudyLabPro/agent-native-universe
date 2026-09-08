@@ -106,6 +106,66 @@ test("no tracked file publishes the cloud project identifier", () => {
   );
 });
 
+/**
+ * Third-party service endpoints a deployment file may legitimately name: they
+ * are somebody else's public infrastructure, not ours. Anything else with a
+ * dot in it, inside the deployment surface, is our own naming and belongs in
+ * deploy/mws/target.env.
+ */
+const THIRD_PARTY_HOSTS = /(^|\.)(npmjs\.org|docker\.com|shields\.io|w3\.org|openai\.com|anthropic\.com|mwsapis\.ru|letsencrypt\.org|github\.com|ubuntu\.com|debian\.org|python\.org|nodejs\.org|example\.com|example\.org)$/;
+
+/** `containerd.io` is an apt package name that happens to look like a host. */
+const NOT_A_HOST = /^containerd\.io$/;
+
+/**
+ * The deployment surface — files that describe THIS deployment. Files outside
+ * it (the lab docs, .env.example, compose.lab.yml) carry names the owner
+ * published long ago on master; this boundary is about not adding new ones,
+ * not about relitigating that decision.
+ */
+function isDeploymentSurface(path) {
+  return path.startsWith("deploy/") || path.startsWith("scripts/live/") || path === "compose.live.yml";
+}
+
+/**
+ * Only real registry zones count. Matching any dot-separated token would flag
+ * file names (`compose.live.yml`) and label keys (`com.docker.compose.project`),
+ * which say nothing about anyone's infrastructure.
+ */
+const HOSTNAME = /\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\.(?:com|ru|pro|online|org|io|dev|net|ai|app|cloud|tech|info|me|xyz)\b/g;
+
+function foreignHostnames(text) {
+  const found = [];
+  for (const match of text.matchAll(HOSTNAME)) {
+    const host = match[0];
+    if (THIRD_PARTY_HOSTS.test(host) || NOT_A_HOST.test(host)) continue;
+    found.push(host);
+  }
+  return found;
+}
+
+test("no deployment file publishes a hostname of our own", () => {
+  const offenders = [];
+  for (const path of trackedFiles()) {
+    if (ALLOWED_PATHS.has(path)) continue;
+    if (!isDeploymentSurface(path)) continue;
+    if (!SCANNED_EXTENSIONS.has(extname(path))) continue;
+    let text;
+    try {
+      text = readFileSync(resolve(repositoryRoot, path), "utf8");
+    } catch {
+      continue;
+    }
+    const hits = foreignHostnames(text);
+    if (hits.length > 0) offenders.push(`${path}: ${[...new Set(hits)].join(", ")}`);
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "hostnames of our own infrastructure come from deploy/mws/target.env, not from tracked files",
+  );
+});
+
 test("the deployment artefacts reference only the untracked target file for that context", () => {
   const runbook = readFileSync(resolve(repositoryRoot, "deploy/mws/DEPLOY_LIVE.md"), "utf8");
   assert.ok(runbook.includes("deploy/mws/target.env"), "the runbook must name the local target file");
