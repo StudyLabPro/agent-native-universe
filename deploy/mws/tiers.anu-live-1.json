@@ -1,0 +1,23 @@
+{
+  "fast": {
+    "model": "gpt-oss-120b",
+    "maxTokens": 1024,
+    "timeoutMs": 60000,
+    "concurrency": 4,
+    "pricePpm": 1000000
+  },
+  "standard": {
+    "model": "qwen3-6-35b-a3b",
+    "maxTokens": 2048,
+    "timeoutMs": 120000,
+    "concurrency": 2,
+    "pricePpm": 3000000
+  },
+  "deliberate": {
+    "model": "kimi-k2-6",
+    "maxTokens": 4096,
+    "timeoutMs": 240000,
+    "concurrency": 1,
+    "pricePpm": 8000000
+  }
+}

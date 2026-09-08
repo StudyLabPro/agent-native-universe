@@ -1,0 +1,59 @@
+[Unit]
+Description=Genesis-Live: раннер, LLM-шлюз и Observer на anu-live-1 (фаза L5b)
+Documentation=file:///opt/anu-live/DEPLOY_LIVE.md
+# Без секретов в tmpfs стек стартовать не должен вообще: Requires, а не
+# Wants — неудача чтения секретов обязана остановить запуск, а не дать
+# контейнерам подняться с пустыми файлами.
+Requires=anu-secrets.service docker.service
+After=anu-secrets.service docker.service network-online.target
+Wants=network-online.target
+# Перезапуск самого dockerd оставляет стек в неопределённом состоянии
+# (контейнеры поднимет политика рестарта, но `compose up` с текущим .env
+# не выполнялся). PartOf заставляет юнит перезапуститься вместе с docker,
+# то есть заново пройти все предохранители ниже.
+PartOf=docker.service
+
+[Service]
+# Контейнеры сами держат restart: unless-stopped, поэтому юнит не обязан
+# висеть в foreground; его роль — порядок запуска (секреты -> docker ->
+# стек), единая точка остановки и проверки перед подъёмом.
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/anu-live
+# EnvironmentFile намеренно НЕ используется: docker compose сам читает
+# /opt/anu-live/.env как файл окружения проекта. Второй читатель того же
+# файла означал бы два разных парсера одной истины и лишний класс отказов.
+
+# Предохранитель 0: файл окружения на месте (без него ANU_LIVE_IMAGE не
+# разрешится и compose откажет — но отказать лучше здесь и внятно).
+ExecStartPre=/usr/bin/test -f /opt/anu-live/.env
+ExecStartPre=/usr/bin/test -f /opt/anu-live/tiers.json
+
+# Предохранитель 1: три секрета обязаны существовать и быть ОБЫЧНЫМИ
+# файлами. Если файла нет, docker создаст на его месте каталог, и
+# контейнер поднимется с нечитаемым секретом — отказ будет невнятным и
+# поздним. Здесь он ранний и внятный.
+ExecStartPre=/usr/bin/test -f /run/anu/secrets/anu-live-provider-key
+ExecStartPre=/usr/bin/test -f /run/anu/secrets/anu-live-gateway-token
+ExecStartPre=/usr/bin/test -f /run/anu/secrets/anu-live-observer-token
+# Предохранитель 2: дерево улик и файлы записанных входов на месте.
+ExecStartPre=/usr/bin/test -d /var/lib/anu-live/evidence
+ExecStartPre=/usr/bin/test -f /var/lib/anu-live/inbox/tasks.jsonl
+ExecStartPre=/usr/bin/test -f /var/lib/anu-live/inbox/physics.jsonl
+# Предохранитель 3: compose-файл валиден и все переменные разрешились.
+ExecStartPre=/usr/bin/docker compose -f /opt/anu-live/compose.live.yml config -q
+
+ExecStart=/usr/bin/docker compose -f /opt/anu-live/compose.live.yml up -d --remove-orphans
+
+# stop, а не down: сети и тома остаются, а контейнеры получают SIGTERM и
+# штатную паузу. Раннер обязан успеть доиграть текущий тик (в худшем
+# случае — таймаут яруса deliberate) и записать чекпойнт, поэтому таймаут
+# остановки больше, чем stop_grace_period раннера (600s).
+ExecStop=/usr/bin/docker compose -f /opt/anu-live/compose.live.yml stop -t 600
+ExecReload=/usr/bin/docker compose -f /opt/anu-live/compose.live.yml up -d --remove-orphans
+
+TimeoutStartSec=900
+TimeoutStopSec=720
+
+[Install]
+WantedBy=multi-user.target

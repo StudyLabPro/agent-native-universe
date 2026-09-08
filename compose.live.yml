@@ -1,0 +1,359 @@
+# compose.live.yml — боевой стек Genesis-Live на одной машине (фаза L5b).
+#
+# Целевой хост: VM `anu-live-1` в MWS (project-vxgxs2) — base-4-8:
+# 4 vCPU, 8 GB RAM, ОДИН boot-диск 50 GB. Отдельного evidence-диска НЕТ
+# (квота nbs-pl2 исчерпана), поэтому улики лежат на boot-диске в
+# /var/lib/anu-live — см. deploy/mws/DEPLOY_LIVE.md, раздел «Диск».
+#
+# Три процесса, три роли, одна машина:
+#   lab-runner-live      — `anu lab live`: единственный писатель улик.
+#                          Сеть `llm-control` (internal: true) — маршрута
+#                          наружу нет вообще, ключа провайдера нет.
+#   lab-llm-gateway-live — `anu lab gateway`: единственный процесс с ключом
+#                          провайдера и выходом в gpt.mwsapis.ru.
+#   lab-observer-live    — `anu lab serve` над /data:ro: только чтение,
+#                          Bearer, публикуется на 127.0.0.1.
+#
+# ОТСТУПЛЕНИЕ ОТ ДИЗАЙНА (принято осознанно, фиксируется здесь и в
+# DEPLOY_LIVE.md §2, отступление О-1): дизайн разносит шлюз когниции и ядро улик по разным
+# хостам, чтобы ключ провайдера физически не лежал на машине с уликами.
+# Второго хоста нет — квота vCPU/дисков не позволяет его создать. Значит
+# ключ провайдера и улики находятся на одной машине: компрометация
+# `anu-live-1` даёт и то, и другое. Ограничения, которые остаются в силе:
+# ключ читается только контейнером шлюза из tmpfs, раннер физически не
+# имеет маршрута наружу, а шлюз не имеет доступа к каталогу улик.
+# Отступление снимается созданием `anu-cog-fast-1` — после увеличения квот.
+#
+# Секреты — ТОЛЬКО file-secrets из tmpfs /run/anu/secrets (их пишет
+# anu-secrets.service). Ни один секрет никогда не передаётся через
+# environment: значение из Config.Env видно в `docker inspect`, в API
+# демона и в дампе метаданных контейнера.
+name: anu-live
+
+x-live-runtime: &live-runtime
+  # Тег обязан быть пиннутым (live-<short-sha>) и задаётся только в .env.
+  # Значения по умолчанию намеренно нет: забытый .env должен падать сразу
+  # и громко, а не поднимать вселенную на неизвестно каком коде.
+  image: "${ANU_LIVE_IMAGE:?ANU_LIVE_IMAGE обязателен - пиннутый тег образа движка}"
+  init: true
+  user: "1000:1000"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  pids_limit: 256
+  # Логи контейнеров лежат на том же 50-гигабайтном диске, что и улики,
+  # поэтому они ограничены жёстко: 3 x 10 MB на сервис.
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  # --------------------------------------------------------------------
+  # Раннер: единственный писатель. Ни ключа провайдера, ни маршрута наружу.
+  # --------------------------------------------------------------------
+  lab-runner-live:
+    <<: *live-runtime
+    # Известное и принятое: после перезагрузки хоста контейнеры поднимает
+    # политика рестарта Docker, а она depends_on не соблюдает. Раннер
+    # может стартовать раньше готовности шлюза, не получить его identity
+    # и выйти с ошибкой — рестарт с задержкой сходится сам, ценой
+    # нескольких шумных строк в логе. Чинить это здесь нечем: очередь
+    # порядка при старте демона задаёт anu-live.service, а не compose.
+    restart: unless-stopped
+    depends_on:
+      lab-llm-gateway-live:
+        condition: service_healthy
+    command:
+      - node
+      - dist/lab/runner.js
+      - live
+      - --data-dir
+      - /data
+      # Физика вселенной живёт В ОБРАЗЕ: она хэшируется в configHash и,
+      # значит, в runId каждой эпохи. Взять её из bind-монтирования
+      # означало бы, что личность цепочки можно поменять, не сменив тег
+      # образа. Файл — experiments/genesis-live/config.anu-live-1.json.
+      - --config
+      - ${ANU_LIVE_CONFIG:-/app/experiments/genesis-live/config.anu-live-1.json}
+      - --universe-id
+      - ${ANU_LIVE_UNIVERSE_ID:-U0001}
+      # Ярусы когниции — развёртывание, но их содержимое входит в
+      # cognitionId и потому в манифест каждой эпохи. Файл монтируется
+      # только на чтение и меняется так же осознанно, как образ.
+      - --tiers
+      - /config/tiers.json
+      # Записанные входы. Каталог /inbox смонтирован ТОЛЬКО НА ЧТЕНИЕ:
+      # раннер их читает, пишет их оператор, и раннер не может подделать
+      # собственный записанный вход.
+      - --task-inbox
+      - /inbox/tasks.jsonl
+      - --physics-inbox
+      - /inbox/physics.jsonl
+      # Стражи супервизора (fs, провайдер) — чистое развёртывание, ни один
+      # из них не попадает в улики.
+      - --outage-ticks
+      - ${ANU_LIVE_OUTAGE_TICKS:-3}
+      # Порог свободного места. Встроенный по умолчанию 20 GiB рассчитан
+      # на выделенный диск улик на 300 GB; на общем boot-диске 50 GB его
+      # надо задавать явно — см. DEPLOY_LIVE.md, раздел «Диск».
+      - --min-free-bytes
+      - ${ANU_LIVE_MIN_FREE_BYTES:-8589934592}
+      - --probe-interval-ms
+      - ${ANU_LIVE_PROBE_INTERVAL_MS:-30000}
+      # Перехват аренды писателя, которую ЭТОТ процесс может доказательно
+      # признать протухшей (сменился boot_id хоста, либо pid держит другой
+      # процесс с другим временем старта — src/lab/artifacts.ts). Без него
+      # любой kill -9 или OOM останавливает вселенную до ручного вмешательства,
+      # а на этой машине оператора рядом нет. Условие безопасности: против
+      # одного /data никогда не запускается второй раннер — Observer
+      # монтирует те же улики как :ro.
+      - --recover-stale-lease
+      - ${ANU_LIVE_RECOVER_STALE_LEASE:-true}
+    environment:
+      # Шлюз, а не провайдер. У раннера нет и не может быть ключа провайдера.
+      ANU_LLM_BASE_URL: http://lab-llm-gateway-live:8790/v1
+      ANU_LLM_IDENTITY_URL: http://lab-llm-gateway-live:8790/identity
+      # Bearer ДЛЯ ШЛЮЗА (не ключ провайдера) — читается из tmpfs-файла.
+      ANU_LLM_API_KEY_FILE: /run/secrets/anu_live_gateway_token
+      # Грейдер записанной внешней работы — через тот же шлюз: один egress,
+      # один бюджет, один аудит. Его id входит в evaluatorId манифеста.
+      ANU_LIVE_GRADER_MODEL: ${ANU_LIVE_GRADER_MODEL:-gpt-oss-120b}
+      ANU_LIVE_GRADER_MAX_TOKENS: ${ANU_LIVE_GRADER_MAX_TOKENS:-512}
+      ANU_LIVE_GRADER_TIMEOUT_MS: ${ANU_LIVE_GRADER_TIMEOUT_MS:-120000}
+      ANU_LLM_COOLDOWN_MS: ${ANU_LLM_COOLDOWN_MS:-30000}
+      ANU_LLM_CONTENT_BYTE_BUDGET: ${ANU_LLM_CONTENT_BYTE_BUDGET:-65536}
+      NODE_OPTIONS: ${ANU_LIVE_RUNNER_NODE_OPTIONS:---max-old-space-size=2048}
+    secrets:
+      - source: anu_live_gateway_token
+        target: anu_live_gateway_token
+    volumes:
+      - ${ANU_LIVE_EVIDENCE_DIR:-/var/lib/anu-live/evidence}:/data
+      - ${ANU_LIVE_INBOX_DIR:-/var/lib/anu-live/inbox}:/inbox:ro
+      - ${ANU_LIVE_TIERS_FILE:-/opt/anu-live/tiers.json}:/config/tiers.json:ro
+    networks:
+      - llm-control
+    # Раннер — не сервер: встроенный HEALTHCHECK образа (GET /readyz) для
+    # него ложен, поэтому он выключен, как и в compose.lab.yml.
+    healthcheck:
+      disable: true
+    cpus: ${ANU_LIVE_RUNNER_CPUS:-2.0}
+    mem_limit: ${ANU_LIVE_RUNNER_MEMORY_LIMIT:-3g}
+    # SIGTERM ставит вселенную на паузу НА ГРАНИЦЕ ТИКА: текущий тик
+    # доигрывается вместе с уже начатыми консультациями (худший случай —
+    # таймаут яруса deliberate) и записывает чекпойнт. Меньший grace
+    # означал бы SIGKILL посреди тика и оборванный хвост журнала.
+    stop_grace_period: ${ANU_LIVE_RUNNER_STOP_GRACE:-600s}
+
+  # --------------------------------------------------------------------
+  # Шлюз: единственный держатель ключа провайдера и единственный egress.
+  # --------------------------------------------------------------------
+  lab-llm-gateway-live:
+    <<: *live-runtime
+    # В compose.lab.yml шлюз намеренно не перезапускается: там счётчики
+    # бюджета живут в процессе, и рестарт молча открыл бы новый бюджет
+    # внутри одного эксперимента. Здесь --state-file делает бюджет
+    # переживающим рестарт, поэтому автоперезапуск безопасен и нужен:
+    # открытая вселенная не должна умирать от одного сбоя шлюза.
+    restart: unless-stopped
+    command:
+      - node
+      - dist/lab/runner.js
+      - gateway
+      - --upstream
+      - ${ANU_LIVE_LLM_UPSTREAM:-https://gpt.mwsapis.ru/projects/project-vxgxs2/openai/v1}
+      - --api-key-file
+      - /run/secrets/anu_live_provider_key
+      - --auth-token-file
+      - /run/secrets/anu_live_gateway_token
+      # Ровно те модели, которые названы в tiers.json и в ANU_LIVE_GRADER_MODEL.
+      - --models
+      - ${ANU_LIVE_LLM_MODELS:-gpt-oss-120b,qwen3-6-35b-a3b,kimi-k2-6}
+      # Бюджет — СКОЛЬЗЯЩЕЕ ОКНО, а не пожизненный потолок. Пожизненный
+      # потолок у бесконечной вселенной означает гарантированную смерть на
+      # заранее известном тике; окно ограничивает скорость расхода и
+      # восстанавливается само. Жёсткий финансовый предел ставится на
+      # стороне провайдера (ключ SA), а не здесь.
+      - --budget-window-ms
+      - ${ANU_LIVE_GATEWAY_BUDGET_WINDOW_MS:-3600000}
+      - --max-tokens-per-window
+      - ${ANU_LIVE_GATEWAY_MAX_TOKENS_PER_WINDOW:-8000000}
+      - --max-requests-per-window
+      - ${ANU_LIVE_GATEWAY_MAX_REQUESTS_PER_WINDOW:-20000}
+      - --rate-per-minute
+      - ${ANU_LIVE_GATEWAY_RATE_PER_MINUTE:-240}
+      - --max-in-flight
+      - ${ANU_LIVE_GATEWAY_MAX_IN_FLIGHT:-8}
+      - --max-response-bytes
+      - ${ANU_LIVE_GATEWAY_MAX_RESPONSE_BYTES:-2097152}
+      - --timeout-ms
+      - ${ANU_LIVE_GATEWAY_TIMEOUT_MS:-240000}
+      # Аудит шлюза — независимая от улик запись о каждом обращении.
+      # Ротация включена намеренно: без неё шлюз честно отказывает при
+      # достижении потолка (fail-closed), что для открытой вселенной
+      # означает вечный простой. Потолок держит аудит в пределах ~512 MB.
+      - --audit
+      - /gw/audit/gateway.jsonl
+      - --max-audit-bytes
+      - ${ANU_LIVE_GATEWAY_MAX_AUDIT_BYTES:-134217728}
+      - --audit-rotate
+      - ${ANU_LIVE_GATEWAY_AUDIT_ROTATE:-4}
+      # Бюджет переживает рестарт контейнера — именно это делает
+      # restart: unless-stopped честным.
+      - --state-file
+      - /gw/state/gateway-state.json
+      # latch: при сбое учёта шлюз перестаёт отвечать, но остаётся живым.
+      # Раннер видит это как отсутствие ответов, страж outage ставит
+      # вселенную на паузу на границе тика — это ровно то поведение,
+      # которое нужно. `exit` в паре с автоперезапуском дал бы цикл.
+      - --metering-failure-mode
+      - latch
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8790"
+    secrets:
+      - source: anu_live_provider_key
+        target: anu_live_provider_key
+      - source: anu_live_gateway_token
+        target: anu_live_gateway_token
+    volumes:
+      # Аудит и состояние бюджета — НЕ улики. Отдельный каталог, к которому
+      # у раннера нет доступа, и который не лежит внутри /data.
+      - ${ANU_LIVE_GATEWAY_DIR:-/var/lib/anu-live/gateway}:/gw
+    expose:
+      - "8790"
+    networks:
+      - llm-control
+      - llm-egress
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8790/readyz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    cpus: ${ANU_LIVE_GATEWAY_CPUS:-0.75}
+    mem_limit: ${ANU_LIVE_GATEWAY_MEMORY_LIMIT:-512m}
+    stop_grace_period: 45s
+
+  # --------------------------------------------------------------------
+  # Observer: только чтение улик, Bearer, только на 127.0.0.1.
+  # --------------------------------------------------------------------
+  lab-observer-live:
+    <<: *live-runtime
+    restart: unless-stopped
+    command:
+      - node
+      - dist/lab/runner.js
+      - serve
+      - --data-dir
+      - /data
+      - --host
+      - 0.0.0.0
+      - --port
+      - "3000"
+      - --auth-token-file
+      - /run/secrets/anu_live_observer_token
+    secrets:
+      - source: anu_live_observer_token
+        target: anu_live_observer_token
+    volumes:
+      - ${ANU_LIVE_EVIDENCE_DIR:-/var/lib/anu-live/evidence}:/data:ro
+    ports:
+      # Только петля хоста. Наружу — либо SSH-туннель с Lab (штатный путь,
+      # внешнего адреса у VM нет), либо профиль `edge` ниже.
+      - "127.0.0.1:${ANU_LIVE_OBSERVER_PORT:-3000}:3000"
+    networks:
+      - observer
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/readyz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    cpus: ${ANU_LIVE_OBSERVER_CPUS:-1.0}
+    mem_limit: ${ANU_LIVE_OBSERVER_MEMORY_LIMIT:-1g}
+    stop_grace_period: 30s
+
+  # --------------------------------------------------------------------
+  # Профиль `edge` — TLS-край на самой VM. ВЫКЛЮЧЕН по умолчанию: у
+  # anu-live-1 нет привязанного внешнего адреса, а без него ACME HTTP-01
+  # не проходит. Включать только после того, как владелец привяжет
+  # anu-live-1-ip и заведёт A-запись (см. DEPLOY_LIVE.md §10).
+  # --------------------------------------------------------------------
+  lab-edge-live:
+    profiles:
+      - edge
+    image: ${ANU_LIVE_CADDY_IMAGE:-caddy:2-alpine}
+    restart: unless-stopped
+    depends_on:
+      lab-observer-live:
+        condition: service_healthy
+    volumes:
+      - ${ANU_LIVE_CADDYFILE:-/opt/anu-live/Caddyfile}:/etc/caddy/Caddyfile:ro
+      - anu-live-caddy-data:/data
+      - anu-live-caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - observer
+    cpus: ${ANU_LIVE_EDGE_CPUS:-0.25}
+    mem_limit: ${ANU_LIVE_EDGE_MEMORY_LIMIT:-192m}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  # Раннер и шлюз. internal: true — у раннера нет маршрута наружу вообще,
+  # и это не правило файрвола, которое можно отменить, а отсутствие сети.
+  llm-control:
+    driver: bridge
+    internal: true
+  # Единственная сеть с выходом наружу; в ней состоит только шлюз.
+  llm-egress:
+    driver: bridge
+  # Observer публикует порт на 127.0.0.1. ИЗМЕРЕННЫЙ ФАКТ (docker 27.3.1,
+  # проверено на Lab 2026-09-08): опубликованный порт контейнера в сети с
+  # `internal: true` с хоста НЕ доступен (curl -> 000), в обычной bridge —
+  # 200. Поэтому сеть Observer'а не internal. Цена: у контейнера Observer'а
+  # есть egress. Он не держит ключа провайдера, монтирует улики :ro и
+  # никогда ничего не пишет.
+  observer:
+    driver: bridge
+
+volumes:
+  anu-live-caddy-data:
+    driver: local
+  anu-live-caddy-config:
+    driver: local
+
+# Все три секрета — файлы в tmpfs /run/anu/secrets, которые пишет
+# anu-secrets.service (deploy/mws/anu-secrets.sh) при каждом запуске.
+# /run — tmpfs: значения не переживают перезагрузку и никогда не ложатся
+# на постоянный диск. Ни один из них не передаётся через environment.
+secrets:
+  anu_live_provider_key:
+    # Ключ провайдера. Его видит ТОЛЬКО контейнер шлюза.
+    file: ${ANU_LIVE_PROVIDER_KEY_FILE:-/run/anu/secrets/anu-live-provider-key}
+  anu_live_gateway_token:
+    # Bearer между раннером и шлюзом. Общий у этих двух контейнеров.
+    file: ${ANU_LIVE_GATEWAY_TOKEN_FILE:-/run/anu/secrets/anu-live-gateway-token}
+  anu_live_observer_token:
+    # Bearer читателя улик. Его видит только Observer.
+    file: ${ANU_LIVE_OBSERVER_TOKEN_FILE:-/run/anu/secrets/anu-live-observer-token}

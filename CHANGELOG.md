@@ -548,6 +548,54 @@ epoch chain — not by any test written against either repository alone.
   it at the next tick boundary via `--outage-ticks`, the same mechanism a
   `SIGTERM` uses).
 
+### Genesis-Live — phase L5b (the single-machine live stack, ready to deploy)
+
+- Added `compose.live.yml`: the production stack of one machine — the runner
+  (`anu lab live`) on an `internal: true` network with no route out and no
+  provider key, the gateway (`anu lab gateway`) as the only holder of the
+  provider credential and the only egress, and the Observer (`anu lab serve`)
+  over the evidence read-only, published on the host loopback alone. Every
+  secret is a file secret from the tmpfs `/run/anu/secrets`; not one of them
+  is passed through `environment`, where `docker inspect` would show it.
+- Sized the universe for the machine that actually exists (`anu-live-1`,
+  4 vCPU / 8 GB / one 50 GB boot disk, no separate evidence disk):
+  `experiments/genesis-live/config.anu-live-1.json` differs from the canonical
+  physics in exactly five values (`agents` 16, `ticks` and `live.epochTicks`
+  250, `initialResources.llmTokens` 400 000, and its own seed) and is
+  byte-identical to the canonical config everywhere else; `checkpointEvery`
+  was deliberately left alone and the reason is stated rather than assumed. The
+  reasoning for each number, with the measurements behind it, is in
+  `.env.live.example`; the "everything else is canonical" invariant is pinned
+  by `test/lab-live-deployment-anu-live-1.test.mjs`, which also proves that
+  the tier prices in `deploy/mws/tiers.anu-live-1.json` equal the prices the
+  reducer charges from.
+- Ran epoch 0 of that universe end to end against a real gateway and a stub
+  provider before writing the disk thresholds: 250 ticks, 23 545 events,
+  4 000 `cognition.recorded` (every agent consulted every tick, none priced
+  out), 16 520 717 bytes of evidence plus 1 722 195 bytes of gateway audit —
+  roughly 18.2 MB per epoch, which on this disk is on the order of 1 700
+  epochs. The run also exposed the economy's real first wall: with no earnings
+  the agents run out of credits at tick 144 and `violation.recorded{cognition
+  overdraft}` follows. Recorded rather than hidden, with the operator's lever
+  (recorded physics — prices only) named.
+- Added `deploy/mws/bootstrap-anu-live-1.sh`, which applies the `cloud-init.yaml`
+  configuration by hand and idempotently to a machine cloud-init never
+  touched, minus the evidence-disk section that no longer has a disk. It also
+  declares `/run/anu` in `tmpfiles.d`: without that, `anu-secrets.service`
+  silently fails its `ConditionPathExists` after every reboot.
+- Added `deploy/mws/anu-live.service` (ordered after the secrets unit, with
+  fail-early preconditions on the three secret files, the evidence tree and
+  the Compose model) and the drop-in
+  `deploy/mws/anu-secrets.service.d/10-before-docker.conf`, which reads the
+  secrets *before* `dockerd` starts — otherwise Docker's own restart policy
+  brings the stack up after a reboot against an empty tmpfs.
+- Added `deploy/mws/DEPLOY_LIVE.md`: the step-by-step runbook for this machine,
+  every step with a checkable criterion, the owner-only steps marked, and the
+  five deliberate deviations from the multi-host design stated as deviations —
+  the provider key sharing a host with the evidence first among them — each
+  with what it risks and what lifts it.
+
+
 ## [1.0.0] - 2026-08-19
 
 The first stable release establishes ANU as an executable agent-native runtime
