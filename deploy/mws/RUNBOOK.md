@@ -10,7 +10,7 @@ docs/GENESIS_LIVE.md §7 и §10. Этот документ не переопр�
 
 2026-09-04 01:39–01:56 кто-то (не через этот скрипт — тогда в нём ещё не
 было предохранителя) выполнил часть команд §7.2 напрямую под профилем
-`xteam-pro`. Обнаружено и сверено напрямую с аккаунтом (`mws ... list -f
+владельца. Обнаружено и сверено напрямую с аккаунтом (`mws ... list -f
 json`) 2026-09-06 — до этого ошибочно считалось, что попытка провалилась
 целиком:
 
@@ -22,7 +22,7 @@ json`) 2026-09-06 — до этого ошибочно считалось, чт�
   (значения соответствуют §7.2 по факту — приоритеты 1000/1050/64000 вместо
   100/105/65000 в тексте документа, но диапазон `[1000-64535]` реального API
   других чисел и не допускает); правило `ssh-from-lab` (существует, но
-  пускает только Lab `185.233.3.14` — роль "ssh-from-owner" из §7.2 не
+  пускает только Lab (адрес в deploy/mws/target.env) — роль "ssh-from-owner" из §7.2 не
   выполнена, IP владельца отсутствовал); реестр `anu` + репозиторий
   `agent-native-universe-lab`.
 - **НЕ созданы:** ни одного IAM-ключа (api-key/hmac-key/authorized-key), ни
@@ -66,7 +66,7 @@ UTC 04.09, чтобы понять, кем/чем был запущен этот
 
 Перед реальным запуском:
 
-1. Свериться с квотами проекта `project-vxgxs2` в консоли/поддержке MWS.
+1. Свериться с квотами проекта `${MWS_PROJECT}` в консоли/поддержке MWS.
    Более ранняя попытка (см. заголовок provision.sh) упёрлась в исчерпанные
    vCPU, суммарный размер дисков `nbs-pl2` и внешние адреса — без запаса по
    квоте реальные вызовы провалятся так же.
@@ -83,7 +83,7 @@ UTC 04.09, чтобы понять, кем/чем был запущен этот
 REST API) вручную:
 
 - [ ] `anu-live` → чтение секретов `anu-live-*` в Secret Manager
-- [ ] `anu-live` → pull из `registry/projects/project-vxgxs2/registries/anu`
+- [ ] `anu-live` → pull из `registry/projects/${MWS_PROJECT}/registries/anu`
 - [ ] `anu-live` → `compute disk-backup create` на диск `anu-live-evidence-01`
 - [ ] `anu-anchor` → запись в S3-бакет `anu-live-anchors` — **и только туда**
       (не давайте этому SA ничего сверх записи в этот один бакет)
@@ -93,10 +93,10 @@ REST API) вручную:
 её не гонять "на пробу" — только `list`):
 
 ```bash
-mws --impersonate iam/projects/project-vxgxs2/serviceAccounts/anu-live \
+mws --impersonate iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live \
     secretmanager secret-version get-data --name anu-live-provider-key -f json
 
-mws --impersonate iam/projects/project-vxgxs2/serviceAccounts/anu-live \
+mws --impersonate iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live \
     compute disk-backup list -f json
 
 # docker pull под профилем VM (не impersonate с Lab — реальная проверка
@@ -116,8 +116,27 @@ create --active`, без данных). Версии с реальными зн�
 # Формат ввода данных версии секрета — сверить при первом реальном запуске
 # (см. §8 docs/GENESIS_LIVE.md); ниже — заведомо НЕ финальная команда, а
 # место, где она появится после подтверждения формата.
-mws secretmanager secret-version create secretmanager/projects/project-vxgxs2/secrets/anu-live-provider-key/secretVersions/1 ...
+mws secretmanager secret-version create secretmanager/projects/${MWS_PROJECT}/secrets/anu-live-provider-key/secretVersions/1 ...
 ```
+
+**Чтение версии — проверенная форма вызова CLI** (справка прочитана
+2026-09-08): у `secret-version get-data` есть позиционный `<id>` вида
+`secretmanager/projects/{project}/secrets/{secret}/secretVersions/{version}`
+и обязательный флаг `--name`. Что именно отдаёт вызов без явной версии,
+не документировано, поэтому `anu-secrets.sh` версию разрешает сам —
+максимальную активную из `secret-version list --filter 'spec.active=true'`.
+Формат ответа `get-data` (имя поля, base64 или сырые байты) остаётся
+**непроверенным фактом** до первого запуска на VM; скрипт при
+несовпадении падает с внятной ошибкой — поправить разбор и вписать факт
+сюда.
+
+**Ожидаемый отказ, не связанный с секретами.** `anu-secrets.service` —
+системный юнит: ИЗМЕРЕНО на Lab, что у такого юнита `HOME` не выставлен
+вовсе, а `PATH` не содержит `~/.local/bin`, где стоит CLI. Без drop-in
+`20-runtime-environment.conf` шаг падает с «команда mws не найдена», и
+отказ выглядит как проблема с секретами. Если он всё же случился —
+проверять окружение юнита (`systemctl show anu-secrets.service -p Environment`),
+а не разбор JSON.
 
 После этого на VM `anu-secrets.service` (см. `deploy/mws/anu-secrets.sh`)
 читает все три секрета в tmpfs `/run/anu/secrets/` при каждом запуске —
@@ -128,7 +147,7 @@ mws secretmanager secret-version create secretmanager/projects/project-vxgxs2/se
 ## 4. Аварийная остановка
 
 ```bash
-mws iam api-key update "iam/projects/project-vxgxs2/serviceAccounts/anu-live/apiKeys/anu-live-inference" --active=false
+mws iam api-key update "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/apiKeys/anu-live-inference" --active=false
 ```
 
 Деактивация ключа провайдера не трогает саму VM, контейнеры или супервизор
@@ -141,7 +160,7 @@ L3c, `src/lab/live/supervisor.ts`) считает подряд идущие ти
 Возобновление — обратная команда:
 
 ```bash
-mws iam api-key update "iam/projects/project-vxgxs2/serviceAccounts/anu-live/apiKeys/anu-live-inference" --active
+mws iam api-key update "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live/apiKeys/anu-live-inference" --active
 ```
 
 и перезапуск контейнера движка (не самого ключа — активация ключа не
@@ -180,9 +199,36 @@ Observer): новая версия секрета → `systemctl restart anu-sec
 стека — `anu-secrets.service` сам по себе не рестартует ничего, кроме
 собственного чтения секретов в tmpfs).
 
-Для ключа сайта Ask Lab (SA `xteam-pro`, истекает 2026-11-22) — замена на
-`anu-site-ask/ask-lab` до срока, отдельно от остальной ротации: правится
-`.env` сайта StudyLabPro, не эта VM.
+**Ротация обязана иметь проверяемый критерий, иначе она молча не
+происходит.** `anu-secrets.sh` разрешает версию секрета не «по имени», а
+явно: берёт максимальную АКТИВНУЮ версию через
+`secret-version list --filter 'spec.active=true'` и читает её по полному
+id. Без этого стек после ротации мог бы продолжить работать на старой,
+возможно скомпрометированной версии — и ни один критерий раннбука этого
+не показал бы: три файла на месте, сервисы healthy.
+
+Критерий: **отпечаток файла секрета изменился**. Скрипт печатает первые
+16 символов sha256 каждого записанного файла, значение при этом никуда не
+попадает:
+
+```bash
+# ДО ротации
+sudo sha256sum /run/anu/secrets/anu-live-provider-key | cut -c1-16
+# новая версия секрета создаётся владельцем, затем
+sudo systemctl restart anu-secrets.service
+sudo journalctl -u anu-secrets.service -n 5 --no-pager   # видна новая «версия N»
+# ПОСЛЕ ротации — отпечаток обязан отличаться
+sudo sha256sum /run/anu/secrets/anu-live-provider-key | cut -c1-16
+```
+
+Если отпечаток не изменился — версия не подхватилась. Тогда пиннуть
+версию вручную (`ANU_SECRET_VERSION=<N>` в
+`/etc/systemd/system/anu-secrets.service.d/`) и записать факт в §3.
+
+Ключ инференса витрины Ask Lab заменяется на `anu-site-ask/ask-lab` до
+истечения текущего, отдельно от остальной ротации: правится `.env` самой
+витрины на её собственном хосте, не эта VM. Даты в этот файл не
+выписываются — он публичный, актуальный срок даёт `iam api-key get`.
 
 Grafana-алерт «ключ истекает» по каждой строке `KEYS.md` — не входит в
 объём L5a (см. TODO в `KEYS.md`), задача фазы L5c.

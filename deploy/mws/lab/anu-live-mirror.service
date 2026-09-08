@@ -1,28 +1,48 @@
 [Unit]
 # ПРИМЕЧАНИЕ: этот юнит живёт в репозитории только как заготовка. Он
-# рассчитан на копирование в /etc/systemd/system/ НА ЭТОМ ХОСТЕ (185.233.3.14
-# — Lab) после того, как фаза L5b поднимет реальную VM anu-live-1 и станет
-# известен её адрес. До этого момента файл не устанавливается и не
-# включается — см. deploy/mws/RUNBOOK.md.
+# рассчитан на копирование в /etc/systemd/system/ НА ХОСТЕ Lab после того,
+# как фаза L5b поднимет VM anu-live-1 и станет известен её адрес. До этого
+# момента файл не устанавливается и не включается — см. deploy/mws/RUNBOOK.md.
 Description=Синхронизация chain/ живой вселенной anu-live-1 на Lab (второй якорь, docs/GENESIS_LIVE.md §7.2)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Переменные ниже создаёт владелец на этом хосте в /etc/anu-live-mirror.env
-# (0600, не в git) ПОСЛЕ того, как VM anu-live-1 реально существует:
-#   ANU_LIVE_MIRROR_HOST=<внутренний или внешний адрес VM anu-live-1 — заполняется по факту L5b>
+# Переменные ниже создаёт оператор на Lab в /etc/anu-live-mirror.env
+# (0640 root:anu-mirror, не в git) ПОСЛЕ того, как VM реально существует:
+#   ANU_LIVE_MIRROR_HOST=<адрес VM anu-live-1>
 #   ANU_LIVE_MIRROR_USER=<пользователь SSH на VM>
-#   ANU_LIVE_MIRROR_REMOTE_PATH=<путь к genesis-live/U0001/chain/ на VM,
-#       ожидаемо /var/lib/anu-live/genesis-live/U0001/chain/ — сверить по факту>
-#   ANU_LIVE_MIRROR_LOCAL_PATH=<локальное зеркало, по умолчанию /root/anu-live-mirror/chain/>
+#   ANU_LIVE_MIRROR_REMOTE_PATH=/var/lib/anu-live/evidence/genesis-live/U0001/chain/
+#       ^ сегмент evidence/ обязателен: корень улик — /var/lib/anu-live/evidence,
+#         а не /var/lib/anu-live (bootstrap-anu-live-1.sh, раскладка §3).
+#   ANU_LIVE_MIRROR_LOCAL_PATH=/var/lib/anu-live-mirror/chain/
 EnvironmentFile=/etc/anu-live-mirror.env
+
+# Зеркало принимает файлы с машины, которую сам раннбук считает наименее
+# защищённой (отступление О-1: одна компрометация даёт и ключ провайдера,
+# и улики). Поэтому юнит НЕ работает от root и не имеет права писать
+# никуда, кроме собственного каталога зеркала.
+# Пользователя заводит оператор: `useradd --system --shell /usr/sbin/nologin anu-mirror`,
+# каталог — `install -d -m 0750 -o anu-mirror -g anu-mirror /var/lib/anu-live-mirror`,
+# ключ SSH — в /var/lib/anu-live-mirror/.ssh/ (0600, владелец anu-mirror).
+User=anu-mirror
+Group=anu-mirror
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/var/lib/anu-live-mirror
+
 # Намеренно БЕЗ --delete: chain/ — плотный, только-добавляющий индекс
 # эпох (см. src/lab/artifacts.ts, LiveChainIndex) — единственная причина
 # исчезновения файла локально была бы сбоем синхронизации, а не реальным
 # состоянием источника. Второй якорь не должен уметь стирать уже
 # подтверждённые локальные копии из-за сетевого сбоя на удалённой стороне.
+#
+# Зеркалится ТОЛЬКО chain/. Каталог anchors/ в этой фазе не зеркалится:
+# движок его не пишет (в коде он только читается), якорение отложено до
+# ops-хоста — DEPLOY_LIVE.md §9.
 ExecStart=/usr/bin/rsync -az \
   -e "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" \
   "${ANU_LIVE_MIRROR_USER}@${ANU_LIVE_MIRROR_HOST}:${ANU_LIVE_MIRROR_REMOTE_PATH}" \

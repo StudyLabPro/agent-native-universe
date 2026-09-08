@@ -13,7 +13,7 @@
 # рисковать так живой вселенной ради учения недопустимо. Вместо этого драйв
 # поднимает ОДНОРАЗОВУЮ scratch-VM в той же подсети anu-live-nodes:
 #   - без внешнего адреса (не создаём новую точку входа из интернета);
-#   - доступна по SSH только с внутреннего адреса anu-live-1 (10.77.0.10) —
+#   - доступна по SSH только с внутреннего адреса anu-live-1 —
 #     то есть оператор сначала заходит на anu-live-1 (уже разрешено
 #     правилом ssh-from-owner), а оттуda — на scratch-VM;
 #   - все ресурсы драйва (2 диска, VM, временное правило firewall)
@@ -23,13 +23,25 @@
 # явного подтверждения.
 set -euo pipefail
 
-readonly MWS_PROJECT="project-vxgxs2"
+# Локальный файл цели развёртывания (адреса, имя проекта, пользователь SSH).
+# В git он не входит: этот репозиторий публичный, а адреса и идентификатор
+# облачного проекта — внешний инфраструктурный контекст. Образец —
+# deploy/mws/target.env.example.
+__anu_target_env="${ANU_LIVE_TARGET_ENV:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/target.env}"
+if [[ -f "$__anu_target_env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$__anu_target_env"
+  set +a
+fi
+
+readonly MWS_PROJECT="${MWS_PROJECT:?MWS_PROJECT не задан: заполните deploy/mws/target.env по образцу target.env.example}"
 readonly MWS_ZONE="ru-central1-a"
 readonly CONFIRM_FLAG="--yes-i-understand-this-costs-real-money"
 readonly SOURCE_DISK="anu-live-evidence-01"
 readonly BACKUP_PREFIX="anu-live-evidence-"
-readonly DRILL_INTERNAL_IP="10.77.0.20"
-readonly ANU_LIVE_INTERNAL_IP="10.77.0.10"
+readonly DRILL_INTERNAL_IP="${ANU_DRILL_INTERNAL_IP:?ANU_DRILL_INTERNAL_IP не задан: заполните deploy/mws/target.env}"
+readonly ANU_LIVE_INTERNAL_IP="${ANU_LIVE_INTERNAL_IP:?ANU_LIVE_INTERNAL_IP не задан: заполните deploy/mws/target.env}"
 readonly LIVE_EXPERIMENT_ID="genesis-live"
 readonly LIVE_UNIVERSE_ID="U0001"
 DRILL_ID="drill-$(date +%Y%m%d%H%M%S)"

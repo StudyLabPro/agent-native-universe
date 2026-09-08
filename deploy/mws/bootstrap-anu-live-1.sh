@@ -110,9 +110,14 @@ log "каталог стека ${OPT_DIR} готов (compose.live.yml, .env, ti
 # systemd-tmpfiles воссоздаёт каталог на каждой загрузке.
 install -d -m 0700 -o root -g root "$RUN_DIR"
 cat > /etc/tmpfiles.d/anu-live.conf <<'TMPFILES'
-# Каталог секретов Genesis-Live в tmpfs. Пересоздаётся на каждой загрузке
+# Каталоги секретов Genesis-Live в tmpfs. Пересоздаются на каждой загрузке
 # ДО того, как anu-secrets.service проверит своё ConditionPathExists.
+# Вторая строка обязательна: если /run/anu/secrets окажется НЕ каталогом
+# (docker создаёт bind-источник каталогом, когда контейнер стартовал
+# раньше секретов, а сам файл секрета исчез), systemd-tmpfiles приведёт
+# путь к каталогу до того, как anu-secrets.sh начнёт писать в него.
 d /run/anu 0700 root root -
+d /run/anu/secrets 0700 root root -
 TMPFILES
 systemd-tmpfiles --create /etc/tmpfiles.d/anu-live.conf
 log "tmpfs-каталог секретов ${RUN_DIR} создан и объявлен в /etc/tmpfiles.d/anu-live.conf"
@@ -121,13 +126,19 @@ log "tmpfs-каталог секретов ${RUN_DIR} создан и объяв
 cat <<'NEXT'
 
 bootstrap: машина готова принять стек. Осталось (см. deploy/mws/DEPLOY_LIVE.md):
-  1. Владелец: профиль `mws` на этой VM (/root/.config/mws/..., 0600) — без него
+  1. Владелец: профиль `mws` на этой VM (0600, root) — без него
      anu-secrets.service не прочитает ни одного секрета.
   2. Владелец: версии трёх секретов в MWS Secret Manager (контейнеры уже созданы,
      значений в них нет) и IAM role bindings для SA anu-live.
-  3. Оператор: скопировать в /opt/anu-live — compose.live.yml, .env, tiers.json;
+  3. Оператор: /etc/anu-live/target.env (0640 root:root) с одной строкой
+     MWS_PROJECT=<имя проекта> — его читает anu-secrets.service.
+  4. Оператор: скопировать в /opt/anu-live — compose.live.yml, .env, tiers.json;
      в /opt/anu-live/anu-secrets.sh — скрипт чтения секретов;
-     в /etc/systemd/system — anu-secrets.service, anu-live.service и drop-in
-     anu-secrets.service.d/10-before-docker.conf.
-  4. Оператор: docker login в registry.mwsapis.ru и `docker compose pull`.
+     в /etc/systemd/system — anu-secrets.service, anu-live.service и оба drop-in
+     из anu-secrets.service.d/ (10-before-docker, 20-runtime-environment).
+  5. Оператор: аутентификация в реестре ПОД СЕРВИСНЫМ АККАУНТОМ этой VM
+     (`mws registry configure-docker` под профилем VM), затем `docker compose pull`.
+     Логиниться на VM учётной записью ВЛАДЕЛЬЦА запрещено: её credentials легли бы
+     открытым текстом в /root/.docker/config.json на машине, где лежат улики и
+     ключ провайдера.
 NEXT

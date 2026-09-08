@@ -16,7 +16,7 @@
 #   deny-all-ingress (значения совпадают с §7.2 по факту, хотя приоритеты
 #   отличаются от чисел в тексте архитектурного документа — см. ниже) и
 #   ssh-from-lab (совпадает с §7.2 по имени и структуре, НО пускает только
-#   Lab 185.233.3.14 — IP владельца в нём нет, документ называл эту роль
+#   Lab — IP владельца в нём нет, документ называл эту роль
 #   "ssh-from-owner"); реестр anu + репозиторий agent-native-universe-lab.
 #   ЧЕГО НЕТ: ни одного IAM-ключа (api-key/hmac-key/authorized-key), ни
 #   одного секрета в Secret Manager, external-address anu-live-1-ip, диска
@@ -47,7 +47,7 @@
 #
 # ПРЕДОХРАНИТЕЛЬ: каждый вызов ниже, который реально что-то создаёт —
 # биллингуемый или security-significant ресурс в проекте MWS
-# project-vxgxs2. Условие перехода фазы L5a в архитектурном документе
+# ${MWS_PROJECT}. Условие перехода фазы L5a в архитектурном документе
 # требует, чтобы владелец сначала подтвердил список ресурсов и лично
 # выполнил шаг с секретами и IAM-биндингами. Скрипт не продолжает работу без
 # явного человеческого подтверждения — см. раздел "Предохранитель" ниже.
@@ -76,12 +76,24 @@
 # смещены в допустимый диапазон.
 set -euo pipefail
 
+# Локальный файл цели развёртывания (адреса, имя проекта, пользователь SSH).
+# В git он не входит: этот репозиторий публичный, а адреса и идентификатор
+# облачного проекта — внешний инфраструктурный контекст. Образец —
+# deploy/mws/target.env.example.
+__anu_target_env="${ANU_LIVE_TARGET_ENV:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/target.env}"
+if [[ -f "$__anu_target_env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$__anu_target_env"
+  set +a
+fi
+
 # ---------------------------------------------------------------------------
 # 0. Константы
 # ---------------------------------------------------------------------------
-readonly MWS_PROJECT="project-vxgxs2"
+readonly MWS_PROJECT="${MWS_PROJECT:?MWS_PROJECT не задан: заполните deploy/mws/target.env по образцу target.env.example}"
 readonly MWS_ZONE="ru-central1-a"
-readonly LAB_IP="185.233.3.14"
+readonly LAB_IP="${ANU_LIVE_LAB_IP:?ANU_LIVE_LAB_IP не задан: заполните deploy/mws/target.env}"
 readonly CONFIRM_FLAG="--yes-i-understand-this-costs-real-money"
 # Фиксированное пространство имён для детерминированных UUIDv5 idempotency-key.
 # Значение произвольно, но должно оставаться неизменным между запусками —
@@ -188,7 +200,7 @@ cat <<EOF
   VPC:      внешний адрес anu-live-1-ip (сеть/подсеть/большинство правил
             firewall уже существуют); правило ssh-from-lab будет ДОПОЛНЕНО
             вашим IP, если его там ещё нет — существующий доступ с Lab
-            (185.233.3.14) не убирается.
+            (Lab) не убирается.
   Compute:  диск anu-live-evidence-01 (300GB, nbs-pl2). VM anu-live-1 УЖЕ
             РАБОТАЕТ (base-4-8) — этот скрипт её не создаёт и не меняет;
             подключение нового диска и внешнего адреса к ней — отдельный
@@ -246,8 +258,8 @@ ensure "SA anu-site-ask" \
   mws iam service-account create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask" \
   --display-name anu-site-ask
 
-# Замена ключа сайта studylabpro.com (SA xteam-pro), который истекает
-# 2026-11-22 — см. KEYS.md.
+# Замена ключа инференса витрины Ask Lab на собственный SA — см. KEYS.md.
+# Актуальный срок истечения текущего ключа даёт `iam api-key get`.
 ensure "API-ключ ask-lab" \
   mws iam api-key get "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask/apiKeys/ask-lab" -- \
   mws iam api-key create "iam/projects/${MWS_PROJECT}/serviceAccounts/anu-site-ask/apiKeys/ask-lab" \
@@ -352,7 +364,7 @@ ensure "Сеть anu-live" \
 ensure "Подсеть anu-live-nodes" \
   mws vpc subnet get "vpc/projects/${MWS_PROJECT}/networks/anu-live/subnets/anu-live-nodes" -- \
   mws vpc subnet create "vpc/projects/${MWS_PROJECT}/networks/anu-live/subnets/anu-live-nodes" \
-  --network anu-live --cidr 10.77.0.0/24 \
+  --network anu-live --cidr "${ANU_LIVE_SUBNET_CIDR:?ANU_LIVE_SUBNET_CIDR не задан: заполните deploy/mws/target.env}" \
   --idempotency-key "$(idem_key 'subnet-anu-live-nodes')"
 
 # Реальный API 2026-09-06 отклонил вызов без --body (`415 Content type ''
@@ -382,7 +394,7 @@ for rule in https-from-lab acme-http deny-all-ingress; do
   fi
 done
 
-# ssh-from-lab существует, но по факту пускает только Lab (185.233.3.14) —
+# ssh-from-lab существует, но по факту пускает только Lab (Lab) —
 # роль "ssh-from-owner" из §7.2 в нём не выполнена. Донастраиваем идемпотентно:
 # читаем текущий список CIDR только чтобы РЕШИТЬ, нужно ли что-то менять;
 # сама update-команда всегда передаёт оба известных адреса явно (LAB_IP +
@@ -447,30 +459,30 @@ cat <<'EOF'
 1. Прямо перед выполнением получите СВЕЖЕЕ состояние VM (не полагайтесь на
    значения из более раннего запуска этого скрипта или из документации):
 
-     mws compute vm get compute/projects/project-vxgxs2/virtualMachines/anu-live-1 -f json
+     mws compute vm get compute/projects/${MWS_PROJECT}/virtualMachines/anu-live-1 -f json
 
 2. Соберите --storage-disks дважды: с текущей boot-записью БЕЗ ИЗМЕНЕНИЙ
    (скопировать из шага 1, поле status.storage.disks) и новой evidence-
    записью:
 
-     --storage-disks 'boot: true, deviceName: boot, disk: {ref: "compute/projects/project-vxgxs2/disks/anu-live-1-boot"}' \
-     --storage-disks 'boot: false, deviceName: evidence, disk: {ref: "compute/projects/project-vxgxs2/disks/anu-live-evidence-01"}'
+     --storage-disks 'boot: true, deviceName: boot, disk: {ref: "compute/projects/${MWS_PROJECT}/disks/anu-live-1-boot"}' \
+     --storage-disks 'boot: false, deviceName: evidence, disk: {ref: "compute/projects/${MWS_PROJECT}/disks/anu-live-evidence-01"}'
 
 3. Соберите --network-interfaces с текущим адресом БЕЗ ИЗМЕНЕНИЙ (поле
    status.network.networkInterfaces[0].addresses[0].ref из шага 1) плюс
    oneToOneNat на новый внешний адрес:
 
-     --network-interfaces 'primary: true, name: eth0, addresses: [{address: {ref: "vpc/projects/project-vxgxs2/networks/anu-live/addresses/anu-live-1-internal"}, oneToOneNat: {external: {address: {ref: "vpc/projects/project-vxgxs2/externalAddresses/anu-live-1-ip"}}}}]'
+     --network-interfaces 'primary: true, name: eth0, addresses: [{address: {ref: "vpc/projects/${MWS_PROJECT}/networks/anu-live/addresses/anu-live-1-internal"}, oneToOneNat: {external: {address: {ref: "vpc/projects/${MWS_PROJECT}/externalAddresses/anu-live-1-ip"}}}}]'
 
 4. Рекомендация: сделать это при кратком плановом простое, а не «на живую» —
    гарантии hot-attach в документации CLI не подтверждены:
 
-     mws compute vm update compute/projects/project-vxgxs2/virtualMachines/anu-live-1 --hardware-power OFF --wait-timeout 3m
-     mws compute vm update compute/projects/project-vxgxs2/virtualMachines/anu-live-1 \
+     mws compute vm update compute/projects/${MWS_PROJECT}/virtualMachines/anu-live-1 --hardware-power OFF --wait-timeout 3m
+     mws compute vm update compute/projects/${MWS_PROJECT}/virtualMachines/anu-live-1 \
        --storage-disks '...' --storage-disks '...' \
        --network-interfaces '...' \
        --idempotency-key "<новый UUID>"
-     mws compute vm update compute/projects/project-vxgxs2/virtualMachines/anu-live-1 --hardware-power ON
+     mws compute vm update compute/projects/${MWS_PROJECT}/virtualMachines/anu-live-1 --hardware-power ON
 
 5. После включения — примонтировать evidence-диск внутри VM (см.
    cloud-init.yaml, тот же блок форматирования/монтирования в
@@ -518,7 +530,7 @@ cat <<'EOF'
 
   xt-plesk dns-add studylabpro.com A live.anu <external-ip>
 
-(ns1/ns2.studylabpro.com -> 5.101.77.36). Публикация DNS-записи — необратимое
+(зона обслуживается ns1/ns2.studylabpro.com). Публикация DNS-записи — необратимое
 публичное действие (домен станет виден всем), поэтому эта команда намеренно
 НЕ выполняется автоматически этим скриптом.
 EOF

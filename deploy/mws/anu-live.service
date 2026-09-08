@@ -11,6 +11,11 @@ Wants=network-online.target
 # (контейнеры поднимет политика рестарта, но `compose up` с текущим .env
 # не выполнялся). PartOf заставляет юнит перезапуститься вместе с docker,
 # то есть заново пройти все предохранители ниже.
+#
+# ЦЕНА, которую надо знать заранее: вместе с PartOf и TimeoutStopSec=720
+# любой `systemctl restart docker` на этой машине сначала штатно
+# останавливает вселенную — до 12 минут (раннер доигрывает тик и пишет
+# чекпойнт). Это не зависание; прерывать нельзя. См. DEPLOY_LIVE.md §10.
 PartOf=docker.service
 
 [Service]
@@ -20,19 +25,23 @@ PartOf=docker.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/anu-live
-# EnvironmentFile намеренно НЕ используется: docker compose сам читает
-# /opt/anu-live/.env как файл окружения проекта. Второй читатель того же
-# файла означал бы два разных парсера одной истины и лишний класс отказов.
+# EnvironmentFile намеренно НЕ используется для .env стека: docker compose
+# сам читает /opt/anu-live/.env как файл окружения проекта. Второй читатель
+# той же истины означал бы два парсера и лишний класс отказов.
 
-# Предохранитель 0: файл окружения на месте (без него ANU_LIVE_IMAGE не
-# разрешится и compose откажет — но отказать лучше здесь и внятно).
+# Предохранитель 0: файл окружения и ярусы на месте.
 ExecStartPre=/usr/bin/test -f /opt/anu-live/.env
 ExecStartPre=/usr/bin/test -f /opt/anu-live/tiers.json
 
 # Предохранитель 1: три секрета обязаны существовать и быть ОБЫЧНЫМИ
-# файлами. Если файла нет, docker создаст на его месте каталог, и
-# контейнер поднимется с нечитаемым секретом — отказ будет невнятным и
-# поздним. Здесь он ранний и внятный.
+# файлами.
+# ИЗМЕРЕНО (docker 27.3.1 / compose 2.29.7, Lab, 2026-09-08): если файла
+# секрета нет ВООБЩЕ, compose отказывается создавать контейнер —
+# `invalid mount config for type "bind": bind source path does not exist`,
+# каталога он при этом не создаёт. Но отказ приходит поздно, со стороны
+# демона, и при restart: unless-stopped повторяется бесконечно; а если
+# контейнер уже существовал и файл исчез, `docker start` СОЗДАЁТ на его
+# месте каталог (тоже измерено). Поэтому проверка ранняя и внятная.
 ExecStartPre=/usr/bin/test -f /run/anu/secrets/anu-live-provider-key
 ExecStartPre=/usr/bin/test -f /run/anu/secrets/anu-live-gateway-token
 ExecStartPre=/usr/bin/test -f /run/anu/secrets/anu-live-observer-token
@@ -40,7 +49,18 @@ ExecStartPre=/usr/bin/test -f /run/anu/secrets/anu-live-observer-token
 ExecStartPre=/usr/bin/test -d /var/lib/anu-live/evidence
 ExecStartPre=/usr/bin/test -f /var/lib/anu-live/inbox/tasks.jsonl
 ExecStartPre=/usr/bin/test -f /var/lib/anu-live/inbox/physics.jsonl
-# Предохранитель 3: compose-файл валиден и все переменные разрешились.
+# Предохранитель 3: страж диска задан ЯВНО. У движка он по умолчанию
+# ВЫКЛЮЧЕН (runner.ts: default 0, the guard is off), поэтому потерянная
+# переменная означала бы не «более строгий порог», а отсутствие стража —
+# и вселенная забила бы boot-диск вместе с ОС и docker.
+ExecStartPre=/bin/sh -c 'grep -Eq "^ANU_LIVE_MIN_FREE_BYTES=[1-9][0-9]*$" /opt/anu-live/.env'
+# Предохранитель 4: против одного каталога улик не должно быть второго
+# писателя. Одноразовый раннер Ш7 (`compose run`) может пережить обрыв ssh
+# и остаться невидимым; вместе с --recover-stale-lease это дало бы двух
+# писателей в один events.jsonl (проверка протухания аренды читает
+# /proc/<pid> в СВОЁМ pid-namespace и чужой контейнер «не видит»).
+ExecStartPre=/bin/sh -c '! docker ps -q --filter label=com.docker.compose.project=anu-live --filter label=com.docker.compose.oneoff=True | grep -q .'
+# Предохранитель 5: compose-файл валиден и все переменные разрешились.
 ExecStartPre=/usr/bin/docker compose -f /opt/anu-live/compose.live.yml config -q
 
 ExecStart=/usr/bin/docker compose -f /opt/anu-live/compose.live.yml up -d --remove-orphans

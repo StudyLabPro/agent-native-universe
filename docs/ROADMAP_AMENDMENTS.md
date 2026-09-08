@@ -101,6 +101,35 @@ traceable to something concrete instead of being self-certifying.
   that exchange. Nothing beyond these two items was confirmed by this
   exchange.
 
+### Open, awaiting the owner — the publication boundary of `deploy/**` (raised 2026-09-08, L5b review)
+
+**Not a decision. A question with nothing confirmed yet**, recorded here so it
+cannot be lost between phases and so nothing downstream can cite it as settled.
+
+This repository is public and its `AGENTS.md` forbids exposing external
+infrastructure context. Phase L5a/L5b introduced `deploy/**`,
+`compose.live.yml` and `.env.live.example`, which carried machine addresses,
+the cloud project identifier, subnets, firewall rule names with priorities and
+a reference to an internal document of a different, closed project. The branch
+was never pushed, so nothing was disclosed.
+
+Everything measurable has been removed: those values now live only in
+`deploy/mws/target.env` (untracked, from `target.env.example`), the tracked
+artefacts carry variable names, and `test/publication-boundary.test.mjs`
+enforces the boundary as patterns rather than literals.
+
+What remains is a judgment the agent cannot make: **whether `deploy/**` should
+exist in a public repository at all.** Even anonymised, it describes the
+topology of a production deployment.
+
+- **A.** Keep it public and anonymised, real values only on the operator's
+  machine. This is the branch's current state.
+- **B.** Move `deploy/mws/**`, `compose.live.yml` and `.env.live.example` to a
+  closed repository and leave a pointer here.
+
+The answer belongs in the Decision log above, in the owner's own words, before
+`feat/genesis-live` is pushed.
+
 ## Status
 
 | Amendment | Needs owner | Reversible | State |

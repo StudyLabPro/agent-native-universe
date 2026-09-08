@@ -1,6 +1,6 @@
 [Unit]
 # ПРИМЕЧАНИЕ: заготовка для копирования в /etc/systemd/system/ НА ЭТОМ
-# ХОСТЕ (185.233.3.14 — Lab) после того, как L5b поднимет VM anu-live-1 и
+# ХОСТЕ Lab после того, как L5b поднимет VM anu-live-1 и
 # станет известен её адрес. Структура (Type=simple, Restart=always,
 # StartLimitIntervalSec=0) сознательно скопирована с уже работающего на
 # этом хосте /etc/systemd/system/prod-tunnel@.service — тот же принцип:

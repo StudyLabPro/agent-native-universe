@@ -8,7 +8,19 @@
 # назначается владельцем вручную, см. RUNBOOK.md).
 set -euo pipefail
 
-readonly MWS_PROJECT="project-vxgxs2"
+# Локальный файл цели развёртывания (адреса, имя проекта, пользователь SSH).
+# В git он не входит: этот репозиторий публичный, а адреса и идентификатор
+# облачного проекта — внешний инфраструктурный контекст. Образец —
+# deploy/mws/target.env.example.
+__anu_target_env="${ANU_LIVE_TARGET_ENV:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/target.env}"
+if [[ -f "$__anu_target_env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$__anu_target_env"
+  set +a
+fi
+
+readonly MWS_PROJECT="${MWS_PROJECT:?MWS_PROJECT не задан: заполните deploy/mws/target.env по образцу target.env.example}"
 readonly SOURCE_DISK="anu-live-evidence-01"
 readonly BACKUP_PREFIX="anu-live-evidence-"
 readonly KEEP_LAST=14

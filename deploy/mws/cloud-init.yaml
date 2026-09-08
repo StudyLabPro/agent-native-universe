@@ -51,7 +51,7 @@ write_files:
   # ПОСЛЕ создания ключа (provision.sh, раздел IAM), НЕ через cloud-init.
   # Ожидаемый путь и права: /root/.config/mws/profile/default.yaml,
   # владелец root, режим 0600. Проверка после установки:
-  # `mws iam service-account get iam/projects/project-vxgxs2/serviceAccounts/anu-live`
+  # `mws iam service-account get iam/projects/${MWS_PROJECT}/serviceAccounts/anu-live`
   # с этой VM должен отработать без ошибок авторизации.
   - path: /etc/anu-live/PLACEHOLDER-mws-profile-installed-by-owner.txt
     permissions: "0644"

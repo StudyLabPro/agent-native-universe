@@ -7,3 +7,7 @@ dist-test/
 .anu-state/
 runs/
 .superdesign/tmp/
+
+# Локальный файл цели развёртывания (адреса, имя проекта) — вне публичного репозитория.
+deploy/mws/target.env
+deploy/mws/local/

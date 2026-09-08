@@ -53,10 +53,14 @@ test("the anu-live-1 universe config is the canonical physics, resized only wher
   assert.equal(host.ticks, 250);
   assert.equal(host.live.epochTicks, 250);
   assert.ok(host.live.epochTicks > host.live.archive.submissionTicks);
-  // A fast consultation meters on the order of 1.5–2k units here, so the
-  // canonical 200000 would exhaust the whole population before the first
-  // chain link. Doubling it makes exhaustion a consequence of an agent's own
-  // tier choices, not of arithmetic.
+  // A `fast` consultation meters ~1580 units here, so the canonical 200000
+  // would wall the population around tick 126 — before the first chain link.
+  // Doubling it moves the wall to a measured tick 253. It does not make the
+  // universe survive: with nothing earned the wall arrives anyway, and where
+  // it arrives is decided by which tier the models ask for (measured: tick 22
+  // when every answer requests `deliberate`). This number is revisited only
+  // through a recorded tier distribution of a real epoch — see
+  // `deploy/mws/DEPLOY_LIVE.md` §5 and step Ш7.
   assert.equal(host.initialResources.llmTokens, 400_000);
   // Its own seed: a differently-sized universe must never be mistaken for the
   // canonical one in someone else's report.
@@ -115,10 +119,69 @@ test("the anu-live-1 tiers file is a valid tiers spec and prices exactly what th
     "ANU_LIVE_GATEWAY_MAX_IN_FLIGHT must cover the tiers plus the grader",
   );
 
-  // The disk guard's built-in default (20 GiB) assumes a dedicated 300 GB
-  // evidence volume. On a shared 50 GB boot disk it has to be set explicitly
-  // and it has to be smaller than that default, or the universe pauses at
-  // once — and larger than nothing, or it never pauses at all.
+  // Every tier's ceiling has to sit above the reasoning volume its model
+  // actually produces, or the answer is truncated, fails to parse, and the
+  // record lands as `rejected` with no actions — a consultation paid for and
+  // wasted. Measured on the real deployments: gpt-oss-120b with
+  // reasoning_effort "low" spends on the order of a hundred tokens,
+  // qwen3-6-35b-a3b 1.6-2.1k (thinking cannot be switched off) and kimi-k2-6
+  // 0.9-2.6k. `maxTokens` also sets the affordability reserve, so these are
+  // not free to inflate either.
+  const MEASURED_REASONING_CEILING = { fast: 512, standard: 3_000, deliberate: 3_500 };
+  for (const tier of ["fast", "standard", "deliberate"]) {
+    assert.ok(
+      tiers[tier].maxTokens > MEASURED_REASONING_CEILING[tier],
+      `${tier}.maxTokens must clear the measured reasoning ceiling of its model`,
+    );
+  }
+  // The one tier whose model honours it: without reasoning_effort "low"
+  // gpt-oss-120b is not the cheap tier this deployment prices it as.
+  assert.deepEqual(
+    tiers.fast.requestOverrides,
+    { reasoning_effort: "low" },
+    "the fast tier must carry the reasoning_effort override its model needs",
+  );
+
+  // The rate limit must sit ABOVE the stack's physical ceiling, not on it:
+  // eight concurrent requests at the ~1s floor latency is up to 480 per
+  // minute, and a limit equal to that turns normal operation into a stream of
+  // 429s — three in a row open the circuit breaker and the outage guard then
+  // pauses the universe. The window is a runaway fuse, not a budget.
+  const PHYSICAL_CEILING_PER_MINUTE = (concurrency + GRADER_IN_FLIGHT) * 60;
+  assert.ok(
+    Number(env.get("ANU_LIVE_GATEWAY_RATE_PER_MINUTE")) > PHYSICAL_CEILING_PER_MINUTE,
+    "ANU_LIVE_GATEWAY_RATE_PER_MINUTE must exceed the stack's own throughput ceiling",
+  );
+
+  // The disk guard is OFF by default in the engine (`--min-free-bytes`
+  // defaults to 0 and the supervisor skips the check at 0; the exported
+  // LIVE_DEFAULT_MIN_FREE_BYTES constant is used nowhere). So the value is not
+  // "a stricter override" — it is the only thing standing between the universe
+  // and a full boot disk shared with the OS and docker.
   const minFree = Number(env.get("ANU_LIVE_MIN_FREE_BYTES"));
-  assert.ok(minFree > 0 && minFree < 20 * 1024 * 1024 * 1024);
+  assert.ok(minFree > 0, "ANU_LIVE_MIN_FREE_BYTES must be set: the engine's guard is off at 0");
+  assert.ok(minFree < 20 * 1024 * 1024 * 1024, "and small enough for a 50 GB boot disk");
+});
+
+test("the deployment carries no chain identity that the Observer cannot see", async () => {
+  // `/api/live` reports the universe as a constant (LIVE_UNIVERSE_ID), so a
+  // runner writing to any other id would leave the Observer showing an empty
+  // universe — silently, with every liveness criterion failing for no visible
+  // reason. The id is therefore a literal in the Compose file, never a variable.
+  const env = await readEnvExample();
+  assert.equal(
+    env.has("ANU_LIVE_UNIVERSE_ID"),
+    false,
+    "ANU_LIVE_UNIVERSE_ID must not be offered as a setting",
+  );
+  const compose = await readFile(join(repositoryRoot, "compose.live.yml"), "utf8");
+  assert.ok(
+    /\n      - --universe-id\n      - U0001\n/.test(compose),
+    "compose must pin --universe-id to the literal U0001",
+  );
+  // The disk guard and the provider URL have no defaults on purpose: a
+  // forgotten .env must fail loudly, not silently disarm the guard.
+  assert.ok(compose.includes("${ANU_LIVE_MIN_FREE_BYTES:?"), "min-free-bytes must have no default");
+  assert.ok(compose.includes("${ANU_LIVE_LLM_UPSTREAM:?"), "the upstream must have no default");
+  assert.ok(compose.includes("${ANU_LIVE_IMAGE:?"), "the image tag must have no default");
 });

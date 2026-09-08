@@ -548,7 +548,7 @@ epoch chain — not by any test written against either repository alone.
   it at the next tick boundary via `--outage-ticks`, the same mechanism a
   `SIGTERM` uses).
 
-### Genesis-Live — phase L5b (the single-machine live stack, ready to deploy)
+### Genesis-Live — phase L5b (the single-machine live stack, reviewed and measured)
 
 - Added `compose.live.yml`: the production stack of one machine — the runner
   (`anu lab live`) on an `internal: true` network with no route out and no
@@ -557,43 +557,86 @@ epoch chain — not by any test written against either repository alone.
   over the evidence read-only, published on the host loopback alone. Every
   secret is a file secret from the tmpfs `/run/anu/secrets`; not one of them
   is passed through `environment`, where `docker inspect` would show it.
-- Sized the universe for the machine that actually exists (`anu-live-1`,
-  4 vCPU / 8 GB / one 50 GB boot disk, no separate evidence disk):
+  Three values deliberately have no default and fail the Compose model when
+  missing — the pinned image tag, the disk-guard floor and the provider URL.
+- Sized the universe for the machine that actually exists (4 vCPU / 8 GB /
+  one 50 GB boot disk, no separate evidence disk):
   `experiments/genesis-live/config.anu-live-1.json` differs from the canonical
   physics in exactly five values (`agents` 16, `ticks` and `live.epochTicks`
   250, `initialResources.llmTokens` 400 000, and its own seed) and is
   byte-identical to the canonical config everywhere else; `checkpointEvery`
-  was deliberately left alone and the reason is stated rather than assumed. The
-  reasoning for each number, with the measurements behind it, is in
-  `.env.live.example`; the "everything else is canonical" invariant is pinned
-  by `test/lab-live-deployment-anu-live-1.test.mjs`, which also proves that
-  the tier prices in `deploy/mws/tiers.anu-live-1.json` equal the prices the
-  reducer charges from.
-- Ran epoch 0 of that universe end to end against a real gateway and a stub
-  provider before writing the disk thresholds: 250 ticks, 23 545 events,
-  4 000 `cognition.recorded` (every agent consulted every tick, none priced
-  out), 16 520 717 bytes of evidence plus 1 722 195 bytes of gateway audit —
-  roughly 18.2 MB per epoch, which on this disk is on the order of 1 700
-  epochs. The run also exposed the economy's real first wall: with no earnings
-  the agents run out of credits at tick 144 and `violation.recorded{cognition
-  overdraft}` follows. Recorded rather than hidden, with the operator's lever
-  (recorded physics — prices only) named.
-- Added `deploy/mws/bootstrap-anu-live-1.sh`, which applies the `cloud-init.yaml`
-  configuration by hand and idempotently to a machine cloud-init never
-  touched, minus the evidence-disk section that no longer has a disk. It also
-  declares `/run/anu` in `tmpfiles.d`: without that, `anu-secrets.service`
-  silently fails its `ConditionPathExists` after every reboot.
-- Added `deploy/mws/anu-live.service` (ordered after the secrets unit, with
-  fail-early preconditions on the three secret files, the evidence tree and
-  the Compose model) and the drop-in
-  `deploy/mws/anu-secrets.service.d/10-before-docker.conf`, which reads the
-  secrets *before* `dockerd` starts — otherwise Docker's own restart policy
-  brings the stack up after a reboot against an empty tmpfs.
-- Added `deploy/mws/DEPLOY_LIVE.md`: the step-by-step runbook for this machine,
-  every step with a checkable criterion, the owner-only steps marked, and the
-  five deliberate deviations from the multi-host design stated as deviations —
-  the provider key sharing a host with the evidence first among them — each
-  with what it risks and what lifts it.
+  was deliberately left alone and the reason is stated rather than assumed.
+- Sized the cognition tiers against the models' *measured* behaviour rather
+  than round numbers: `fast` carries `{"reasoning_effort":"low"}` (without it
+  gpt-oss-120b is not the cheap tier this deployment prices it as), and the
+  `standard`/`deliberate` ceilings were raised to 4096/8192 to clear the
+  1.6–2.6k of reasoning those models emit — below that the answer is truncated,
+  fails to parse, and the record lands as `rejected` with no actions: a
+  consultation paid for and wasted. `maxTokens` and `requestOverrides` both
+  enter `cognitionId`, so this had to be settled before epoch 0, not after.
+- Ran the sized universe end to end twice, and let the measurements correct
+  the documents rather than the other way round:
+  - two epochs on the `fast` tier — epoch 0: 250 ticks, 23 547 events, 4 000
+    consultations (every agent every tick, none priced out, none rejected or
+    truncated), ~18.3 MB of evidence and gateway audit; epoch 1: the last
+    consultation falls on tick 253 and all sixteen agents are retired
+    `exhausted` on tick 272, ending with `activeAgents 0`;
+  - one epoch on the `deliberate` tier — the last consultation falls on
+    tick 22 and the population is gone by tick 40.
+  So the `llmTokens` wall at zero earnings lies between tick 22 and tick 253
+  depending on which tier the models ask for — an eleven-fold spread that the
+  earlier single fast-only measurement could not show, because the stub pinned
+  `nextTier` to `fast` in every answer. The honest bound of both runs is stated
+  where the numbers are used: the stub claimed a task id that does not exist,
+  so nothing was ever earned; this measures the worst case, it does not
+  condemn the physics.
+- Reconciled the gateway budget with the universe's own pace, which the first
+  draft never did: one `fast` epoch is 4 000 requests and 6 320 000 tokens, so
+  the previous 8 M tokens/hour window and 240 requests/minute sat *below* the
+  stack's own throughput — the gateway would have failed closed and the outage
+  guard would have paused the universe, an oscillation caused by its own
+  settings. The window is now a runaway fuse (36 M/hour, 900/minute) above the
+  physical ceiling of eight concurrent requests, and the invariant is pinned by
+  a test.
+- Corrected a claim repeated across four artefacts: the engine's disk guard is
+  **off** by default (`--min-free-bytes` falls back to 0 and the supervisor
+  skips the check at 0), not a stricter 20 GiB. A lost variable therefore means
+  no guard at all, so the value is now mandatory twice over — `:?` in Compose
+  and an `ExecStartPre` in the unit.
+- Split the image step in two: build and push happen only from the one host the
+  registry whitelists, with a disk/memory precondition, a refusal to build from
+  a dirty tree (`docker build` reads the working tree, so the `live-<sha>` tag
+  would name a commit the image does not contain) and a `docker logout` built
+  into the script; the VM authenticates to the registry as its own service
+  account, and logging in there as the owner is forbidden outright.
+- Made the secrets unit actually able to run: a drop-in supplies `HOME` and the
+  `PATH` that a system unit does not have (measured), and the reader now
+  resolves the newest *active* secret version explicitly and prints each file's
+  sha256 prefix — so key rotation has a checkable criterion instead of a hope.
+- Added `deploy/mws/bootstrap-anu-live-1.sh`, `deploy/mws/anu-live.service` and
+  `deploy/mws/DEPLOY_LIVE.md`: the runbook for this machine, every step with a
+  checkable criterion, the owner-only steps marked, the five deliberate
+  deviations from the multi-host design stated as deviations — including the
+  one that was previously called harmless and is not: the gateway holds the
+  provider key and its egress is restricted by nothing at all.
+- Stopped describing the stack as exercised and actually exercised it: the image
+  of this commit was built and all three services were brought up through
+  `docker compose` against a stub provider, running an epoch to completion.
+  That is what confirms `read_only: true`, the tmpfs file secrets,
+  `user: 1000:1000` and the `internal` network — the runner's `fetch` to the
+  public internet fails from inside the container, the gateway and Observer
+  reach `healthy`, a chain link is written and `/api/live` serves it. The run
+  also surfaced a failure shape worth knowing: the gateway refuses a non-HTTPS,
+  non-loopback upstream, and under `restart: unless-stopped` that reads as an
+  endless crash loop rather than a clear refusal.
+- Drew a publication boundary the repository can enforce. This repository is
+  public and its `AGENTS.md` forbids external infrastructure context, so every
+  machine address, the cloud project identifier, the subnets and the SSH user
+  now live in one untracked file (`deploy/mws/target.env`, from
+  `target.env.example`) and the tracked artefacts carry variable names only.
+  `test/publication-boundary.test.mjs` states the boundary as patterns rather
+  than literals — writing the forbidden address into the assertion would
+  publish it just as surely as leaving it in the runbook.
 
 
 ## [1.0.0] - 2026-08-19

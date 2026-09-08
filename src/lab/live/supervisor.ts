@@ -98,7 +98,15 @@ export interface LiveSupervisorOptions extends LiveSupervisorObservations {
 
 export const LIVE_DEFAULT_OUTAGE_TICKS = 3;
 export const LIVE_DEFAULT_PROBE_INTERVAL_MS = 30_000;
-/** 20 GiB, the design's floor for an evidence volume. */
+/**
+ * 20 GiB — the design's *recommended* floor for a dedicated evidence volume.
+ *
+ * NOT a default: nothing reads it. `--min-free-bytes` falls back to 0 and
+ * {@link LiveSupervisor} skips the free-space check entirely at 0, so the
+ * guard is OFF unless a deployment sets the floor itself. It is exported as a
+ * reference value for deployments to start from, and a deployment on a shared
+ * boot disk must pick a smaller one deliberately (see `deploy/mws/DEPLOY_LIVE.md`).
+ */
 export const LIVE_DEFAULT_MIN_FREE_BYTES = 20 * 1024 * 1024 * 1024;
 
 export class LiveSupervisorGaveUpError extends Error {
